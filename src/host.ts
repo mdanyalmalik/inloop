@@ -46,6 +46,12 @@ export type Host = {
   speak: (text: string, voice?: string) => Promise<unknown>
   /** Speaks `text` in a way that can be cut off: `done` settles when it ends or is stopped. */
   say: (text: string, voice?: string) => { done: Promise<void>; stop: () => void }
+  /**
+   * Runs inloop's read-only reader agent on a task and resolves with its final
+   * message; rejects when it cannot start, fails or takes too long. Absent where
+   * agents cannot run (a headless run).
+   */
+  investigate?: (prompt: string, description: string, model: string) => Promise<string>
   /** Whether `uv` (which runs the Kokoro voice) is on this machine. */
   hasUv: boolean
   /** Whether this machine has a player for Kokoro's clips (afplay, pw-play, paplay, aplay, ffplay, or PowerShell). */

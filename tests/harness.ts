@@ -31,6 +31,10 @@ export type World = {
   /** While true, `git status` does not return (a hung git, a locked index) until releaseGit(). */
   isGitStatusHung: boolean
   releaseGit: () => void
+  /** The reader agents inloop spawned: their prompts and models, by agentId; `isReaderOn` false refuses spawns. */
+  spawned: { agentId: string; prompt: string; model?: string; subagentType: string }[]
+  isReaderOn: boolean
+  registeredAgents: Record<string, unknown>[]
   /** A model call to fail, by its count from 1: the reason (and status) it fails with, or undefined to answer. */
   failModel: (call: number) => { reason: string; status?: number; error?: string } | undefined
   /** A model call to hold until the promise it returns settles (a slow call), by its prompt; undefined answers at once. */
@@ -109,6 +113,9 @@ export function world(
     isGitStatusHung: false,
     releaseGit: () => undefined,
     failModel: () => undefined,
+    spawned: [],
+    isReaderOn: true,
+    registeredAgents: [],
     holdModel: () => undefined,
     prompts: [],
     reads: [],
@@ -275,6 +282,16 @@ export function world(
   })
   on('model.classify', () => ({ value: w.classify }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
+  on('agent.register', ($, e) => {
+    w.registeredAgents.push({ ...e })
+    return { value: { agent: `inloop:${e.name}` } } as never
+  })
+  on('agent.spawn', ($, e) => {
+    if (!w.isReaderOn) return { deny: 'agents are off here' } as never
+    const agentId = `a${w.spawned.length + 1}`
+    w.spawned.push({ agentId, prompt: e.prompt, model: (e as { model?: string }).model, subagentType: e.subagentType })
+    return { model: 'claude-sonnet-5-5', agentId } as never
+  })
   on('ui.open', () => ({ value: { isPlaced: true } }) as never)
   on('ui.panes', () => ({ value: w.pane === 'closed' ? [] : [{ id: 'inloop', title: 'inloop', isShown: w.pane === 'shown', isFocused: false, isPlaced: true }] }) as never)
   on('ui.status', () => ({ value: undefined }))

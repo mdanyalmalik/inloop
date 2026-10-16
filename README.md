@@ -52,7 +52,8 @@ Requirements: Claude Code 2.1.301 or newer (inloop uses the plugin mod API: func
 
 ```bash
 claude plugin validate .        # manifest + hooks module, as the engine reads them
-claude plugin test .            # 72 tests: logic + engine-level (hooks, pane on terminal/desktop/mobile)
+claude plugin test .            # logic + engine-level tests (hooks, pane on terminal/desktop/mobile)
+sh tests/reader-guard.test.sh    # the reader guard: what it allows and refuses
 claude --plugin-dir .           # a live session with inloop loaded
 ```
 
@@ -121,7 +122,9 @@ Type in the pane's ask field, or use `/inloop <question>`. Examples:
 - *Explain that again, but more simply.* / *Don't simplify anything.*
 - *Show me how login worked three months ago.*
 
-inloop runs a short investigation, up to five rounds. The model asks for read-only lookups (find symbols, search text, read lines, a symbol with its callers and callees, trace a flow, git log/show, switch revision), inloop runs them itself, and the answer cites files and lines. A reference to a file or line that doesn't exist is dropped. Whatever can't be verified from the code is stated as such.
+By default a question is investigated by **inloop's reader**, a Claude Code agent of inloop's own. It finds code the way Claude Code does: it searches the project (`git grep`, file searches), follows what it finds, and reads only what matters. Then it answers in inloop's format, with the files and lines it used. It runs in the background on the questions model (Sonnet by default) and only reads: see [Security and privacy](#security-and-privacy). Your coding agent never sees it; the notice Claude Code sends when it finishes is kept out of your conversation. A question takes about 20–60 seconds this way.
+
+Where the reader can't run (a headless `claude -p` run, or if it fails or takes over four minutes), or with Settings → *questions investigated by: inloop's own lookups*, inloop runs its own short investigation instead, up to five rounds. The model asks for read-only lookups (find symbols, search text, read lines, a symbol with its callers and callees, trace a flow, git log/show, switch revision), inloop runs them itself, and the answer cites files and lines. A reference to a file or line that doesn't exist is dropped. Whatever can't be verified from the code is stated as such.
 
 ### Flows
 
@@ -224,6 +227,7 @@ src/explain.ts                   prompts, change cards, the read-only investigat
 src/repo.ts                      read-only project and git access, per-revision index cache
 src/diff.ts, src/batcher.ts      unified diffs; edit grouping, hashing, LRU caches
 src/security.ts                  path validation, sensitive files, secret masking, safe git arguments
+src/reader.ts, hooks/reader-guard.sh   the reader agent: its prompt and definition, and the guard every call it makes passes
 src/ui.tsx                       the pane (terminal, desktop with SVG flows, mobile fallback), the changes box, narration
 src/voices.ts                    system voice listing and ranking, Kokoro voices, which engine speaks
 src/host.ts                      the small interface the controller uses to reach Claude Code
@@ -240,9 +244,10 @@ It's a single mod: one hooks module, no MCP server, no extra process, no web ser
 ## Security and privacy
 
 - **Read-only by construction.** The module has no file-write call at all (validate lists its calls). The only processes it runs are `git` with read-only subcommands, and for speech `say`, an audio player (`afplay`, `pw-play`, `paplay`, `aplay`, `ffplay`, or PowerShell playing a clip) and `uv` running inloop's own `voice/inloop_tts.py`. All are passed as an argument list with no shell. The voice script writes only under `~/.cache/inloop/`, and reaches the network only to set the voice up (automatically on first start, or with `/inloop-voice setup`): `uv` fetches the script's Python packages and the script downloads the model from its GitHub release. After that it runs with `--offline`. The model never gets tools. It can only ask for inloop's own read-only lookups.
+- **The reader agent only reads.** Claude Code runs it in `dontAsk` mode, so nothing that would need your permission runs. Every call it makes first goes through `hooks/reader-guard.sh`, a hook set on the agent alone. The hook allows read-only git (`log`, `show`, `diff`, `blame`, `grep`…), reading, listing and finding files, and piping into `head`, `tail`, `grep`, `wc`, `sort`, `uniq` or `cut`. It refuses everything else, including chaining, redirection, substitution, paths outside the project, and any secrets file named in the call. A search of the whole tree must use `git grep`, which skips untracked files such as `.env`; a recursive `grep` or `rg` would read them too. (inloop's own plugin hooks can't police the agent, because Claude Code skips a plugin's hooks for calls the plugin itself caused. So the guard is a Claude Code hook in the agent's own definition.)
 - **Never executes repository code** to explain it.
 - **Sensitive files are never read:** `.env*`, keys and certificates, `id_rsa*`, `.npmrc`/`.netrc`/`.git-credentials`, `.aws/`/`.ssh/`, `credentials`/`secrets.*`, service-account JSON, `.git/`. They're also excluded from git greps and patches. Edits to them are noticed but never read.
-- **Secrets are masked** before any text goes to the model: common key formats, private keys, JWT-like strings, and quoted values assigned to names like `password`, `token` or `apiKey`. References like `process.env.X` are kept.
+- **Secrets are masked** before any text goes to the model: common key formats, private keys, JWT-like strings, and quoted values assigned to names like `password`, `token` or `apiKey`. References like `process.env.X` are kept. One limit: Claude Code doesn't let a hook rewrite what its built-in tools return, so the reader sees a secret written inside an ordinary source file (not in a secrets file) unmasked, as Claude Code itself would. It's told never to repeat one. For no exceptions at all, choose *inloop's own lookups* in Settings.
 - **Untrusted content stays data.** Code, comments, commit messages and file names go to the model inside `<repo_data>` tags, with an instruction never to follow instructions found there.
 - **Paths are validated:** anything outside the project root, or escaping it with `..`, is refused. Revisions and dates are checked before they reach git, so nothing option-like and no ranges get through.
 - **Where data goes:** code excerpts go only to the session's own Claude model, through Claude Code's client and credentials. Explanation history and settings stay in Claude Code's local plugin store (`~/.claude/plugins/store/`), outside your project. Clear them from the History tab. Spoken text is rendered on your machine and never sent anywhere.
@@ -252,7 +257,7 @@ It's a single mod: one hooks module, no MCP server, no extra process, no web ser
 
 ## Testing
 
-`claude plugin test .` runs 72 tests in the engine's own test kit:
+`claude plugin test .` runs 122 tests in the engine's own test kit, and `sh tests/reader-guard.test.sh` checks the reader guard against 53 calls it must allow or refuse. The test kit covers:
 
 - **Logic** (28): path, sensitive-file, revision and secret rules; symbol, route, React and HTTP-call extraction; significance scoring; focus matching; diffs; batching windows; the demo app's login flow, from the button to the database, with every node checked against its source line and every edge's confidence; callers; natural-language search; the first commit's index (sessions, no JWT); JSON recovery; static cards; voice listing, ranking and choice; spoken-text cleanup.
 - **Engine** (44): the plugin loaded by the engine over a virtual project, with a scripted model:

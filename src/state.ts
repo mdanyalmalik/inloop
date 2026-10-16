@@ -14,6 +14,7 @@ export const DEFAULT_SETTINGS: InloopSettings = {
   autoVoiceSetup: true,
   autoModel: 'haiku',
   askModel: 'sonnet',
+  useReader: true,
   autoEngine: 'model',
   minScore: 3,
   quietSeconds: 6,

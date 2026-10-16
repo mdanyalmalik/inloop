@@ -7,6 +7,7 @@ import { describeFlow, extractJson, kindOf, parseReply, partsFor, speakable, sta
 import { buildIndex, callersOf, findSymbols, lookup, traceFlow, urlMatches } from '../src/graph'
 import { isSafeRev, isSensitive, redact, toRelative } from '../src/security'
 import { DEMO_FIRST, DEMO_HEAD } from './fixtures'
+import { readerHooks } from '../src/reader'
 import { SAY_LISTING } from './harness'
 import { needsBetterVoice, parseVoices, pickVoice, rankVoices } from '../src/voices'
 
@@ -279,6 +280,15 @@ describe('voices', () => {
     const long = 'One sentence here. '.repeat(60)
     expect(speakable(long).length <= 450).toBe(true)
     expect(speakable(long).endsWith('.')).toBe(true)
+  })
+})
+
+describe('the reader agent only reads', () => {
+  test('every call it makes goes through the guard script, quoted safely', () => {
+    const hooks = readerHooks("/Users/me/it's here/") as { PreToolUse: { matcher: string; hooks: { type: string; command: string }[] }[] }
+    expect(hooks.PreToolUse[0]!.matcher).toBe('*')
+    expect(hooks.PreToolUse[0]!.hooks[0]!.type).toBe('command')
+    expect(hooks.PreToolUse[0]!.hooks[0]!.command).toBe("sh '/Users/me/it'\\''s here/hooks/reader-guard.sh'")
   })
 })
 

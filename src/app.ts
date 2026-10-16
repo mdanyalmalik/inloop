@@ -259,10 +259,12 @@ export class App {
   }
 
   private async env(progress?: (t: string) => void): Promise<Env> {
+    const settings = await this.settings()
     return {
       repo: this.repo,
       model: this.model,
-      settings: await this.settings(),
+      investigate: settings.useReader ? this.host.investigate : undefined,
+      settings,
       ctx: await this.host.state.ctx.get(),
       convo: await this.host.state.convo.get(),
       now: Date.now(),

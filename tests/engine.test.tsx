@@ -1017,6 +1017,46 @@ describe('what is asked about', () => {
   })
 })
 
+describe('the reader agent', () => {
+  test('a question asks the read-only reader first, with the question, the context and the answer shape', async ($, on) => {
+    const w = world(on, () => JSON.stringify({ answer: 'From the lookups.', refs: [], steps: [], flow: null, scope: '' }))
+    tools(on, w)
+    await start($)
+    expect(w.registeredAgents.map(a => [a.name, a.permissionMode, a.tools, a.background])).toEqual([['reader', 'dontAsk', ['Read', 'Grep', 'Glob', 'Bash'], true]])
+    await $.command.run({ command: 'inloop', args: 'how is the password checked?' } as never)
+    await w.clock.advance(10)
+    expect(w.spawned.length).toBe(1)
+    const job = w.spawned[0]!
+    expect(job.model).toBe('sonnet')
+    expect(job.prompt.includes("Developer's question: how is the password checked?")).toBe(true)
+    expect(job.prompt.includes('function verifyPassword')).toBe(true)
+    expect(job.prompt.includes('"answer": "markdown')).toBe(true)
+    // (In the test kit only Claude Code itself can start an agent, so the question falls back and is still answered.)
+    expect((w.get('convo') ?? []).at(-1)?.text).toBe('From the lookups.')
+  })
+
+  test('with the reader turned off in Settings, no agent is started', async ($, on) => {
+    const w = world(on, () => JSON.stringify({ answer: 'From the lookups.', refs: [], steps: [], flow: null, scope: '' }), { settings: { style: 'written', useReader: false } })
+    tools(on, w)
+    await start($)
+    await $.command.run({ command: 'inloop', args: 'how is the password checked?' } as never)
+    await w.clock.advance(10)
+    expect(w.spawned.length).toBe(0)
+    expect((w.get('convo') ?? []).at(-1)?.text).toBe('From the lookups.')
+  })
+
+  test("when the reader can't run, questions fall back to inloop's own lookups", async ($, on) => {
+    const w = world(on, () => JSON.stringify({ answer: 'From the lookups.', refs: [], steps: [], flow: null, scope: '' }))
+    w.isReaderOn = false
+    tools(on, w)
+    await start($)
+    await $.command.run({ command: 'inloop', args: 'how is the password checked?' } as never)
+    await w.clock.advance(10)
+    expect((w.get('convo') ?? []).at(-1)?.text).toBe('From the lookups.')
+    expect(w.prompts.length).toBe(1)
+  })
+})
+
 describe('narrow dock', () => {
   test('short tab labels and no paths in the flow tree at 30 columns', async ($, on) => {
     const w = world(on, () => JSON.stringify({ answer: 'ok', refs: [], flow: { entry: 'login' }, scope: '' }))

@@ -131,6 +131,8 @@ export type InloopSettings = {
   autoModel: string
   /** Model for questions, flows and commits. */
   askModel: string
+  /** Questions are investigated by inloop's reader, a read-only Claude Code agent; off, by inloop's own lookups. */
+  useReader: boolean
   /** 'model' asks a model for automatic cards; 'static' explains from analysis alone. */
   autoEngine: 'model' | 'static'
   /** Minimum significance score (0-10) before a change batch gets a card. */

@@ -1068,6 +1068,16 @@ async function settingsTab(k: Kit): Promise<RenderElement> {
         onSelect={(v: string) => app.setSettings({ askModel: v })}
       />
       <Select
+        key="set:reader"
+        label="questions investigated by "
+        value={s.useReader ? 'reader' : 'lookups'}
+        options={[
+          { value: 'reader', label: "a read-only Claude Code agent (searches and reads like Claude Code)" },
+          { value: 'lookups', label: "inloop's own lookups (faster, fewer tokens)" },
+        ]}
+        onSelect={(v: string) => app.setSettings({ useReader: v === 'reader' })}
+      />
+      <Select
         key="set:style"
         label="style "
         value={s.style}

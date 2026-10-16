@@ -13,6 +13,7 @@ import { DEFAULT_SETTINGS } from '../src/state'
 import type { InloopCard, InloopDepth, InloopMode, InloopTab } from '../types'
 import { describeFlow } from '../src/explain'
 import { describePlan, KOKORO_VOICES, rankVoices } from '../src/voices'
+import { READER_NAME, READER_PROMPT, READER_TYPE, readerHooks } from '../src/reader'
 
 const cardsAtom = atom({ plugin: 'inloop', key: 'cards' } as const, [])
 const historyAtom = atom({ plugin: 'inloop', key: 'history' } as const, [])
@@ -66,6 +67,12 @@ const COMMANDS: { name: string; description: string; argumentHint?: string }[] =
 ]
 
 let app: App | null = null
+/** The reader agents inloop started, by agentId, each waiting for its final message. */
+const readers = new Map<string, { resolve: (text: string) => void; reject: (err: Error) => void }>()
+/** Every reader agent this process started: their finishing notices are inloop's to keep. */
+const readerIds = new Set<string>()
+/** The reader's longest run before inloop answers without it. */
+const READER_TIMEOUT_MS = 4 * 60_000
 /** A -p or SDK run ends right after its turn: there, a turn waits for its explanation. */
 let isHeadless = false
 
@@ -202,6 +209,22 @@ export const register: Register = on => {
         }
         return { done, stop }
       },
+      investigate: isHeadless ? undefined : async (prompt, description, model) => {
+        const spawned = await $.agent.spawn({ subagentType: READER_TYPE, prompt, description, model } as never) as { agentId?: string; deny?: string }
+        if (spawned.agentId === undefined) throw new Error(spawned.deny ?? 'the reader agent did not start')
+        const id = spawned.agentId
+        readerIds.add(id)
+        return new Promise<string>((resolve, reject) => {
+          const timer = $.clock.after(READER_TIMEOUT_MS, () => {
+            readers.delete(id)
+            reject(new Error('the reader agent took too long'))
+          })
+          readers.set(id, {
+            resolve: text => { timer.cancel(); resolve(text) },
+            reject: err => { timer.cancel(); reject(err) },
+          })
+        })
+      },
       hasUv: uv !== undefined,
       canPlayClips: player !== undefined,
       kokoroReady: async () => {
@@ -261,6 +284,22 @@ export const register: Register = on => {
     app.isHeadless = isHeadless
     await app.start()
     for (const c of COMMANDS) await $.command.register({ ...c, immediate: true })
+    // The reader: Claude Code's own way of finding and reading code, held to reading.
+    if (!isHeadless) {
+      await $.agent.register({
+        name: READER_NAME,
+        description: "inloop's internal read-only code reader. Never use it: inloop starts it itself.",
+        prompt: READER_PROMPT,
+        tools: ['Read', 'Grep', 'Glob', 'Bash'],
+        // Nothing that needs a permission runs, and the guard holds it to reading
+        // inside the project (inloop's own hooks are skipped for calls it caused).
+        permissionMode: 'dontAsk',
+        hooks: readerHooks($.plugin.root),
+        maxTurns: 24,
+        background: true,
+        omitClaudeMd: true,
+      }).catch(() => undefined)
+    }
     // Seated only where the terminal is wide enough to dock it beside the transcript.
     void $.ui.open({ id: PANE, title: 'inloop', columns: 64 })
     return started
@@ -326,6 +365,14 @@ export const register: Register = on => {
 
   // The same, as a note beside each prompt the person types (the model never shows it).
   on('prompt.submit', async ($, e, next) => {
+    // A reader finishing is inloop's news, not the coding agent's: its notice never reaches the conversation.
+    // It comes as the subagent's hand-back (a peer message from its agentId) or a task notification naming it.
+    const origin = (e as { origin?: { kind?: string; from?: string; senderTaskId?: string } }).origin
+    const isReaders = origin !== undefined && (
+      (origin.from !== undefined && readerIds.has(origin.from)) ||
+      (origin.senderTaskId !== undefined && readerIds.has(origin.senderTaskId)) ||
+      ((origin.kind === 'task-notification' || origin.kind === 'peer') && [...readerIds].some(id => e.text.includes(id))))
+    if (isReaders) return { drop: "inloop's answer is in its pane" } as never
     if (app === null || e.command !== undefined || e.isMeta === true) return next(e)
     // After /clear the conversation's state starts fresh: settings and the feed come back first.
     await app.ensureState().catch(() => undefined)
@@ -353,6 +400,13 @@ export const register: Register = on => {
   })
 
   on('turn.complete', async ($, e, next) => {
+    // A reader's final message is its answer.
+    if (e.agentId !== undefined && readers.has(e.agentId)) {
+      const waiting = readers.get(e.agentId)!
+      readers.delete(e.agentId)
+      if (e.isAborted) waiting.reject(new Error('the reader agent was stopped'))
+      else waiting.resolve(e.answer)
+    }
     if (e.agentId === undefined && app !== null) {
       if (isHeadless) await app.drain(60_000).catch(() => undefined)
       else {

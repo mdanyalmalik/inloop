@@ -38,6 +38,8 @@ export type Env = {
   now: number
   newId: () => string
   signal?: AbortSignal
+  /** Runs inloop's reader agent on a task (Claude Code's own search and reading); absent where it cannot run. */
+  investigate?: (prompt: string, description: string, model: string) => Promise<string>
   /** Reports progress ("reading src/auth.js"). */
   progress?: (text: string) => void
 }
@@ -788,13 +790,20 @@ export async function ask(env: Env, question: string, kind: AskKind, extra = '')
   if (isBroadQuestion(question) || isFollowUpOfBroad) {
     extra = `${extra}\n\nThe project's big picture:\n${await projectOverview(env.repo, st.rev)}`.trim()
   }
+  // Claude Code's own way of finding the code, when its reader can run here; inloop's lookups otherwise.
+  if (env.investigate !== undefined) {
+    try {
+      return await askWithReader(env, st, question, kind, extra, env.investigate)
+    } catch (err) {
+      if (env.signal?.aborted === true) throw err
+      env.progress?.('investigating')
+    }
+  }
   const transcript: string[] = []
   const maxRounds = 5
   let lookups = 0
-  const flowAsk = kind === 'flow'
-    ? `\nThe developer wants to follow an execution flow. In your final answer include "flow": {"entry": "symbol where the flow starts", "path": ["entry", "next symbol", "..."]} using only symbol names you saw in lookups. inloop draws the diagram from its own static analysis, so do not invent steps.`
-    : `\nIf a step-by-step flow would help, you may include "flow": {"entry": "...", "path": [...]} as above; otherwise "flow": null.`
-  const answerShape = `{"answer": "markdown, short and plain: lead with the direct answer in one or two sentences, then only what is needed to understand it. At most 120 words in total, no headings, at most one short list, unless the developer asked for detail or depth is advanced. If they asked for it briefly, at most 3 sentences. Never a pointer such as 'see above'.", "refs": [{"path": "file", "line": 10, "end_line": 24, "label": "what is there"}], "steps": ${STEPS_SHAPE} (0-3 parts pointing at the code worth looking at, in order; each adds a detail the answer does not already say, never a restatement of it), "flow": null, "scope": "the topic the developer limited the conversation to, '' if none, or 'clear' if they lifted it"}`
+  const flowAsk = flowAskFor(kind)
+  const answerShape = ANSWER_SHAPE
   for (let round = 0; round < maxRounds; round++) {
     const isLast = round === maxRounds - 1
     // Hints come from the revision being studied now, never a mix of two.
@@ -838,26 +847,69 @@ export async function ask(env: Env, question: string, kind: AskKind, extra = '')
       }
       continue
     }
-    const refs = await groundRefs(env.repo, json.refs, st.rev)
-    const steps = await groundSteps(env.repo, json.steps, st.rev)
-    const flow = await flowFrom(env, st, json.flow, question, kind === 'flow' ? seeds : [])
-    const scopeRaw = str(json.scope, 300)
-    // A reply that wrote its explanation as prose and left "answer" a stub: keep the prose.
-    let answer = str(json.answer)
-    const prose = reply.slice(0, Math.max(0, reply.indexOf('{'))).replace(/```(json)?\s*$/, '').trim()
-    if (answer.length < 60 && prose.length > answer.length + 80) answer = prose
-    return {
-      answer: answer || 'No answer was produced.',
-      refs,
-      steps,
-      flow,
-      scope: scopeRaw === 'clear' ? '' : scopeRaw || undefined,
-      rev: st.rev,
-      revLabel: st.revLabel,
-      lookups,
-    }
+    return finishAnswer(env, st, json, reply, question, kind, seeds, lookups)
   }
   return { answer: 'No answer was produced.', refs: [], steps: [], flow: null, scope: undefined, lookups }
+}
+
+function flowAskFor(kind: AskKind): string {
+  return kind === 'flow'
+    ? `\nThe developer wants to follow an execution flow. In your final answer include "flow": {"entry": "symbol where the flow starts", "path": ["entry", "next symbol", "..."]} using only symbol names you saw in the code. inloop draws the diagram from its own static analysis, so do not invent steps.`
+    : `\nIf a step-by-step flow would help, you may include "flow": {"entry": "...", "path": [...]} as above; otherwise "flow": null.`
+}
+
+const ANSWER_SHAPE = `{"answer": "markdown, short and plain: lead with the direct answer in one or two sentences, then only what is needed to understand it. At most 120 words in total, no headings, at most one short list, unless the developer asked for detail or depth is advanced. If they asked for it briefly, at most 3 sentences. Never a pointer such as 'see above'.", "refs": [{"path": "file", "line": 10, "end_line": 24, "label": "what is there"}], "steps": ${STEPS_SHAPE} (0-3 parts pointing at the code worth looking at, in order; each adds a detail the answer does not already say, never a restatement of it), "flow": null, "scope": "the topic the developer limited the conversation to, '' if none, or 'clear' if they lifted it"}`
+
+/** An answer reply, made ready to show: its references and parts checked against the code, its flow drawn from the index. */
+async function finishAnswer(env: Env, st: LoopState, json: Record<string, unknown>, reply: string, question: string, kind: AskKind, seeds: readonly CodeSymbol[], lookups: number): Promise<AskResult> {
+  const refs = await groundRefs(env.repo, json.refs, st.rev)
+  const steps = await groundSteps(env.repo, json.steps, st.rev)
+  const flow = await flowFrom(env, st, json.flow, question, kind === 'flow' ? seeds : [])
+  const scopeRaw = str(json.scope, 300)
+  // A reply that wrote its explanation as prose and left "answer" a stub: keep the prose.
+  let answer = str(json.answer)
+  const prose = reply.slice(0, Math.max(0, reply.indexOf('{'))).replace(/```(json)?\s*$/, '').trim()
+  if (answer.length < 60 && prose.length > answer.length + 80) answer = prose
+  return {
+    answer: answer || 'No answer was produced.',
+    refs,
+    steps,
+    flow,
+    scope: scopeRaw === 'clear' ? '' : scopeRaw || undefined,
+    rev: st.rev,
+    revLabel: st.revLabel,
+    lookups,
+  }
+}
+
+/**
+ * A question answered by inloop's reader: a Claude Code agent that searches and
+ * reads the project itself (Grep, Glob, Read, read-only git), as Claude Code does.
+ */
+async function askWithReader(env: Env, st: LoopState, question: string, kind: AskKind, extra: string, investigate: NonNullable<Env['investigate']>): Promise<AskResult> {
+  const seeds = findSymbols(await indexFor(env, st), question, 10)
+  const where = st.rev !== undefined
+    ? `The developer is studying revision ${st.rev}${st.revLabel !== undefined ? ` (${st.revLabel})` : ''}: read files as they were there with \`git show ${st.rev}:<path>\`, not from the working tree.`
+    : 'Read the working tree as it is now.'
+  const prompt = [
+    await contextBlock(env, st),
+    convoBlock(env.convo),
+    extra,
+    seeds.length > 0 ? `Places whose names look related (a starting point, not a limit):\n${seeds.map(symbolLine).join('\n')}` : '',
+    where,
+    `Developer's question: ${question}`,
+    flowAskFor(kind),
+    `${depthGuide(env.settings.depth)}\nInvestigate, then make your final message JSON only, in this shape: ${ANSWER_SHAPE}`,
+  ].filter(p => p !== '').join('\n\n')
+  env.progress?.('reading the code')
+  const reply = await investigate(prompt, `inloop: ${question.replace(/\s+/g, ' ').slice(0, 48)}`, env.settings.askModel)
+  const { json, isCutOff } = parseReply(reply)
+  if (json === null) {
+    if (isCutOff || reply.trim() === '') throw new Error('the reader gave no answer')
+    return { answer: reply.trim(), refs: [], steps: [], flow: null, scope: undefined, rev: st.rev, revLabel: st.revLabel, lookups: 0 }
+  }
+  if (str(json.answer) === '') throw new Error('the reader gave no answer')
+  return finishAnswer(env, st, json, reply, question, kind, seeds, 0)
 }
 
 /** A flow drawn from the index: the model only names where to start. */
