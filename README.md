@@ -24,7 +24,14 @@ It only reads. It never edits files, runs your project's code, or changes your g
 
 ## Install
 
-**From this folder** (any terminal session):
+**From GitHub:**
+
+```
+claude plugin marketplace add mdanyalmalik/inloop
+claude plugin install inloop@inloop
+```
+
+**From a local clone** (any terminal session):
 
 ```
 claude plugin marketplace add /path/to/inloop
@@ -306,3 +313,7 @@ Verified by hand with real Claude Code 2.1.301, the real model and real git, on 
 - Generate per-concept summaries across history (*"everything I've learned about middleware"*).
 - An optional browser companion for very large interactive diagrams.
 - More editors and agents: the controller only talks to a small `Host` interface (`src/host.ts`), so another host can drive the same logic.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

@@ -1,6 +1,8 @@
 {
   "name": "inloop",
-  "owner": { "name": "inloop" },
+  "owner": {
+    "name": "Danyal Malik"
+  },
   "plugins": [
     {
       "name": "inloop",
