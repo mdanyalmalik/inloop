@@ -50,6 +50,7 @@ const MAX_CARDS = 80
 const MAX_HISTORY = 150
 const MAX_QUEUED_BATCHES = 3
 const RECENT_KEEP_MS = 3 * 60 * 60 * 1000
+const NO_PLAYER = 'The natural voice needs an audio player, and none was found (on Linux: pipewire, pulseaudio-utils, alsa-utils or ffmpeg). Until then inloop uses the system voice.'
 
 /** Pieces of speech played in turn; each can be cut off. */
 type Speaker = { play: (i: number) => Promise<void>; stopPiece: () => void; close: () => void }
@@ -500,7 +501,12 @@ export class App {
 
   /** The engine and voice a setting speaks with ('' = the best available: Kokoro once set up). */
   voicePlan(setting: string): VoicePlan {
-    return planVoice(setting, this.isKokoroReady, this.voices)
+    return planVoice(setting, this.canUseKokoro, this.voices)
+  }
+
+  /** Kokoro is set up and this machine can play what it renders. */
+  get canUseKokoro(): boolean {
+    return this.isKokoroReady && this.host.canPlayClips
   }
 
   private voiceSetup: Promise<string> | null = null
@@ -512,7 +518,8 @@ export class App {
   async prepareVoice(): Promise<void> {
     await this.refreshVoices()
     const settings = await this.settings()
-    if (this.isKokoroReady || !settings.autoVoiceSetup || this.isHeadless || !this.host.hasUv) return
+    // Nothing to fetch where its audio could not be played.
+    if (this.isKokoroReady || !settings.autoVoiceSetup || this.isHeadless || !this.host.hasUv || !this.host.canPlayClips) return
     const said = await this.setupKokoro()
     if (this.isKokoroReady) this.host.toast(`inloop: ${said}`, { timeoutMs: 6000 })
   }
@@ -521,7 +528,9 @@ export class App {
   setupKokoro(): Promise<string> {
     if (this.voiceSetup !== null) return this.voiceSetup
     const run = async (): Promise<string> => {
-      if (!this.host.hasUv) return 'The natural voice needs uv (https://docs.astral.sh/uv/). Until then inloop uses the Mac voice.'
+      if (!this.host.hasUv) return 'The natural voice needs uv (https://docs.astral.sh/uv/). Until then inloop uses the system voice.'
+      if (!this.host.canPlayClips) return NO_PLAYER
+      if (this.canUseKokoro) return 'The natural voice (Kokoro) is already set up.'
       await this.host.state.status.update(s => ({ ...s, isVoiceSettingUp: true }))
       await this.refreshStatus()
       try {
@@ -689,8 +698,10 @@ export class App {
         if (path === null) return direct(texts[i] ?? '')
         const handle = this.host.play(path)
         current = handle
-        await handle.done.catch(() => undefined)
+        // A clip that could not be played is said by the platform voice instead, never skipped in silence.
+        const isPlayed = await handle.done.then(() => true, () => false)
         current = null
+        if (!isPlayed && !isInterrupted()) await direct(texts[i] ?? '')
       },
       stopPiece: () => {
         current?.stop()

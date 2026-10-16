@@ -710,6 +710,64 @@ describe('styles', () => {
     expect(w.setupRuns).toBe(0)
   })
 
+  for (const [platform, players] of [['Linux', ['aplay', 'paplay']], ['Windows', ['powershell']]] as const) {
+    test(`${platform}: Kokoro's clips play through the player the machine has`, { timeoutMs: 20_000 }, async ($, on) => {
+      const w = world(on, STEPPED)
+      w.kokoro = true
+      w.hasSay = false
+      w.players = [...players]
+      tools(on, w)
+      await start($)
+      await $.command.run({ command: 'inloop-style', args: 'spoken' } as never)
+      await quiet(w)
+      await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
+      await w.clock.advance(10_000)
+      expect(w.said.map(x => x.voice)).toEqual(['kokoro:af_heart'])
+      // The first player found wins: PipeWire, then PulseAudio, then ALSA.
+      expect(w.playersUsed.at(-1)).toBe(platform === 'Linux' ? 'paplay' : 'powershell')
+      w.finishSpeech()
+      await w.clock.advance(1)
+      expect(w.said.at(-1)?.text).toBe('refreshToken checks the old token first.')
+      await $.command.run({ command: 'inloop-style', args: 'written' } as never)
+      await w.clock.advance(1)
+    })
+  }
+
+  test('with no audio player, nothing is downloaded and the platform voice speaks', { timeoutMs: 20_000 }, async ($, on) => {
+    const w = world(on, STEPPED)
+    w.stored.delete('settings')
+    w.kokoro = true
+    w.isKokoroInstalled = false
+    w.hasSay = false
+    w.players = []
+    tools(on, w)
+    await start($)
+    await w.clock.advance(1)
+    expect(w.setupRuns).toBe(0)
+    await quiet(w)
+    await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
+    await w.clock.advance(10_000)
+    expect(w.spoken.includes('The agent added refreshToken.')).toBe(true)
+    expect((await $.command.run({ command: 'inloop-voice', args: 'setup' } as never)).text).toMatch(/audio player/)
+    await $.command.run({ command: 'inloop-style', args: 'written' } as never)
+    await w.clock.advance(1)
+  })
+
+  test('a clip the player cannot play is said by the system voice, not skipped', { timeoutMs: 20_000 }, async ($, on) => {
+    const w = world(on, STEPPED)
+    w.kokoro = true
+    w.isPlayerBroken = true
+    tools(on, w)
+    await start($)
+    await $.command.run({ command: 'inloop-style', args: 'spoken' } as never)
+    await quiet(w)
+    await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
+    await w.clock.advance(10_000)
+    expect(w.said.map(x => [x.text, x.voice])).toEqual([['The agent added refreshToken.', 'Zoe (Premium)']])
+    await $.command.run({ command: 'inloop-style', args: 'written' } as never)
+    await w.clock.advance(1)
+  })
+
   test('while Kokoro is still rendering, the pane and status line say audio is being generated', { timeoutMs: 20_000 }, async ($, on) => {
     const w = world(on, STEPPED)
     w.kokoro = true

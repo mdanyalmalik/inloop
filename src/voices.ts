@@ -67,6 +67,9 @@ export function needsBetterVoice(voices: readonly Voice[]): boolean {
 export const VOICE_HELP =
   'For the most natural voice (free, offline), inloop downloads Kokoro by itself (~200 MB, once) when [uv](https://docs.astral.sh/uv/) is installed; `/inloop-voice setup` starts it now. Or download a Mac voice marked **Premium**: System Settings → Accessibility → Spoken Content → System voice → Manage Voices…'
 
+export const NO_PLAYER_HELP =
+  'The natural Kokoro voice needs an audio player, and none was found. On Linux, install one of: pipewire (pw-play), pulseaudio-utils (paplay), alsa-utils (aplay) or ffmpeg (ffplay), then restart the session. Until then the system voice speaks.'
+
 /** Kokoro's voices worth offering (all built into its voice file), best first. */
 export const KOKORO_VOICES: readonly { id: string; label: string }[] = [
   { id: 'af_heart', label: 'Heart (US, warm)' },

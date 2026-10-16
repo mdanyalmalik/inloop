@@ -23,7 +23,7 @@ import type {
 import type { App } from './app'
 import { extractSymbols } from './analysis'
 import { formatRanges, summarizeDiff } from './diff'
-import { describePlan, KOKORO_VOICES, rankVoices, VOICE_HELP } from './voices'
+import { describePlan, KOKORO_VOICES, NO_PLAYER_HELP, rankVoices, VOICE_HELP } from './voices'
 import { callersOf, calleesOf, enclosingSymbol, flowOrder, lookup } from './graph'
 
 export type Snapshot = {
@@ -923,7 +923,7 @@ async function settingsTab(k: Kit): Promise<RenderElement> {
   const s = k.s.settings
   const usage = k.s.usage
   const voiceOptions = [
-    ...(app.isKokoroReady ? KOKORO_VOICES.map(v => ({ value: `kokoro:${v.id}`, label: `${v.label} — Kokoro` })) : []),
+    ...(app.canUseKokoro ? KOKORO_VOICES.map(v => ({ value: `kokoro:${v.id}`, label: `${v.label} — Kokoro` })) : []),
     ...rankVoices(app.voices).slice(0, 8).map(v => ({ value: v.name, label: `${v.name} — Mac` })),
   ]
   if (Select === undefined || Input === undefined) {
@@ -1035,12 +1035,12 @@ async function settingsTab(k: Kit): Promise<RenderElement> {
       />
       <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
         <Button key="set:testvoice" label="test voice" onPress={fire(k, () => app.speak('Here is how I sound when I explain a change to you.'))} />
-        {!app.isKokoroReady && k.s.status.isVoiceSettingUp !== true && (
+        {!app.isKokoroReady && app.host.canPlayClips && k.s.status.isVoiceSettingUp !== true && (
           <Button key="set:kokoro" label="install natural voice (Kokoro)" onPress={fire(k, async () => app.host.toast(await app.setupKokoro()))} />
         )}
         <Button key="set:reloadvoices" label="reload voices" plain onPress={fire(k, () => app.refreshVoices().then(() => app.host.toast(`using ${describePlan(app.voicePlan(s.voice))}`)))} />
       </Box>
-      {!app.isKokoroReady && <Markdown dimColor text={VOICE_HELP} />}
+      {!app.canUseKokoro && <Markdown dimColor text={app.host.canPlayClips ? VOICE_HELP : NO_PLAYER_HELP} />}
       <Text dimColor>
         inloop model use this session: {usage.calls} calls · {usage.inputTokens.toLocaleString()} in · {usage.outputTokens.toLocaleString()} out tokens
       </Text>

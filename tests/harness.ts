@@ -42,6 +42,14 @@ export type World = {
   kokoro: boolean
   /** Kokoro clip paths, to the text each was rendered from. */
   clips: Map<string, string>
+  /** The audio players this machine has (macOS: afplay; a Linux box might have paplay). */
+  players: string[]
+  /** Whether macOS's `say` exists; elsewhere speech goes to the platform synthesizer. */
+  hasSay: boolean
+  /** The player each clip was handed to. */
+  playersUsed: string[]
+  /** The player starts but cannot play (no sound device): it exits non-zero. */
+  isPlayerBroken: boolean
   /** With `kokoro` (uv present): whether its model is downloaded yet. */
   isKokoroInstalled: boolean
   /** How many times setup ran; while `isSetupHeld`, it waits for releaseSetup() (a long download). */
@@ -66,6 +74,8 @@ export type World = {
   get: <K extends keyof InloopState>(key: K) => InloopState[K] | undefined
 }
 
+const PLAYERS = ['afplay', 'pw-play', 'paplay', 'aplay', 'ffplay', 'powershell']
+
 export function world(
   on: On,
   reply: (prompt: string) => string = () => '{"worth_explaining": true, "title": "T", "summary": "S", "key_lines": []}',
@@ -86,6 +96,10 @@ export function world(
     root: ROOT,
     kokoro: false,
     clips: new Map(),
+    players: ['afplay'],
+    hasSay: true,
+    playersUsed: [],
+    isPlayerBroken: false,
     isKokoroInstalled: true,
     setupRuns: 0,
     isSetupHeld: false,
@@ -142,7 +156,14 @@ export function world(
     w.gitCalls.push(argv)
     const args = argv.filter(a => a !== '-c' && a !== 'core.quotepath=off' && a !== '--no-pager').slice(1)
     const ok = (stdout: string, exitCode = 0, stderr = '') => ({ value: { exitCode, stdout, stderr, isStdoutTruncated: false, isStderrTruncated: false } })
-    if (argv[0] === 'say') return ok(SAY_LISTING)
+    if (argv[0] === 'say') {
+      if (!w.hasSay) throw new Error('spawn say ENOENT')
+      return ok(SAY_LISTING)
+    }
+    if (PLAYERS.includes(argv[0] ?? '')) {
+      if (!w.players.includes(argv[0]!)) throw new Error(`spawn ${argv[0]} ENOENT`)
+      return ok('')
+    }
     if (argv[0] === 'uv') {
       if (!w.kokoro) return ok('', 127, 'uv: not found')
       if (argv[1] === '--version') return ok('uv 0.8.0\n')
@@ -215,8 +236,13 @@ export function world(
       }
       return { value: { code: 0, signal: null } }
     }
+    if (argv[0] === 'say' && !w.hasSay) throw new Error('spawn say ENOENT')
+    if (PLAYERS.includes(argv[0] ?? '') && !w.players.includes(argv[0]!)) throw new Error(`spawn ${argv[0]} ENOENT`)
     const v = argv.indexOf('-v')
-    const clip = argv[0] === 'afplay' ? w.clips.get(argv[1] ?? '') : undefined
+    const clipPath = PLAYERS.includes(argv[0] ?? '') ? argv.find(a => w.clips.has(a)) ?? argv.map(a => /'(\/virtual\/[^']+)'/.exec(a)?.[1]).find(p => p !== undefined) : undefined
+    if (clipPath !== undefined) w.playersUsed.push(argv[0]!)
+    if (clipPath !== undefined && w.isPlayerBroken) return { value: { code: 1, signal: null } }
+    const clip = clipPath !== undefined ? w.clips.get(clipPath) : undefined
     const entry = clip !== undefined
       ? { text: clip.split('|')[1] ?? '', voice: `kokoro:${clip.split('|')[0]}`, isCut: false }
       : { text: e.input ?? '', voice: v >= 0 ? argv[v + 1] : undefined, isCut: false }

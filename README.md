@@ -52,7 +52,7 @@ Requirements: Claude Code 2.1.301 or newer (inloop uses the plugin mod API: func
 
 ```bash
 claude plugin validate .        # manifest + hooks module, as the engine reads them
-claude plugin test .            # 62 tests: logic + engine-level (hooks, pane on terminal/desktop/mobile)
+claude plugin test .            # 66 tests: logic + engine-level (hooks, pane on terminal/desktop/mobile)
 claude --plugin-dir .           # a live session with inloop loaded
 ```
 
@@ -152,7 +152,14 @@ Every explanation is a short summary plus a few **parts**, each a sentence or tw
 
 You can switch styles at any time, even mid-explanation. Switching to written stops the voice at once, including a confirmation still being said, and leaves the explanation open to read. Switching back to spoken reads the next change aloud from its start.
 
-**The voice is Kokoro** (Kokoro-82M, Apache-2.0), a free neural voice that runs locally and sounds close to a person. It sets itself up: the first time a session starts on a machine with `uv`, inloop downloads it in the background (~200 MB, once) into `~/.cache/inloop/`. It runs through `uv` in an isolated environment, with nothing installed system-wide. While it downloads, the pane says so and the Mac voice speaks; when it's ready, a toast says so and Kokoro takes over. Sessions starting at the same time share one download. To set it up by hand instead, choose Settings → *natural voice: only when I install it*, then use `/inloop-voice setup` or **install natural voice**. inloop doesn't install `uv` itself, since that means running an installer on your machine. After setup Kokoro runs offline, and nothing is sent anywhere. Every part of an explanation is rendered ahead in one go, so there is no gap between parts, and each part plays as a clip that stop, pause and skip cut off at once. Without Kokoro (or without `uv`), inloop uses the Mac's best installed voice instead. Kokoro can take several seconds to start, so while a part is still being rendered the narration box shows **⟳ generating audio…**, and so does the status line. Playback starts as soon as the audio is ready.
+**The voice is Kokoro** (Kokoro-82M, Apache-2.0), a free neural voice that runs locally and sounds close to a person. It sets itself up: the first time a session starts on a machine with `uv`, inloop downloads it in the background (~200 MB, once) into `~/.cache/inloop/`. It runs through `uv` in an isolated environment, with nothing installed system-wide. While it downloads, the pane says so and the Mac voice speaks; when it's ready, a toast says so and Kokoro takes over. Sessions starting at the same time share one download. To set it up by hand instead, choose Settings → *natural voice: only when I install it*, then use `/inloop-voice setup` or **install natural voice**. inloop doesn't install `uv` itself, since that means running an installer on your machine. After setup Kokoro runs offline, and nothing is sent anywhere. Every part of an explanation is rendered ahead in one go, so there is no gap between parts, and each part plays as a clip that stop, pause and skip cut off at once. Without Kokoro (or without `uv`), inloop uses the system voice instead.
+
+| | macOS | Linux | Windows |
+| --- | --- | --- | --- |
+| Kokoro plays through | `afplay` | the first found of `pw-play`, `paplay`, `aplay`, `ffplay` | PowerShell's built-in sound player |
+| System voice | `say`, with a voice picker; stop and skip cut it off mid-sentence | the platform synthesizer through Claude Code (`$.audio.speak`); no voice picker, and stop and skip take effect after the current part | same as Linux |
+
+If no player is found, Kokoro isn't downloaded and the system voice speaks. A clip that a player fails to play (no sound device, say) is read by the system voice instead of being skipped. Kokoro can take several seconds to start, so while a part is still being rendered the narration box shows **⟳ generating audio…**, and so does the status line. Playback starts as soon as the audio is ready.
 
 Each spoken part is one short plain sentence that doesn't read out code names, paths or line numbers, since the code is on screen. Choose a voice in Settings (with **test voice**) or with `/inloop-voice`, which lists the Kokoro and Mac voices; `/inloop-voice heart`, `/inloop-voice george`, or `/inloop-voice auto`. Only one thing speaks at a time: a confirmation never plays over an explanation. Voice files live in `~/.cache/inloop/` (the model in `kokoro/`, clips in `tts/`, which are deleted after an hour).
 
@@ -223,7 +230,7 @@ It's a single mod: one hooks module, no MCP server, no extra process, no web ser
 
 ## Security and privacy
 
-- **Read-only by construction.** The module has no file-write call at all (validate lists its calls). The only processes it runs are `git` with read-only subcommands, and for speech `say`, `afplay` and `uv` running inloop's own `voice/inloop_tts.py`. All are passed as an argument list with no shell. The voice script writes only under `~/.cache/inloop/`, and reaches the network only to set the voice up (automatically on first start, or with `/inloop-voice setup`): `uv` fetches the script's Python packages and the script downloads the model from its GitHub release. After that it runs with `--offline`. The model never gets tools. It can only ask for inloop's own read-only lookups.
+- **Read-only by construction.** The module has no file-write call at all (validate lists its calls). The only processes it runs are `git` with read-only subcommands, and for speech `say`, an audio player (`afplay`, `pw-play`, `paplay`, `aplay`, `ffplay`, or PowerShell playing a clip) and `uv` running inloop's own `voice/inloop_tts.py`. All are passed as an argument list with no shell. The voice script writes only under `~/.cache/inloop/`, and reaches the network only to set the voice up (automatically on first start, or with `/inloop-voice setup`): `uv` fetches the script's Python packages and the script downloads the model from its GitHub release. After that it runs with `--offline`. The model never gets tools. It can only ask for inloop's own read-only lookups.
 - **Never executes repository code** to explain it.
 - **Sensitive files are never read:** `.env*`, keys and certificates, `id_rsa*`, `.npmrc`/`.netrc`/`.git-credentials`, `.aws/`/`.ssh/`, `credentials`/`secrets.*`, service-account JSON, `.git/`. They're also excluded from git greps and patches. Edits to them are noticed but never read.
 - **Secrets are masked** before any text goes to the model: common key formats, private keys, JWT-like strings, and quoted values assigned to names like `password`, `token` or `apiKey`. References like `process.env.X` are kept.
@@ -236,10 +243,10 @@ It's a single mod: one hooks module, no MCP server, no extra process, no web ser
 
 ## Testing
 
-`claude plugin test .` runs 62 tests in the engine's own test kit:
+`claude plugin test .` runs 66 tests in the engine's own test kit:
 
 - **Logic** (28): path, sensitive-file, revision and secret rules; symbol, route, React and HTTP-call extraction; significance scoring; focus matching; diffs; batching windows; the demo app's login flow, from the button to the database, with every node checked against its source line and every edge's confidence; callers; natural-language search; the first commit's index (sessions, no JWT); JSON recovery; static cards; voice listing, ranking and choice; spoken-text cleanup.
-- **Engine** (34): the plugin loaded by the engine over a virtual project, with a scripted model:
+- **Engine** (38): the plugin loaded by the engine over a virtual project, with a scripted model:
   - an agent `Edit` produces a card with nobody asking, the tool result is untouched, and the prompt is framed as untrusted data and never contains the `.env` secret
   - three edits across files become one card
   - comment-only edits cost nothing
@@ -268,6 +275,7 @@ It's a single mod: one hooks module, no MCP server, no extra process, no web ser
   - switching style mid-explanation: written silences at once (a confirmation too), spoken picks up with the next change
   - while Kokoro is still rendering, the pane and status line say audio is being generated
   - out of the box the style is spoken and the natural voice downloads in the background once (a request meanwhile joins it; the Mac voice speaks until it's ready); with the automatic download turned off, nothing is downloaded
+  - on Linux and Windows, Kokoro's clips play through the player the machine has; with no player nothing is downloaded and the platform voice speaks; a clip the player can't play is said by the system voice instead
 
 Verified by hand with real Claude Code 2.1.301, the real model and real git, on the demo app:
 
@@ -291,7 +299,7 @@ Verified by hand with real Claude Code 2.1.301, the real model and real git, on 
 - **No "open in editor" button.** The plugin API offers no call to open a file in the IDE, so code is shown in inloop's own read-only viewer.
 - **Slash commands leave one short line in the transcript.** In interactive sessions, `/inloop-*` commands print a one-line acknowledgement that says it is not a request for the coding agent. Questions typed in the pane's field leave nothing in the transcript.
 - **The flow diagram** is a tree in the terminal (the terminal draws no SVG) and an SVG on desktop. There's no zoom: large flows stop at 22–24 steps with a note, and you can trace further from any step.
-- **Speech input is not part of inloop.** Speech output is optional. The natural Kokoro voice needs `uv` and a one-time ~200 MB download (automatic), and plays through `afplay` (macOS). Without it, inloop uses the Mac's own voices, whose quality depends on which are installed. Other platforms use their own synthesizer, without a voice picker.
+- **Speech input is not part of inloop.** Speech output is optional. The natural Kokoro voice needs `uv` and a one-time ~200 MB download (automatic), and an audio player (see the table under [Two styles](#two-styles-written-and-spoken)). Without them, inloop uses the system voice: on macOS any installed voice, elsewhere the platform's default, without a voice picker. Linux and Windows playback is covered by tests but hasn't been tried on real machines yet.
 - **The changes box scrolls with the pane.** Claude Code can't stack a second pane above another, so the box sits at the top of inloop's pane and scrolls away if you scroll the whole pane. It counts changes Claude makes, and also any you make yourself in files Claude touched since the prompt.
 - History is capped at 150 explanations (bookmarks first) to stay within the plugin store's 4 MiB.
 
@@ -302,7 +310,7 @@ Verified by hand with real Claude Code 2.1.301, the real model and real git, on 
 - **A card says "model explanation unavailable".** The model call failed, for example because of rate limits or a model your account can't use. The static card is still shown. Change models in Settings, or choose *static analysis only*.
 - **"not a git repository".** History features, the changes box for shell-made changes, and catching changes no edit tool reported all need git. Everything else works without it.
 - **Spoken explanations start slowly.** Kokoro loads its model for each explanation, which takes a few seconds (⟳ *generating audio…* shows meanwhile). Parts after the first are rendered ahead, so they play without a gap. For an instant start, choose a Mac voice with `/inloop-voice`.
-- **No sound.** Run `/inloop-voice` to see which voice is in use, and **test voice** in Settings. If Kokoro isn't set up, check that `uv` is installed, then restart the session or run `/inloop-voice setup`.
+- **No sound.** Run `/inloop-voice` to see which voice is in use, and **test voice** in Settings. On Linux, the natural voice needs one of `pw-play`, `paplay`, `aplay` or `ffplay`; install one (for example `pulseaudio-utils` or `alsa-utils`) and restart the session. If Kokoro isn't set up, check that `uv` is installed, then restart the session or run `/inloop-voice setup`.
 - **Prefer reading.** `/inloop-style written` (kept across sessions).
 - **Checking what the plugin did.** `claude --debug-file /tmp/d.log --plugin-dir …` logs every `$` call inloop makes (git runs, model calls with timings, store writes). `claude plugin validate .` lists every call the module can make.
 

@@ -120,6 +120,27 @@ export const register: Register = on => {
       }
     }
     const ttsScript = `${$.plugin.root}/voice/inloop_tts.py`
+    // A player for Kokoro's clips, the first this machine has: macOS, then Linux
+    // (PipeWire/PulseAudio, ALSA, FFmpeg), then Windows. A probe that cannot start means absent.
+    const PLAYERS: { probe: string[]; play: (path: string) => string[] }[] = [
+      { probe: ['afplay', '-h'], play: path => ['afplay', path] },
+      { probe: ['pw-play', '--version'], play: path => ['pw-play', path] },
+      { probe: ['paplay', '--version'], play: path => ['paplay', path] },
+      { probe: ['aplay', '--version'], play: path => ['aplay', '-q', path] },
+      { probe: ['ffplay', '-version'], play: path => ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet', path] },
+      {
+        probe: ['powershell', '-NoProfile', '-NonInteractive', '-Command', 'exit 0'],
+        play: path => ['powershell', '-NoProfile', '-NonInteractive', '-Command', `(New-Object Media.SoundPlayer '${path.replace(/'/g, "''")}').PlaySync()`],
+      },
+    ]
+    let player: ((path: string) => string[]) | undefined
+    for (const candidate of PLAYERS) {
+      const probe = await $.process.run(candidate.probe, { timeoutMs: 5000 }).catch(() => undefined)
+      if (probe !== undefined) {
+        player = candidate.play
+        break
+      }
+    }
     const host: Host = {
       root: () => $.session.root(),
       home: async () => home,
@@ -179,6 +200,7 @@ export const register: Register = on => {
         return { done, stop }
       },
       hasUv: uv !== undefined,
+      canPlayClips: player !== undefined,
       kokoroReady: async () => {
         if (uv === undefined) return false
         const checked = await $.process.run([uv, 'run', '--offline', '--quiet', '--script', ttsScript, 'status'], { timeoutMs: 60_000 }).catch(() => undefined)
@@ -210,11 +232,20 @@ export const register: Register = on => {
         return { paths: paths(), stop: () => void stream.return(undefined as never).catch(() => undefined) }
       },
       play: path => {
-        const stream = $.process.spawn({ argv: ['afplay', path] })
+        if (player === undefined) return { done: Promise.reject(new Error('no audio player')), stop: () => undefined }
+        const stream = $.process.spawn({ argv: player(path) })
+        let isStopped = false
         const done = (async () => {
-          for await (const piece of stream) void piece
+          let step = await stream.next()
+          while (step.done !== true) step = await stream.next()
+          // A player that could not play (no sound device, a format it lacks) exits non-zero.
+          if (!isStopped && step.value.code !== 0) throw new Error(`the audio player exited with ${step.value.code ?? step.value.signal}`)
         })()
-        return { done, stop: () => void stream.return(undefined as never).catch(() => undefined) }
+        const stop = () => {
+          isStopped = true
+          void stream.return(undefined as never).catch(() => undefined)
+        }
+        return { done, stop }
       },
       listVoices: async () => {
         const listed = await $.process.run(['say', '-v', '?'], { timeoutMs: 5000 }).catch(() => undefined)
@@ -504,6 +535,8 @@ export const register: Register = on => {
     const live = app
     const want = e.args.trim()
     if (want === 'setup') {
+      // What cannot be set up here is said at once, not after a pretend start.
+      if (!live.host.hasUv || !live.host.canPlayClips || live.canUseKokoro) return { text: await live.setupKokoro() }
       if (!isHeadless) {
         live.detach(async () => live.host.log(`inloop: ${await live.setupKokoro()}`))
         return { text: 'Installing the Kokoro voice (one-time download, ~200 MB); inloop says when it is ready.' }
@@ -513,7 +546,7 @@ export const register: Register = on => {
     const voices = await live.refreshVoices()
     const s = await read($, settingsAtom)
     if (want === '') {
-      const kokoro = live.isKokoroReady ? KOKORO_VOICES.map(v => `  kokoro:${v.id}  ${v.label}`) : []
+      const kokoro = live.canUseKokoro ? KOKORO_VOICES.map(v => `  kokoro:${v.id}  ${v.label}`) : []
       const system = rankVoices(voices).slice(0, 10).map(v => `  ${v.name}${v.quality === 'premium' || v.quality === 'enhanced' ? ` (${v.quality})` : ''}`)
       return {
         text: [
@@ -532,7 +565,7 @@ export const register: Register = on => {
     const lower = want.toLowerCase().replace(/^kokoro:/, '')
     const kokoro = KOKORO_VOICES.find(v => v.id === lower || v.label.toLowerCase().startsWith(lower))
     if (kokoro !== undefined) {
-      if (!live.isKokoroReady) return { text: 'Kokoro is not set up yet: /inloop-voice setup' }
+      if (!live.canUseKokoro) return { text: live.isKokoroReady ? 'This machine has no audio player for Kokoro; see /inloop-voice setup.' : 'Kokoro is not set up yet: /inloop-voice setup' }
       await live.setSettings({ voice: `kokoro:${kokoro.id}` })
       live.detach(() => live.speak(say))
       return { text: `Voice: ${kokoro.label} (Kokoro).` }

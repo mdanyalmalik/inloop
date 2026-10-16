@@ -48,13 +48,15 @@ export type Host = {
   say: (text: string, voice?: string) => { done: Promise<void>; stop: () => void }
   /** Whether `uv` (which runs the Kokoro voice) is on this machine. */
   hasUv: boolean
+  /** Whether this machine has a player for Kokoro's clips (afplay, pw-play, paplay, aplay, ffplay, or PowerShell). */
+  canPlayClips: boolean
   /** Whether the Kokoro voice is set up (checked offline). */
   kokoroReady: () => Promise<boolean>
   /** Downloads and checks Kokoro once; resolves with what the setup printed. */
   kokoroSetup: () => Promise<{ ok: boolean; text: string }>
   /** Renders `texts` with Kokoro in one process: each WAV path as it is ready, in order. */
   synthesize: (texts: readonly string[], voice: string, speed: number) => { paths: AsyncIterable<string>; stop: () => void }
-  /** Plays an audio file; can be cut off. */
+  /** Plays an audio file with this machine's player; can be cut off. `done` rejects when it could not play. */
   play: (path: string) => { done: Promise<void>; stop: () => void }
   /** The system's voice listing (`say -v '?'` on macOS); '' where there is none. */
   listVoices: () => Promise<string>
