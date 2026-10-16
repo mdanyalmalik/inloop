@@ -46,6 +46,12 @@ export type InloopCard = {
   bookmarked?: boolean
   /** True when no model call was made (static analysis only). */
   isHeuristic?: boolean
+  /** A change inloop chose not to explain, and why; shown as one line with "explain anyway". */
+  skipped?: string
+  /** The explanation could not be written (the model call failed), and why; shown with "try again". */
+  failed?: string
+  /** The project the explanation belongs to, so a new session's feed starts with its own. */
+  root?: string
   flowId?: string
 }
 
@@ -231,6 +237,8 @@ declare module 'claude-code' {
       status: InloopStatus
       narration: InloopNarration | null
       changes: InloopTurnChanges
+      /** Advances while something is being generated, to animate the spinners. */
+      frame: number
     }
   }
 }

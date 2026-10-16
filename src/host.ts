@@ -61,4 +61,5 @@ export type Host = {
   /** The system's voice listing (`say -v '?'` on macOS); '' where there is none. */
   listVoices: () => Promise<string>
   after: (ms: number, fn: () => void) => Timer
+  every: (ms: number, fn: () => void) => Timer
 }

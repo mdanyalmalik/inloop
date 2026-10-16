@@ -30,6 +30,7 @@ const ctxAtom = atom({ plugin: 'inloop', key: 'ctx' } as const, {})
 const gitAtom = atom({ plugin: 'inloop', key: 'git' } as const, { query: '', commits: [], files: [] })
 const usageAtom = atom({ plugin: 'inloop', key: 'usage' } as const, { calls: 0, inputTokens: 0, outputTokens: 0 })
 const narrationAtom = atom({ plugin: 'inloop', key: 'narration' } as const, null)
+const frameAtom = atom({ plugin: 'inloop', key: 'frame' } as const, 0)
 const changesAtom = atom({ plugin: 'inloop', key: 'changes' } as const, { since: 0, files: [] })
 const statusAtom = atom({ plugin: 'inloop', key: 'status' } as const, { busy: null, queued: 0, pendingChanges: 0, recentBatches: 0 })
 
@@ -174,6 +175,7 @@ export const register: Register = on => {
         status: { get: () => read($, statusAtom), update: change => update($, statusAtom, change) },
         narration: { get: () => read($, narrationAtom), update: change => update($, narrationAtom, change) },
         changes: { get: () => read($, changesAtom), update: change => update($, changesAtom, change) },
+        frame: { get: () => read($, frameAtom), update: change => update($, frameAtom, change) },
       },
       status: text => $.ui.status(text),
       toast: (text, options) => $.ui.toast(text, options),
@@ -252,6 +254,7 @@ export const register: Register = on => {
         return listed?.exitCode === 0 ? listed.stdout : ''
       },
       after: (ms, fn) => $.clock.after(ms, fn),
+      every: (ms, fn) => $.clock.every(ms, fn),
     }
     app = new App(host)
     app.isHeadless = isHeadless
@@ -263,8 +266,9 @@ export const register: Register = on => {
   })
 
   on('session.end', async ($, e, next) => {
-    // Let an explanation already under way land in history before the session goes.
-    await app?.drain(20_000).catch(() => undefined)
+    // Claude Code gives this hook about 1.5 s and cuts model calls off then, so no
+    // explanation is started here: one would only end as a failed card. (A headless
+    // run already waited for its explanations when its turn completed.)
     app?.stop()
     return next(e)
   })
@@ -321,7 +325,7 @@ export const register: Register = on => {
     if (narration === null || app === null || e.props.hasSurvey) return next(e)
     const panes = await $.ui.panes().catch(() => [])
     if (panes.some(p => p.id === PANE && p.isShown && p.isPlaced)) return next(e)
-    return narrationBand($.ui.resolve(e), narration, app, e.props.bodyColumns, e.props.maxRows)
+    return narrationBand($.ui.resolve(e), narration, app, e.props.bodyColumns, e.props.maxRows, await read($, frameAtom))
   })
 
   // The band follows the pane: hidden or shown again, it redraws. A pane the
@@ -367,6 +371,7 @@ export const register: Register = on => {
       usage: await read($, usageAtom),
       narration: await read($, narrationAtom),
       changes: await read($, changesAtom),
+      frame: await read($, frameAtom),
     }
     return renderPane({
       el: $.ui.resolve(e),

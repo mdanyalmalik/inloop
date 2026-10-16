@@ -107,7 +107,8 @@ describe('automatic explanations', () => {
     await start($)
     await $.tool.call({ tool: 'Edit', file_path: `${ROOT}/server/db/index.js`, old_string: 'const tables', new_string: '// in-memory tables\nconst tables' } as never)
     await w.clock.advance(10_000)
-    expect(w.get('cards') ?? []).toEqual([])
+    // Not explained, but not hidden either: one line says so.
+    expect((w.get('cards') ?? []).map(c => c.skipped)).toEqual(['a small change'])
     expect(w.prompts.length).toBe(0)
   })
 
@@ -118,8 +119,59 @@ describe('automatic explanations', () => {
     await $.command.run({ command: 'inloop-focus', args: 'database queries' } as never)
     await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
     await w.clock.advance(10_000)
-    expect(w.get('cards') ?? []).toEqual([])
+    expect((w.get('cards') ?? []).map(c => c.skipped)).toEqual(['not about "database queries"'])
     expect(w.prompts.length).toBe(0)
+  })
+
+  test('a skipped change shows as one line, and "explain anyway" explains it in its place', async ($, on) => {
+    const w = world(on, () => JSON.stringify({ worth_explaining: true, title: 'Tables comment', summary: 'A comment names the tables.', steps: [] }))
+    tools(on, w)
+    await start($)
+    await $.tool.call({ tool: 'Edit', file_path: `${ROOT}/server/db/index.js`, old_string: 'const tables', new_string: '// in-memory tables\nconst tables' } as never)
+    await w.clock.advance(10_000)
+    const ui = await $.ui.mount({ plugin: 'inloop', surface: 'terminal', component: 'Pane', requestId: 'inloop', props: PANE_PROPS as never })
+    expect(await ui.find({ text: /not explained · Edited server\/db\/index\.js/ })).toBeDefined()
+    expect(await ui.find({ text: /1 not explained/ })).toBeDefined()
+    // Never read aloud, never saved to history.
+    expect(w.get('history') ?? []).toEqual([])
+    const id = (w.get('cards') ?? [])[0]!.id
+    await ui.press({ key: `feed:again:${id}` })
+    await w.clock.advance(10_000)
+    const cards = w.get('cards') ?? []
+    expect(cards.length).toBe(1)
+    expect(cards[0]!.title).toBe('Tables comment')
+    expect(cards[0]!.skipped).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('the model saying "not worth explaining" shows as not explained, not as nothing', async ($, on) => {
+    const w = world(on, () => JSON.stringify({ worth_explaining: false }))
+    tools(on, w)
+    await start($)
+    await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
+    await w.clock.advance(10_000)
+    expect((w.get('cards') ?? []).map(c => c.skipped)).toEqual(['the model judged it too minor to explain'])
+  })
+
+  test('a failed model call says so plainly, with the changes and "try again"; a cut-off call is retried once', async ($, on) => {
+    const w = world(on)
+    w.failModel = call => (call <= 2 ? { reason: 'aborted' } : { reason: 'api-error', status: 529, error: 'overloaded' })
+    tools(on, w)
+    await start($)
+    await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
+    await w.clock.advance(10_000)
+    expect(w.prompts.length).toBe(2)
+    const card = (w.get('cards') ?? [])[0]!
+    expect(card.failed).toBe('aborted')
+    expect(card.steps).toEqual([])
+    const ui = await $.ui.mount({ plugin: 'inloop', surface: 'terminal', component: 'Pane', requestId: 'inloop', props: PANE_PROPS as never })
+    expect(await ui.find({ text: /⚠ explanation failed/ })).toBeDefined()
+    await ui.press({ key: `feed:card:${card.id}` })
+    expect(await ui.find({ text: /server\/auth\/tokens\.js/ })).toBeDefined()
+    await ui.press({ key: `feed:again:${card.id}` })
+    await w.clock.advance(10_000)
+    expect((w.get('cards') ?? [])[0]!.failed).toBe('API error 529 overloaded')
+    await ui.unmount()
   })
 
   test('paused mode records but does not explain; explain-recent does', async ($, on) => {
@@ -348,6 +400,56 @@ describe('changes made outside the edit tools', () => {
     const cards = w.get('cards') ?? []
     expect(cards.length).toBe(1)
     expect(cards[0]!.files).toEqual(['server/app.js'])
+  })
+
+  test('a script that edits and commits in one command is still seen', async ($, on) => {
+    const w = world(on)
+    tools(on, w)
+    await start($)
+    w.files.set('server/app.js', w.files.get('server/app.js')! + '\nfunction health(req, res) {\n  res.json({ ok: true })\n}\n')
+    w.commit()
+    await $.tool.call({ tool: 'Bash', command: 'python3 fix.py && git commit -am "health"' } as never)
+    await w.clock.advance(10_000)
+    const cards = w.get('cards') ?? []
+    expect(cards.length).toBe(1)
+    expect(cards[0]!.diff?.includes('+function health(req, res) {')).toBe(true)
+  })
+
+  test('a virtual environment full of files is never taken for changes', async ($, on) => {
+    const w = world(on)
+    for (let i = 0; i < 400; i++) w.files.set(`.venv-qi/lib/python3.12/site-packages/pkg/m${i}.py`, `def f${i}():\n    return ${i}\n`)
+    tools(on, w)
+    await start($)
+    w.files.set('server/app.js', w.files.get('server/app.js')! + '\nfunction health(req, res) {\n  res.json({ ok: true })\n}\n')
+    await $.tool.call({ tool: 'Bash', command: 'python3 fix.py' } as never)
+    await w.clock.advance(10_000)
+    const cards = w.get('cards') ?? []
+    expect(cards.map(c => c.files)).toEqual([['server/app.js']])
+    // Unchanged files are fingerprinted, not read again, on the next scan.
+    const before = w.reads.length
+    await $.tool.call({ tool: 'Bash', command: 'ls' } as never)
+    await w.clock.advance(10_000)
+    expect(w.reads.length).toBe(before)
+  })
+
+  test("after a restart the feed starts with this project's earlier explanations", async ($, on) => {
+    const mine = { id: 'old1', at: 1000, title: 'Earlier change here', summary: 'S', files: ['server/app.js'], symbols: [], refs: [], source: 'auto', root: ROOT }
+    const legacy = { id: 'old2', at: 900, title: 'Untagged, files here', summary: 'S', files: ['server/auth/tokens.js'], symbols: [], refs: [], source: 'auto' }
+    const other = { id: 'old3', at: 800, title: 'Another project', summary: 'S', files: ['src/x.ts'], symbols: [], refs: [], source: 'auto', root: '/elsewhere' }
+    const asked = { id: 'old4', at: 700, title: 'a question', summary: 'S', files: [], symbols: [], refs: [], source: 'ask', root: ROOT }
+    const w = world(on, undefined, { history: [mine, legacy, other, asked] })
+    tools(on, w)
+    await start($)
+    expect((w.get('cards') ?? []).map(c => c.id)).toEqual(['old1', 'old2'])
+    const ui = await $.ui.mount({ plugin: 'inloop', surface: 'terminal', component: 'Pane', requestId: 'inloop', props: PANE_PROPS as never })
+    expect(await ui.find({ text: /earlier sessions/ })).toBeDefined()
+    // New explanations go above them, and are tagged with this project.
+    await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
+    await w.clock.advance(10_000)
+    const cards = w.get('cards') ?? []
+    expect(cards.map(c => c.id).slice(1)).toEqual(['old1', 'old2'])
+    expect(cards[0]!.root).toBe(ROOT)
+    await ui.unmount()
   })
 
   test('the end of a turn catches changes no tool reported', async ($, on) => {
@@ -683,6 +785,11 @@ describe('styles', () => {
     expect(w.get('status')?.isVoiceSettingUp).toBe(true)
     const ui = await $.ui.mount({ plugin: 'inloop', surface: 'terminal', component: 'Pane', requestId: 'inloop', props: PANE_PROPS as never })
     expect(await ui.find({ text: /downloading the natural voice/ })).toBeDefined()
+    // The spinner turns while it downloads.
+    const frame = w.get('frame') ?? 0
+    await w.clock.advance(600)
+    expect((w.get('frame') ?? 0) - frame >= 4).toBe(true)
+    expect(await ui.find({ text: /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] downloading the natural voice/ })).toBeDefined()
     // Asking for it meanwhile joins the download under way.
     await $.command.run({ command: 'inloop-voice', args: 'setup' } as never)
     await w.clock.advance(1)
@@ -696,6 +803,10 @@ describe('styles', () => {
     await w.clock.advance(1)
     expect(w.get('status')?.isVoiceSettingUp).toBe(false)
     expect(w.toasts.some(t => /natural voice \(Kokoro\) is ready/.test(t))).toBe(true)
+    // Idle again: the spinner stops, so nothing redraws for nothing.
+    const still = w.get('frame')
+    await w.clock.advance(2000)
+    expect(w.get('frame')).toBe(still)
     expect(await ui.find({ text: /downloading the natural voice/ })).toBeUndefined()
     await ui.unmount()
   })

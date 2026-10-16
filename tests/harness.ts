@@ -25,6 +25,11 @@ export type World = {
   files: Map<string, string>
   /** The files as committed at HEAD. */
   head: Map<string, string>
+  /** Every commit's tree by sha, the last one HEAD; commit() makes one of the working files. */
+  commits: { sha: string; tree: Map<string, string> }[]
+  commit: () => void
+  /** A model call to fail, by its count from 1: the reason (and status) it fails with, or undefined to answer. */
+  failModel: (call: number) => { reason: string; status?: number; error?: string } | undefined
   prompts: { model: string; prompt: string; system: string }[]
   reads: string[]
   writes: string[]
@@ -74,6 +79,12 @@ export type World = {
   get: <K extends keyof InloopState>(key: K) => InloopState[K] | undefined
 }
 
+function hashText(text: string): string {
+  let h = 0
+  for (let i = 0; i < text.length; i++) h = (h * 31 + text.charCodeAt(i)) | 0
+  return (h >>> 0).toString(16)
+}
+
 const PLAYERS = ['afplay', 'pw-play', 'paplay', 'aplay', 'ffplay', 'powershell']
 
 export function world(
@@ -84,6 +95,9 @@ export function world(
   const w: World = {
     files: new Map(Object.entries(DEMO_HEAD)),
     head: new Map(Object.entries(DEMO_HEAD)),
+    commits: [],
+    commit: () => undefined,
+    failModel: () => undefined,
     prompts: [],
     reads: [],
     writes: [],
@@ -125,6 +139,11 @@ export function world(
   // Most tests read explanations: they start written, as a person who chose it would. Spoken is the default.
   w.stored.set('settings', { style: 'written' })
   for (const [key, value] of Object.entries(store)) w.stored.set(key, value)
+  w.commits.push({ sha: 'c0', tree: new Map(w.head) })
+  w.commit = () => {
+    w.head = new Map(w.files)
+    w.commits.push({ sha: `c${w.commits.length}`, tree: new Map(w.files) })
+  }
   on('store.get', ($, e) => ({ value: structuredClone(w.stored.get(e.key)) }))
   on('store.set', ($, e) => {
     w.stored.set(e.key, structuredClone(e.value))
@@ -187,9 +206,23 @@ export function world(
       for (const path of w.head.keys()) if (!w.files.has(path)) lines.push(` D ${path}`)
       return ok(lines.join('\n') + (lines.length > 0 ? '\n' : ''))
     }
-    if (args[0] === 'show' && (args[1] ?? '').startsWith('HEAD:')) {
-      const text = w.head.get((args[1] ?? '').slice(5))
-      return text === undefined ? ok('', 128, 'fatal: path not in HEAD') : ok(text)
+    if (args[0] === 'show' && /^[0-9a-zA-Z]+:/.test(args[1] ?? '')) {
+      const [rev = '', path = ''] = (args[1] ?? '').split(/:(.*)/s)
+      const tree = rev === 'HEAD' ? w.head : w.commits.find(c => c.sha === rev)?.tree
+      const text = tree?.get(path)
+      return text === undefined ? ok('', 128, `fatal: path not in ${rev}`) : ok(text)
+    }
+    if (args[0] === 'rev-parse' && args.includes('HEAD')) return ok(`${w.commits.at(-1)!.sha}\n`)
+    if (args[0] === 'diff' && args.includes('--name-only')) {
+      const revs = args.filter(a => /^c\d+$/.test(a))
+      const [a, b] = revs.map(r => w.commits.find(c => c.sha === r)!.tree)
+      const paths = new Set([...a!.keys(), ...b!.keys()])
+      return ok([...paths].filter(p => a!.get(p) !== b!.get(p)).join('\n') + '\n')
+    }
+    if (argv[1] === 'hash-object') {
+      const paths = String(e.init?.stdin ?? "").split('\n').filter(Boolean)
+      if (paths.some(p => !w.files.has(p))) return ok('', 128, 'fatal: could not open')
+      return ok(paths.map(p => `h${hashText(w.files.get(p)!)}`).join('\n') + '\n')
     }
     if (args[0] === 'grep') {
       const q = (args[args.indexOf('-e') + 1] ?? '').toLowerCase()
@@ -205,6 +238,8 @@ export function world(
   })
   on('model.complete', ($, e) => {
     w.prompts.push({ model: e.model, prompt: e.prompt, system: e.system ?? '' })
+    const failure = w.failModel(w.prompts.length)
+    if (failure !== undefined) return { value: { isAnswered: false, ...failure, usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } } } as never
     return { value: { isAnswered: true, text: w.reply(e.prompt), usage: { input_tokens: 100, output_tokens: 50, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } } } as never
   })
   on('model.classify', () => ({ value: w.classify }))

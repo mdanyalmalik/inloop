@@ -19,7 +19,11 @@ export function isSensitive(rel: string): boolean {
 
 const NOISE = [
   /(^|\/)node_modules\//,
-  /(^|\/)(dist|build|out|coverage|\.next|\.nuxt|vendor|target|__pycache__|\.venv|venv)\//,
+  /(^|\/)(dist|build|out|coverage|\.next|\.nuxt|vendor|target|__pycache__|site-packages|\.tox|\.mypy_cache|\.pytest_cache|\.ruff_cache|\.ipynb_checkpoints)\//,
+  // Virtual environments by any name: .venv, venv, .venv-qi, my-venv, env/lib/python3.12…
+  /(^|\/)[^/]*venv[^/]*\//i,
+  /(^|\/)[^/]+\/lib\/python\d[^/]*\//,
+  /(^|\/)pyvenv\.cfg$/,
   /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb|Cargo\.lock|poetry\.lock|go\.sum)$/,
   /\.(min\.js|map|png|jpe?g|gif|webp|ico|svg|pdf|zip|gz|woff2?|ttf|eot|mp[34]|mov|wasm)$/i,
   /(^|\/)\.claude-plugin\/types\//,

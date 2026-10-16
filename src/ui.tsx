@@ -45,6 +45,7 @@ export type Snapshot = {
   usage: InloopUsage
   narration: InloopNarration | null
   changes: InloopTurnChanges
+  frame: number
 }
 
 /** What a draw has: the surface's elements, the state as read for this draw, the controller, the room. */
@@ -85,6 +86,10 @@ const CONF_MARK: Record<string, string> = { confirmed: '━', inferred: '┅', r
  * work runs on the plugin's own timer, so the press answers at once and no
  * time limit on the press can cut the work short.
  */
+const SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+/** The spinner glyph for this frame. */
+const spin = (frame: number) => SPIN[frame % SPIN.length]!
+
 const fire = (k: Kit, work: () => Promise<unknown>) => (): void => {
   k.app.detach(work)
 }
@@ -115,7 +120,7 @@ function stepView(k: Kit, step: InloopStep, key: string, maxLines: number): Rend
  * Spoken style, above the prompt: what the pane would show while it is hidden
  * (behind another panel, or closed), kept to a few rows.
  */
-export function narrationBand(el: Kit['el'], n: InloopNarration, app: App, columns: number, maxRows: number): RenderElement {
+export function narrationBand(el: Kit['el'], n: InloopNarration, app: App, columns: number, maxRows: number, frame = 0): RenderElement {
   const { Box, Text, Button, Code } = el
   const step = n.steps[Math.max(0, n.index)]
   const codeRows = Math.max(0, Math.min(6, maxRows - 4))
@@ -123,7 +128,7 @@ export function narrationBand(el: Kit['el'], n: InloopNarration, app: App, colum
   return (
     <Box flexDirection="column" width={columns}>
       <Box flexDirection="row" columnGap={1}>
-        <Text color="suggestion" weight="bold" wrap="truncate-end">{n.isPaused ? '⏸' : n.isPreparing === true ? '⟳' : '▶'} inloop: {n.title}</Text>
+        <Text color="suggestion" weight="bold" wrap="truncate-end">{n.isPaused ? '⏸' : n.isPreparing === true ? spin(frame) : '▶'} inloop: {n.title}</Text>
         <Text dimColor>{n.index < 0 ? '' : `${n.index + 1}/${n.steps.length}`}</Text>
         {n.isPreparing === true && !n.isPaused && <Text color="warning">generating audio…</Text>}
       </Box>
@@ -154,12 +159,12 @@ function narrationBox(k: Kit): RenderElement | null {
   const lines = step?.code?.split('\n') ?? []
   return (
     <Box flexDirection="column" marginTop={1} borderStyle="round" borderColor="suggestion" paddingX={1}>
-      <Text color="suggestion" weight="bold" wrap="truncate-end">{n.isPaused ? '⏸ ' : n.isPreparing === true ? '⟳ ' : '▶ '}{n.title}</Text>
+      <Text color="suggestion" weight="bold" wrap="truncate-end">{n.isPaused ? '⏸ ' : n.isPreparing === true ? `${spin(k.s.frame)} ` : '▶ '}{n.title}</Text>
       <Text dimColor>
         {n.index < 0 ? 'starting' : `part ${n.index + 1} of ${n.steps.length}`}
         {n.queued > 0 ? ` · ${n.queued} more waiting` : ''}
       </Text>
-      {n.isPreparing === true && !n.isPaused && <Text color="warning">⟳ generating audio… it plays as soon as it is ready</Text>}
+      {n.isPreparing === true && !n.isPaused && <Text color="warning">{spin(k.s.frame)} generating audio… it plays as soon as it is ready</Text>}
       {n.index >= 0 && step !== undefined && <Markdown text={step.text} />}
       {step !== undefined && step.ref.path !== '' && (
         <Text dimColor wrap="truncate-start">{step.ref.path}{step.ref.line !== undefined ? `:${step.ref.line}` : ''}</Text>
@@ -228,10 +233,10 @@ export async function renderPane(k: Kit): Promise<RenderElement> {
           <Button key="rev:working" label="use current code" plain onPress={() => app.studyRevision('working')} />
         </Box>
       )}
-      {status.busy !== null && tab !== 'ask' && <Text color="suggestion">⟳ {status.busy}</Text>}
-      {status.isPreparingAudio === true && k.s.narration === null && <Text color="warning">⟳ generating audio…</Text>}
+      {status.busy !== null && tab !== 'ask' && <Text color="suggestion">{spin(k.s.frame)} {status.busy}</Text>}
+      {status.isPreparingAudio === true && k.s.narration === null && <Text color="warning">{spin(k.s.frame)} generating audio…</Text>}
       {status.isVoiceSettingUp === true && (
-        <Text dimColor wrap="truncate-end">⟳ downloading the natural voice (one time, ~200 MB); the Mac voice speaks until it is ready</Text>
+        <Text dimColor wrap="truncate-end">{spin(k.s.frame)} downloading the natural voice (one time, ~200 MB); the Mac voice speaks until it is ready</Text>
       )}
       {status.lastError !== undefined && status.busy === null && (
         <Box flexDirection="row" columnGap={1}>
@@ -384,7 +389,34 @@ function changesView(k: Kit, card: InloopCard, list: string): RenderElement | nu
   )
 }
 
+/** A change inloop did not explain, or could not: one line that says so, its changes when opened, and the way to get the explanation. */
+function unexplainedView(k: Kit, card: InloopCard, isOpen: boolean, list: 'feed' | 'history'): RenderElement {
+  const app = k.app
+  const { Box, Text, Button } = k.el
+  const isFailed = card.failed !== undefined
+  return (
+    <Box key={`${list}:${card.id}`} flexDirection="column" marginBottom={isOpen ? 1 : 0}>
+      <Box flexDirection="row" columnGap={1}>
+        <Button key={`${list}:card:${card.id}`} plain onPress={() => app.host.state.expanded.update(cur => (cur === card.id ? null : card.id))}>
+          <Text dimColor={!isFailed} color={isFailed ? 'warning' : undefined} wrap="truncate-end">
+            {isOpen ? '▾ ' : '▸ '}{isFailed ? '⚠ explanation failed' : 'not explained'} · {card.title}
+          </Text>
+          <Text dimColor> · {ago(card.at)}</Text>
+        </Button>
+        <Button key={`${list}:again:${card.id}`} label={isFailed ? 'try again' : 'explain anyway'} plain onPress={fire(k, () => app.explainAgain(card.id))} />
+      </Box>
+      {isOpen && (
+        <Box flexDirection="column" paddingLeft={2}>
+          <Text dimColor wrap="wrap">{isFailed ? `The model call failed (${card.failed}). The changes are below; try again for the explanation.` : `Skipped: ${card.skipped}. The changes are below.`}</Text>
+          {changesView(k, card, list)}
+        </Box>
+      )}
+    </Box>
+  )
+}
+
 function cardView(k: Kit, card: InloopCard, isOpen: boolean, list: 'feed' | 'history'): RenderElement {
+  if (card.skipped !== undefined || card.failed !== undefined) return unexplainedView(k, card, isOpen, list)
   const app = k.app
   const { Box, Text, Button, Markdown } = k.el
   const tag = card.source === 'auto' ? '' : `${card.source} · `
@@ -448,6 +480,13 @@ function cardView(k: Kit, card: InloopCard, isOpen: boolean, list: 'feed' | 'his
   )
 }
 
+function feedCount(cards: readonly InloopCard[]): string {
+  const shown = cards.filter(c => c.skipped === undefined && c.failed === undefined).length
+  const skipped = cards.filter(c => c.skipped !== undefined).length
+  const failed = cards.filter(c => c.failed !== undefined).length
+  return [`${shown} ${shown === 1 ? 'explanation' : 'explanations'}`, skipped > 0 ? `${skipped} not explained` : '', failed > 0 ? `${failed} failed` : ''].filter(Boolean).join(' · ')
+}
+
 async function feedTab(k: Kit): Promise<RenderElement> {
   const app = k.app
   const { Box, Text, Button, Markdown } = k.el
@@ -475,12 +514,20 @@ async function feedTab(k: Kit): Promise<RenderElement> {
   return (
     <Box flexDirection="column">
       <Box flexDirection="row" columnGap={1}>
-        <Text dimColor>{cards.length} {cards.length === 1 ? 'explanation' : 'explanations'}, newest first</Text>
+        <Text dimColor>{feedCount(cards)}, newest first</Text>
         {status.recentBatches > 0 && settings.mode !== 'auto' && (
           <Button key="feed:recent" label="explain recent" plain onPress={fire(k, () => app.explainRecent(30))} />
         )}
       </Box>
-      {cards.slice(0, 25).map(card => cardView(k, card, card.id === expanded, 'feed'))}
+      {cards.slice(0, 25).map((card, i, shown) => {
+        const isFirstEarlier = card.at < app.startedAt && (i === 0 || shown[i - 1]!.at >= app.startedAt)
+        return (
+          <Box key={`feed:wrap:${card.id}`} flexDirection="column">
+            {isFirstEarlier && <Text dimColor>── earlier sessions ──</Text>}
+            {cardView(k, card, card.id === expanded, 'feed')}
+          </Box>
+        )
+      })}
     </Box>
   )
 }
@@ -748,7 +795,7 @@ function answerView(k: Kit, ex: Exchange, key: string): RenderElement {
   const app = k.app
   const { Box, Text, Button, Markdown } = k.el
   if (ex.a === undefined) {
-    return <Text color="suggestion">⟳ {k.s.status.busy ?? 'waiting'}…</Text>
+    return <Text color="suggestion">{spin(k.s.frame)} {k.s.status.busy ?? 'waiting'}…</Text>
   }
   const steps = ex.a.steps ?? []
   return (

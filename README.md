@@ -52,7 +52,7 @@ Requirements: Claude Code 2.1.301 or newer (inloop uses the plugin mod API: func
 
 ```bash
 claude plugin validate .        # manifest + hooks module, as the engine reads them
-claude plugin test .            # 66 tests: logic + engine-level (hooks, pane on terminal/desktop/mobile)
+claude plugin test .            # 72 tests: logic + engine-level (hooks, pane on terminal/desktop/mobile)
 claude --plugin-dir .           # a live session with inloop loaded
 ```
 
@@ -75,7 +75,7 @@ Above the tabs, a small **Since your last prompt** box lists every file changed 
 
 | Tab | What it shows |
 | --- | --- |
-| **1 Feed** | Explanations of the agent's work, newest first. Each card has: title, concept, a **changes** list (every file with lines added and removed and the line ranges changed; press one for its diff), the explanation with its code parts, bookmark, go deeper, diff, flow, listen |
+| **1 Feed** | Explanations of the agent's work, newest first. After a restart it starts with this project's explanations from earlier sessions, under **earlier sessions**. Each card has: title, concept, a **changes** list (every file with lines added and removed and the line ranges changed; press one for its diff), the explanation with its code parts, bookmark, go deeper, diff, flow, listen |
 | **2 Code** | Read-only viewer: syntax-highlighted source with line numbers and the relevant lines marked, the revision shown (working tree or a commit), callers and callees with confidence, the functions in the file, and diffs |
 | **3 Flow** | A traced execution flow as a tree. Press a step to see where it is, an explanation of it, **open code**, and **how is it reached?** (the link from the step before). On desktop, also an SVG diagram |
 | **4 Ask** | Your conversation with inloop, separate from the coding agent. Includes the active scope and the revision being studied |
@@ -89,9 +89,11 @@ The seven tabs are independent: each keeps its own state, so switching away and 
 
 ### Automatic explanations
 
-Every successful `Edit`, `Write`, `MultiEdit` or `NotebookEdit`, by the main agent or a subagent, is recorded after the tool has run. Changes made any other way are caught too: after each `Bash` command, and at the end of every turn, inloop asks git which files changed since it last saw them, so a script, `sed` or a formatter run by the agent is explained like an edit. Whatever was already uncommitted when the session started is your own work, and is never explained. The hook adds about 15–30 ms per edit and never changes the tool's result. Edits are grouped into one **step** until the agent goes quiet (6 s by default), a step has run for 45 s, or the turn ends. Each step is analysed statically: new and changed functions, routes, dependencies, topics such as auth or database, and the callers of new code. Then it gets a significance score. A step that clears the threshold gets a card. Comment-only and whitespace edits, lockfiles, build output and binary files never get one. A step that was already explained (say an undo followed by a redo) is not explained twice.
+Every successful `Edit`, `Write`, `MultiEdit` or `NotebookEdit`, by the main agent or a subagent, is recorded after the tool has run. Changes made any other way are caught too: after each `Bash` command, and at the end of every turn, inloop asks git which files changed since it last saw them, and what any new commit changed. So a script, `sed` or a formatter run by the agent is explained like an edit, even when the same command commits the result. Files are fingerprinted with `git hash-object` (nothing is written to git), so a scan reads only files that actually changed, even in a repo with thousands of untracked files. Virtual environments by any name (`.venv`, `venv`, `.venv-qi`…), `site-packages` and tool caches are skipped. Files git ignores are invisible to this check; edits to them through the edit tools are still seen. Whatever was already uncommitted when the session started is your own work, and is never explained. The hook adds about 15–30 ms per edit and never changes the tool's result. Edits are grouped into one **step** until the agent goes quiet (6 s by default), a step has run for 45 s, or the turn ends. Each step is analysed statically: new and changed functions, routes, dependencies, topics such as auth or database, and the callers of new code. Then it gets a significance score. A step that clears the threshold gets a card. A step that doesn't (a small fix, a comment-only edit, a change off your focus topic, or one the model judges too minor) still shows in the Feed as one dim **not explained** line: press it for the changes, or **explain anyway**. Skipped steps are never read aloud or saved to history. Lockfiles, build output and binary files are left out entirely. A step that was already explained (say an undo followed by a redo) is not explained twice.
 
-Cards are written by a small model (Haiku by default) from the step's diff, the static facts, and the definitions of functions the new code calls. If that model call fails, or you choose **static analysis only**, the card is written from the analysis alone, with no model call.
+Cards are written by a small model (Haiku by default) from the step's diff, the static facts, and the definitions of functions the new code calls. With **static analysis only**, the card is written from the analysis alone, with no model call. If the model call fails, the Feed says so plainly (**⚠ explanation failed**, with the reason and the changes) and offers **try again**. A call cut off part-way is retried once by itself. When a session ends, inloop doesn't start explanations (Claude Code gives a closing session about 1.5 s, too short for one).
+
+While anything is being generated (an explanation, an answer, audio, the voice download), a spinner turns beside it. It stops when the work is done, so an idle pane never redraws.
 
 ### Modes and depth
 
@@ -243,10 +245,10 @@ It's a single mod: one hooks module, no MCP server, no extra process, no web ser
 
 ## Testing
 
-`claude plugin test .` runs 66 tests in the engine's own test kit:
+`claude plugin test .` runs 72 tests in the engine's own test kit:
 
 - **Logic** (28): path, sensitive-file, revision and secret rules; symbol, route, React and HTTP-call extraction; significance scoring; focus matching; diffs; batching windows; the demo app's login flow, from the button to the database, with every node checked against its source line and every edge's confidence; callers; natural-language search; the first commit's index (sessions, no JWT); JSON recovery; static cards; voice listing, ranking and choice; spoken-text cleanup.
-- **Engine** (38): the plugin loaded by the engine over a virtual project, with a scripted model:
+- **Engine** (44): the plugin loaded by the engine over a virtual project, with a scripted model:
   - an agent `Edit` produces a card with nobody asking, the tool result is untouched, and the prompt is framed as untrusted data and never contains the `.env` secret
   - three edits across files become one card
   - comment-only edits cost nothing
@@ -275,6 +277,10 @@ It's a single mod: one hooks module, no MCP server, no extra process, no web ser
   - switching style mid-explanation: written silences at once (a confirmation too), spoken picks up with the next change
   - while Kokoro is still rendering, the pane and status line say audio is being generated
   - out of the box the style is spoken and the natural voice downloads in the background once (a request meanwhile joins it; the Mac voice speaks until it's ready); with the automatic download turned off, nothing is downloaded
+  - a skipped step (small, off-topic, or judged minor) shows as one "not explained" line, and **explain anyway** explains it in its place; a failed model call says so with **try again**, and a cut-off call is retried once
+  - a script that edits and commits in one command is still explained; a virtual environment full of files is never taken for changes, and unchanged files aren't read again
+  - after a restart the Feed starts with this project's earlier explanations, not other projects'
+  - the spinner turns while something is generated and stops when idle
   - on Linux and Windows, Kokoro's clips play through the player the machine has; with no player nothing is downloaded and the platform voice speaks; a clip the player can't play is said by the system voice instead
 
 Verified by hand with real Claude Code 2.1.301, the real model and real git, on the demo app:
@@ -306,7 +312,9 @@ Verified by hand with real Claude Code 2.1.301, the real model and real git, on 
 ## Troubleshooting
 
 - **No pane.** Widen the terminal, or use the fullscreen layout, or run `/inloop` (it opens at any width). Commands work without the pane, and so do toasts and the status line (`inloop: auto · 3 explained`).
-- **No cards appear.** Check the mode (`/inloop-settings`). Raise sensitivity in Settings (*explain edits from significance* → 1). Edits to lockfiles, build output, docs-only and comment-only changes are skipped on purpose. In focus mode, only on-topic steps get cards.
+- **A step says "not explained".** It scored below the threshold, was off your focus topic, or the model judged it minor. Press **explain anyway**, or lower the threshold in Settings (*explain edits from significance* → 1).
+- **No line at all for a change.** Check the mode (`/inloop-settings`). Changes made by a shell command need git, and files git ignores aren't seen; lockfiles, build output and virtual environments are skipped on purpose.
+- **"⚠ explanation failed".** The reason is shown, for example `aborted` (the call was cut off) or an API error such as overloaded. Press **try again**.
 - **A card says "model explanation unavailable".** The model call failed, for example because of rate limits or a model your account can't use. The static card is still shown. Change models in Settings, or choose *static analysis only*.
 - **"not a git repository".** History features, the changes box for shell-made changes, and catching changes no edit tool reported all need git. Everything else works without it.
 - **Spoken explanations start slowly.** Kokoro loads its model for each explanation, which takes a few seconds (⟳ *generating audio…* shows meanwhile). Parts after the first are rendered ahead, so they play without a gap. For an instant start, choose a Mac voice with `/inloop-voice`.

@@ -50,6 +50,7 @@ const MAX_CARDS = 80
 const MAX_HISTORY = 150
 const MAX_QUEUED_BATCHES = 3
 const RECENT_KEEP_MS = 3 * 60 * 60 * 1000
+const SPIN_MS = 120
 const NO_PLAYER = 'The natural voice needs an audio player, and none was found (on Linux: pipewire, pulseaudio-utils, alsa-utils or ffmpeg). Until then inloop uses the system voice.'
 
 /** Pieces of speech played in turn; each can be cut off. */
@@ -84,10 +85,39 @@ export class App {
     await this.host.state.settings.update(() => settings)
     this.batcher = new Batcher({ quietMs: settings.quietSeconds * 1000, maxWaitMs: 45_000, maxFiles: 12 })
     const history = (await this.host.storeGet('history')) as InloopCard[] | undefined
-    if (Array.isArray(history)) await this.host.state.history.update(() => history)
+    if (Array.isArray(history)) {
+      await this.host.state.history.update(() => history)
+      // The feed picks up where this project's last session left off.
+      const earlier = await this.ownEarlier(history).catch(() => [] as InloopCard[])
+      if (earlier.length > 0) await this.host.state.cards.update(list => [...list, ...earlier.filter(c => !list.some(x => x.id === c.id))].slice(0, MAX_CARDS))
+    }
     await this.snapshotBaseline().catch(() => undefined)
     this.detach(() => this.prepareVoice())
     await this.refreshStatus()
+  }
+
+  /** When this session started: the feed marks explanations from before it. */
+  readonly startedAt = Date.now()
+
+  /**
+   * This project's explanations from earlier sessions, newest first: those
+   * tagged with its folder, and older untagged ones whose files are all here.
+   */
+  private async ownEarlier(history: readonly InloopCard[]): Promise<InloopCard[]> {
+    if (this.repo.notProject !== null) return []
+    const out: InloopCard[] = []
+    for (const card of history) {
+      if (out.length >= 20) break
+      if (card.source === 'ask' || card.at >= this.startedAt) continue
+      if (card.root !== undefined) {
+        if (card.root === this.repo.root) out.push(card)
+        continue
+      }
+      if (card.files.length === 0) continue
+      const here = await Promise.all(card.files.map(f => this.repo.read(f).then(() => true, () => false)))
+      if (here.every(Boolean)) out.push(card)
+    }
+    return out
   }
 
   /** Set at session start: a -p or SDK run, where no one sees the pane. */
@@ -117,6 +147,7 @@ export class App {
   stop(): void {
     this.aborter.abort()
     this.timer?.cancel()
+    this.animate(false)
   }
 
   newId(): string {
@@ -134,10 +165,13 @@ export class App {
     const key = hash(`${req.model}\n${req.system}\n${req.prompt}`)
     const held = this.cache.get(key)
     if (held !== undefined) return held
-    const r = await this.host.complete(
+    const call = () => this.host.complete(
       { model: req.model, system: req.system, prompt: req.prompt, maxTokens: req.maxTokens ?? 1024, timeoutMs: 180_000 },
       { signal: req.signal ?? this.aborter.signal },
     )
+    let r = await call()
+    // Cut off by something other than inloop stopping (a dispatch ended under it): one more try.
+    if (!r.isAnswered && r.reason === 'aborted' && !(req.signal ?? this.aborter.signal).aborted) r = await call()
     const usage = r.usage
     await this.host.state.usage.update(u => ({
       calls: u.calls + 1,
@@ -196,6 +230,19 @@ export class App {
     if (status.isPreparingAudio === true) parts.push('generating audio…')
     if (status.isVoiceSettingUp === true) parts.push('setting up the natural voice…')
     this.host.status(parts.join(' · '))
+    this.animate(status.busy !== null || status.isPreparingAudio === true || status.isVoiceSettingUp === true)
+  }
+
+  private spinner: { cancel: () => void } | null = null
+
+  /** Turns the spinners on while something is being generated, and off after: no redraws while idle. */
+  private animate(isOn: boolean): void {
+    if (isOn && this.spinner === null) {
+      this.spinner = this.host.every(SPIN_MS, () => void this.host.state.frame.update(n => (n + 1) % 1000))
+    } else if (!isOn && this.spinner !== null) {
+      this.spinner.cancel()
+      this.spinner = null
+    }
   }
 
   // ---- observing edits ---------------------------------------------------------
@@ -296,11 +343,19 @@ export class App {
    * uncommitted when the session started is the person's, never explained.
    */
   private baseline = new Map<string, string>()
+  /** A content fingerprint of every file that differed from HEAD when last scanned: a scan reads only what moved. */
+  private prints = new Map<string, string>()
+  /** The commit checked out when last scanned: a commit the agent makes shows what it changed. */
+  private lastHead: string | undefined
   private isScanning = false
   private isScanAgain = false
 
   private async snapshotBaseline(): Promise<void> {
-    for (const path of (await this.repo.dirtyFiles().catch(() => [] as string[])).slice(0, 300)) {
+    this.lastHead = await this.repo.head().catch(() => undefined)
+    const present = (await this.repo.dirtyEntries().catch(() => [])).filter(e => !e.isDeleted).map(e => e.path)
+    this.prints = await this.repo.fingerprints(present).catch(() => new Map<string, string>())
+    // The text of the first few hundred, so a later change to one shows against your version, not HEAD's.
+    for (const path of present.slice(0, 300)) {
       const text = await this.repo.readFresh(path)
       if (text !== null && text.length <= 400_000) this.baseline.set(path, text)
     }
@@ -315,7 +370,10 @@ export class App {
     this.detach(() => this.scanWorkingTree())
   }
 
-  /** Finds files changed since inloop last saw them, by any means, and batches them like edits. */
+  /**
+   * Finds files changed since inloop last saw them, by any means (a script, sed,
+   * a formatter, a commit the agent made), and batches them like edits.
+   */
   async scanWorkingTree(): Promise<void> {
     if (!this.repo.isGit || this.repo.notProject !== null) return
     if (this.isScanning) {
@@ -326,12 +384,39 @@ export class App {
     try {
       do {
         this.isScanAgain = false
-        const dirty = await this.repo.dirtyFiles().catch(() => [] as string[])
+        const entries = await this.repo.dirtyEntries().catch(() => [])
+        const present = entries.filter(e => !e.isDeleted).map(e => e.path)
+        const prints = await this.repo.fingerprints(present).catch(() => new Map<string, string>())
+        // New commits: what they changed counts too, so a script that edits and commits in one command is still seen.
+        const head = await this.repo.head().catch(() => undefined)
+        let committed = new Set<string>()
+        let committedFrom: string | undefined
+        if (head !== undefined && this.lastHead !== undefined && head !== this.lastHead) {
+          const moved = await this.repo.changedBetween(this.lastHead, head).catch(() => [] as string[])
+          if (moved.length <= 40) {
+            committed = new Set(moved)
+            committedFrom = this.lastHead
+          } else {
+            // A checkout or a pull, not a step of work: the new tree is where things start.
+            for (const path of moved) this.baseline.delete(path)
+          }
+        }
+        this.lastHead = head
         let isFound = false
         let isMoved = false
-        for (const path of new Set([...dirty, ...this.baseline.keys()])) {
+        const candidates = new Set([...present, ...entries.map(e => e.path), ...this.baseline.keys(), ...committed, ...this.prints.keys()])
+        for (const path of candidates) {
           // An edit tool is already reporting this one.
           if (this.raw.some(r => r.rel === path)) continue
+          const print = prints.get(path)
+          const wasPrint = this.prints.get(path)
+          if (!committed.has(path)) {
+            // Unchanged since the last scan: dirty and the same content, or clean then and now.
+            if (print !== undefined && print === wasPrint) continue
+            if (print === undefined && wasPrint === undefined && !this.baseline.has(path)) continue
+          }
+          if (print !== undefined) this.prints.set(path, print)
+          else this.prints.delete(path)
           const now = await this.repo.readFresh(path)
           if (now === null) {
             // Deleted: the changes since the prompt show it gone.
@@ -339,9 +424,11 @@ export class App {
             if (this.baseline.delete(path)) isMoved = true
             continue
           }
-          const known = this.baseline.has(path) ? this.baseline.get(path)! : await this.repo.read(path, 'HEAD').catch(() => null)
+          const known = this.baseline.has(path) ? this.baseline.get(path)! : await this.repo.read(path, committedFrom ?? 'HEAD').catch(() => null)
+          // Clean again and nothing to compare: drop it from the watch.
+          if (print === undefined && !committed.has(path)) this.baseline.delete(path)
           if (now === known) continue
-          this.baseline.set(path, now)
+          if (print !== undefined || committed.has(path)) this.baseline.set(path, now)
           if (!this.turnStart.has(path)) this.turnStart.set(path, known)
           isMoved = true
           if (now.length > 400_000) continue
@@ -413,22 +500,35 @@ export class App {
     }
   }
 
-  /** Makes a card for a batch if it is significant (and on topic in focus mode). */
+  /** Makes a card for a batch if it is significant (and on topic in focus mode). The busy line clears when it is done. */
   async explainBatch(batch: Batch, source: InloopCard['source'], force = false, titlePrefix = ''): Promise<InloopCard | null> {
+    try {
+      return await this.explainBatchNow(batch, source, force, titlePrefix)
+    } finally {
+      if (!this.isWorking) await this.setBusy(null)
+    }
+  }
+
+  private async explainBatchNow(batch: Batch, source: InloopCard['source'], force: boolean, titlePrefix: string): Promise<InloopCard | null> {
     const settings = await this.settings()
     const score = Math.max(...batch.analyses.map(a => a.score), 0) + Math.min(2, batch.analyses.length - 1)
-    if (!force && score < settings.minScore) return null
+    if (!force && score < settings.minScore) {
+      await this.addSkipped(batch, 'a small change')
+      return null
+    }
     const diffText = batch.diffs.map(d => d.hunks).join('\n')
     const focus = settings.mode === 'focus' ? settings.focus.trim() : ''
     if (!force && focus !== '' && !matchesFocus(focus, batch.analyses, diffText)) {
       // Keywords did not settle it: one cheap classification, when models are on.
-      if (settings.autoEngine !== 'model') return null
-      const verdict = await this.host.classify(
+      const verdict = settings.autoEngine !== 'model' ? 'unrelated' : await this.host.classify(
         `Focus topic: ${focus}\nFiles: ${batch.analyses.map(a => a.path).join(', ')}\nChange:\n${diffText.slice(0, 3000)}`,
         ['related', 'unrelated'],
         { model: settings.autoModel },
       ).catch(() => 'unrelated')
-      if (verdict !== 'related') return null
+      if (verdict !== 'related') {
+        await this.addSkipped(batch, `not about "${focus}"`)
+        return null
+      }
     }
     await this.setBusy('explaining a change…')
     const index = await this.repo.index().catch(() => null)
@@ -440,17 +540,48 @@ export class App {
       try {
         card = await modelCard(await this.env(), batch, base, focus, index ?? undefined)
       } catch (err) {
-        card = { ...base, summary: `${base.summary}\n\n_(model explanation unavailable: ${String((err as Error).message ?? err)})_` }
+        // inloop itself stopped (the session ended or restarted): nothing to show.
+        if (this.aborter.signal.aborted) return null
+        // Said plainly, with the change and a way to try again; never a bare list of code passed off as an explanation.
+        card = { ...base, title: `${titlePrefix}${base.title}`, steps: [], failed: String((err as Error).message ?? err).replace(/^model call failed: /, '') }
+        this.batches.set(card.id, { batch, source })
+        await this.host.state.cards.update(list => [card!, ...list].slice(0, MAX_CARDS))
+        return null
       }
     }
-    if (card === null) return null
+    if (card === null) {
+      if (!force) await this.addSkipped(batch, 'the model judged it too minor to explain')
+      return null
+    }
     if (titlePrefix !== '') card = { ...card, title: `${titlePrefix}${card.title}` }
     await this.addCard(card)
     return card
   }
 
+  /** The batch behind each skipped or failed card, for "explain anyway" and "try again". */
+  private batches = new Lru<{ batch: Batch; source: InloopCard['source'] }>(60)
+
+  /** A change not explained still shows: one line in the feed, with its changes and "explain anyway". Never read aloud. */
+  private async addSkipped(batch: Batch, reason: string): Promise<void> {
+    const card: InloopCard = { ...staticCard(batch, new Map(), this.newId(), Date.now()), steps: [], skipped: reason, root: this.repo.root }
+    this.batches.set(card.id, { batch, source: 'auto' })
+    await this.host.state.cards.update(list => [card, ...list].slice(0, MAX_CARDS))
+  }
+
+  /** Explains a skipped change, or tries a failed one again; the new explanation takes its place. */
+  async explainAgain(id: string): Promise<void> {
+    const held = this.batches.get(id)
+    if (held === undefined) {
+      await this.setBusy(null, 'That change is no longer held; ask about it instead.')
+      return
+    }
+    await this.host.state.cards.update(list => list.filter(c => c.id !== id))
+    this.batches.delete(id)
+    await this.explainBatch(held.batch, held.source, true)
+  }
+
   async addCard(raw: InloopCard, options: { inFeed?: boolean } = {}): Promise<void> {
-    const card = await this.withSteps(raw)
+    const card = { ...(await this.withSteps(raw)), root: this.repo.root }
     if (options.inFeed !== false) {
       await this.host.state.cards.update(list => [card, ...list].slice(0, MAX_CARDS))
       // The newest explanation opens by itself, unless the person opened another one to read.

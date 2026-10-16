@@ -82,13 +82,48 @@ export class Repo {
    * command, a script, a formatter) shows up.
    */
   async dirtyFiles(): Promise<string[]> {
+    return (await this.dirtyEntries()).map(e => e.path)
+  }
+
+  /** Files that differ from HEAD or are untracked (not ignored, noise or secrets), and whether each is deleted. */
+  async dirtyEntries(): Promise<{ path: string; isDeleted: boolean }[]> {
     if (!this.isGit || this.notProject !== null) return []
     const out = await this.git(['status', '--porcelain', '--no-renames', '-uall'])
     return out
       .split('\n')
       .filter(line => line.length > 3)
-      .map(line => line.slice(3).replace(/^"(.*)"$/, '$1'))
-      .filter(path => !isNoise(path) && !isSensitive(path))
+      .map(line => ({ path: line.slice(3).replace(/^"(.*)"$/, '$1'), isDeleted: line[0] === 'D' || line[1] === 'D' }))
+      .filter(e => !isNoise(e.path) && !isSensitive(e.path))
+  }
+
+  /** The commit checked out now; undefined without git or before the first commit. */
+  async head(): Promise<string | undefined> {
+    if (!this.isGit || this.notProject !== null) return undefined
+    return (await this.git(['rev-parse', '--verify', '-q', 'HEAD']).catch(() => '')).trim() || undefined
+  }
+
+  /** Files that differ between two commits (not noise, not secrets). */
+  async changedBetween(from: string, to: string): Promise<string[]> {
+    const out = await this.git(['diff', '--name-only', '--no-renames', this.checkRev(from), this.checkRev(to), '--'])
+    return out.split('\n').filter(p => p !== '' && !isNoise(p) && !isSensitive(p))
+  }
+
+  /**
+   * A fingerprint of each file's content as it is now, from one `git hash-object`
+   * (nothing is written to git): what lets a scan read only the files that changed.
+   * A file that is gone has none.
+   */
+  async fingerprints(paths: readonly string[]): Promise<Map<string, string>> {
+    const out = new Map<string, string>()
+    if (!this.isGit || paths.length === 0) return out
+    for (let i = 0; i < paths.length; i += 2000) {
+      // Only files that exist: hash-object stops at the first one missing.
+      const present = paths.slice(i, i + 2000)
+      const r = await this.host.run(['git', 'hash-object', '--no-filters', '--stdin-paths'], { cwd: this.root, timeoutMs: 30_000, stdin: present.join('\n') + '\n' })
+      if (r.exitCode !== 0) continue
+      r.stdout.trim().split('\n').forEach((h, j) => { if (present[j] !== undefined && h !== '') out.set(present[j]!, h) })
+    }
+    return out
   }
 
   /** A working-tree file read afresh (something other than an edit tool may have changed it); null when gone. */
