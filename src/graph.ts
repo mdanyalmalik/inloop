@@ -114,7 +114,10 @@ function resolveCall(index: CodeIndex, from: CodeSymbol, call: CallSite): Edge |
     }
     return { from, to: { external: true, name: `${call.method ?? 'GET'} ${call.url}`, kind: 'http' }, line: call.line, label: 'HTTP request; no matching route in this repository', confidence: 'runtime' }
   }
-  const candidates = (index.byName.get(call.name) ?? []).filter(s => s.kind !== 'route' && !(s.path === from.path && s.line === from.line))
+  const isMember = call.receiver !== undefined && call.receiver !== 'this' && call.receiver !== 'self' && imports.get(call.receiver) === undefined
+  // `host.run()` on some object is that object's method, never a plain function that happens to share the name.
+  const candidates = (index.byName.get(call.name) ?? []).filter(s => s.kind !== 'route' && !(s.path === from.path && s.line === from.line) &&
+    !(isMember && s.kind !== 'method'))
   if (candidates.length === 0) {
     if (call.receiver !== undefined && call.receiver !== 'this' && call.receiver !== 'self') {
       const mod = imports.get(call.receiver)
@@ -127,7 +130,6 @@ function resolveCall(index: CodeIndex, from: CodeSymbol, call: CallSite): Edge |
     }
     return null
   }
-  const isMember = call.receiver !== undefined && call.receiver !== 'this' && call.receiver !== 'self' && imports.get(call.receiver) === undefined
   const sameFile = candidates.filter(s => s.path === from.path)
   const imported = candidates.filter(s => importsFile(from.path, imports, call.name, s.path) ||
     (call.receiver !== undefined && importsFile(from.path, imports, call.receiver, s.path)))

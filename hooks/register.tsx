@@ -280,7 +280,11 @@ export const register: Register = on => {
     if (tool === 'Bash') {
       // A shell command can change files too (a script, sed, a formatter): look afterwards.
       const ran = await next(e)
-      app.noteShell()
+      try {
+        app.noteShell()
+      } catch {
+        // Observation never gets in the agent's way, nor runs its command twice.
+      }
       return ran
     }
     if (!EDIT_TOOLS.has(tool)) return next(e)
@@ -293,7 +297,14 @@ export const register: Register = on => {
     const ran = await next(e)
     if (ran.deny === undefined && ran.isError !== true && path !== '') {
       try {
-        app.recordEdit(tool, path, input, before)
+        // Edit's record keeps the file as it was: exact even where its new text is not unique, is empty,
+        // or the person changed the proposed edit. (Null: there was no file; an empty old_string made it.)
+        const original = (ran.result as { originalFile?: unknown } | undefined)?.originalFile
+        const edited = tool !== 'Edit' || !isReadable ? before
+          : typeof original === 'string' ? original
+          : original === null && input.old_string === '' ? null
+          : undefined
+        app.recordEdit(tool, path, input, edited)
       } catch {
         // Observation never gets in the agent's way.
       }
@@ -434,6 +445,7 @@ export const register: Register = on => {
 
   on('command.run', { command: 'inloop-commit' }, async ($, e) => {
     if (app === null) return { text: 'inloop is not ready yet.' }
+    if (!app.repo.isGit) return { text: 'This project is not a git repository.' }
     const q = e.args.trim()
     let rev = q
     if (q === '') rev = 'HEAD'
@@ -452,6 +464,7 @@ export const register: Register = on => {
     if (app === null) return { text: 'inloop is not ready yet.' }
     const [from, to, ...topic] = e.args.trim().split(/\s+/)
     if (from === undefined || from === '' || to === undefined) return { text: 'Usage: /inloop-compare <from> <to> [topic]' }
+    if (!app.repo.isGit) return { text: 'This project is not a git repository.' }
     void showTab('feed', () => $.ui.open({ id: PANE, title: 'inloop', columns: 64 }))
     const live = app
     let card: Promise<InloopCard | null> = Promise.resolve(null)

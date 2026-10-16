@@ -20,7 +20,7 @@ import type {
   InloopUsage,
   InloopViewer,
 } from '../types'
-import type { App } from './app'
+import { type App, RECENT_MINUTES } from './app'
 import { extractSymbols } from './analysis'
 import { formatRanges, summarizeDiff } from './diff'
 import { describePlan, KOKORO_VOICES, NO_PLAYER_HELP, rankVoices, VOICE_HELP } from './voices'
@@ -396,13 +396,13 @@ function unexplainedView(k: Kit, card: InloopCard, isOpen: boolean, list: 'feed'
   const isFailed = card.failed !== undefined
   return (
     <Box key={`${list}:${card.id}`} flexDirection="column" marginBottom={isOpen ? 1 : 0}>
-      <Box flexDirection="row" columnGap={1}>
-        <Button key={`${list}:card:${card.id}`} plain onPress={() => app.host.state.expanded.update(cur => (cur === card.id ? null : card.id))}>
-          <Text dimColor={!isFailed} color={isFailed ? 'warning' : undefined} wrap="truncate-end">
-            {isOpen ? '▾ ' : '▸ '}{isFailed ? '⚠ explanation failed' : 'not explained'} · {card.title}
-          </Text>
-          <Text dimColor> · {ago(card.at)}</Text>
-        </Button>
+      <Button key={`${list}:card:${card.id}`} plain onPress={() => app.host.state.expanded.update(cur => (cur === card.id ? null : card.id))}>
+        <Text dimColor={!isFailed} color={isFailed ? 'warning' : undefined} wrap="truncate-end">
+          {isOpen ? '▾ ' : '▸ '}{isFailed ? '⚠ explanation failed' : 'not explained'} · {card.title}
+        </Text>
+        <Text dimColor> · {ago(card.at)}</Text>
+      </Button>
+      <Box paddingLeft={2}>
         <Button key={`${list}:again:${card.id}`} label={isFailed ? 'try again' : 'explain anyway'} plain onPress={fire(k, () => app.explainAgain(card.id))} />
       </Box>
       {isOpen && (
@@ -473,6 +473,7 @@ function cardView(k: Kit, card: InloopCard, isOpen: boolean, list: 'feed' | 'his
               })}
             />
             <Button key={`${list}:say:${card.id}`} label="▶ listen" onPress={fire(k, () => app.narrate(card, true))} />
+            {list === 'history' && <Button key={`history:delete:${card.id}`} label="✕ delete" onPress={() => app.deleteExplanation(card.id)} />}
           </Box>
         </Box>
       )}
@@ -506,7 +507,7 @@ async function feedTab(k: Kit): Promise<RenderElement> {
       <Box flexDirection="column">
         <Markdown text={`${how}\n\nAsk anything below — e.g. *"what happens when I click Login?"*, *"only explain how tokens are created"*, or open **Git** to study an older commit.`} />
         {status.recentBatches > 0 && (
-          <Button key="feed:recent" label={`explain recent changes (${status.recentBatches} steps)`} onPress={fire(k, () => app.explainRecent(30))} />
+          <Button key="feed:recent" label={`explain recent changes (${status.recentBatches} steps)`} onPress={fire(k, () => app.explainRecent(RECENT_MINUTES))} />
         )}
       </Box>
     )
@@ -516,7 +517,7 @@ async function feedTab(k: Kit): Promise<RenderElement> {
       <Box flexDirection="row" columnGap={1}>
         <Text dimColor>{feedCount(cards)}, newest first</Text>
         {status.recentBatches > 0 && settings.mode !== 'auto' && (
-          <Button key="feed:recent" label="explain recent" plain onPress={fire(k, () => app.explainRecent(30))} />
+          <Button key="feed:recent" label="explain recent" plain onPress={fire(k, () => app.explainRecent(RECENT_MINUTES))} />
         )}
       </Box>
       {cards.slice(0, 25).map((card, i, shown) => {

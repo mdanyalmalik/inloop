@@ -21,15 +21,8 @@ export class Batcher {
     if (this.files.size === 0) this.firstAt = change.at
     this.lastAt = change.at
     const held = this.files.get(change.path)
-    if (held === undefined) {
-      this.files.set(change.path, { ...change, snippets: [...change.snippets], tools: [...change.tools] })
-      return
-    }
-    held.after = change.after
-    held.snippets.push(...change.snippets)
-    if (held.snippets.length > 40) held.snippets.splice(0, held.snippets.length - 40)
-    for (const t of change.tools) if (!held.tools.includes(t)) held.tools.push(t)
-    held.at = change.at
+    if (held === undefined) this.files.set(change.path, { ...change, snippets: [...change.snippets], tools: [...change.tools] })
+    else mergeChange(held, change)
   }
 
   /** When the batch should be flushed, or null while empty. */
@@ -49,6 +42,27 @@ export class Batcher {
     this.files.clear()
     return out
   }
+}
+
+/**
+ * Folds a later change to a file into the one held: the earliest `before`, the
+ * latest `after`. When only one of them has whole-file text, both become
+ * snippets, so neither edit is lost and no file looks newly made.
+ */
+export function mergeChange(held: FileChange, change: FileChange): void {
+  const isWhole = (c: FileChange) => c.after !== null
+  if (isWhole(held) !== isWhole(change)) {
+    const asSnippets = (c: FileChange) => (isWhole(c) ? [{ old: c.before ?? '', new: c.after! }] : c.snippets)
+    held.snippets = [...asSnippets(held), ...asSnippets(change)]
+    held.before = null
+    held.after = null
+  } else {
+    held.after = change.after
+    held.snippets.push(...change.snippets)
+  }
+  if (held.snippets.length > 40) held.snippets.splice(0, held.snippets.length - 40)
+  for (const t of change.tools) if (!held.tools.includes(t)) held.tools.push(t)
+  held.at = change.at
 }
 
 /** FNV-1a over a string: a cheap content key for caches and dedupe. */

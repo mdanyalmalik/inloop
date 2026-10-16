@@ -2,6 +2,8 @@
 // source text with patterns per language family. Every result carries the line
 // it came from, so whatever is shown can be checked against the file.
 
+import { summarizeDiff, unifiedDiff } from './diff'
+
 export type Lang = 'js' | 'py' | 'go' | 'rb' | 'other'
 
 export type SymbolKind = 'function' | 'method' | 'class' | 'component' | 'route' | 'handler'
@@ -53,6 +55,68 @@ export function lineAt(text: string, index: number): number {
 }
 
 /**
+ * `text` with the insides of string literals and comments blanked out, same
+ * length and same lines, so patterns looking for code never match text that
+ * only quotes code (a test asserting on `'function f() {'`, a commented-out
+ * route). Quotes stay; a quote or regex literal left open ends at its line.
+ */
+export function maskCode(text: string, lang: Lang): string {
+  const out = text.split('')
+  const blank = (from: number, to: number) => {
+    for (let k = from; k < to; k++) if (out[k] !== '\n') out[k] = ' '
+  }
+  const hashComments = lang === 'py' || lang === 'rb'
+  let i = 0
+  while (i < text.length) {
+    const ch = text[i]!
+    const next = text[i + 1]
+    if (!hashComments && ch === '/' && next === '/') {
+      const end = text.indexOf('\n', i)
+      blank(i, end < 0 ? text.length : end)
+      i = end < 0 ? text.length : end
+    } else if (!hashComments && ch === '/' && next === '*') {
+      const end = text.indexOf('*/', i + 2)
+      blank(i, end < 0 ? text.length : end + 2)
+      i = end < 0 ? text.length : end + 2
+    } else if (hashComments && ch === '#') {
+      const end = text.indexOf('\n', i)
+      blank(i, end < 0 ? text.length : end)
+      i = end < 0 ? text.length : end
+    } else if (lang === 'js' && ch === '/' && next !== '>' && /[(,=:[!&|?{;]\s*$|^\s*$|\breturn\s*$/.test(text.slice(Math.max(0, text.lastIndexOf('\n', i - 1) + 1), i))) {
+      // (`/>` closes a JSX tag; after `}` a slash is division or a tag, rarely a regex.)
+      // A regex literal: up to its closing slash, outside character classes.
+      let k = i + 1
+      let inClass = false
+      while (k < text.length && text[k] !== '\n') {
+        if (text[k] === '\\') k++
+        else if (text[k] === '[') inClass = true
+        else if (text[k] === ']') inClass = false
+        else if (text[k] === '/' && !inClass) break
+        k++
+      }
+      blank(i + 1, Math.min(k, text.length))
+      i = k + 1
+    } else if (ch === '"' || ch === "'" || ch === '`') {
+      const triple = lang === 'py' && text.startsWith(ch.repeat(3), i)
+      const close = triple ? ch.repeat(3) : ch
+      const multiline = triple || ch === '`'
+      let k = i + close.length
+      while (k < text.length) {
+        if (text[k] === '\\') { k += 2; continue }
+        if (text.startsWith(close, k)) break
+        if (text[k] === '\n' && !multiline) break
+        k++
+      }
+      blank(i + close.length, Math.min(k, text.length))
+      i = text.startsWith(close, k) ? k + close.length : k
+    } else {
+      i++
+    }
+  }
+  return out.join('')
+}
+
+/**
  * The last line of a brace-delimited block starting on `startLine`, skipping
  * braces inside strings and comments well enough for ordinary code.
  */
@@ -63,6 +127,7 @@ export function braceEnd(lines: readonly string[], startLine: number): number {
   for (let i = startLine - 1; i < lines.length; i++) {
     const raw = lines[i] ?? ''
     const line = raw.replace(/(["'`])(?:\\.|(?!\1).)*\1/g, '""').replace(/\/\/.*$/, '')
+    let closed = false
     for (const ch of line) {
       // Braces inside the parameter list (destructuring, defaults) are not the body.
       if (ch === '(') parens++
@@ -71,11 +136,17 @@ export function braceEnd(lines: readonly string[], startLine: number): number {
       if (ch === '{') {
         depth++
         opened = true
+        closed = false
       } else if (ch === '}') {
         depth--
-        if (opened && depth <= 0) return i + 1
+        // On the first line a closed brace may be a type (`(): { a: T } {`): the body can still open after it.
+        if (opened && depth <= 0) {
+          if (i > startLine - 1) return i + 1
+          closed = true
+        }
       }
     }
+    if (closed) return i + 1
     // An arrow function with an expression body ends where its statement ends.
     if (!opened && i > startLine - 1 + 2) return i
     if (!opened && /;\s*$/.test(line) && i >= startLine - 1) return i + 1
@@ -130,17 +201,19 @@ const PY_ROUTE_RE = /^[ \t]*@(\w+)\.(route|get|post|put|patch|delete)\(\s*["']([
 export function extractSymbols(text: string, path: string): CodeSymbol[] {
   const lang = langOf(path)
   if (lang === 'other') return []
-  const lines = text.split('\n')
+  // Patterns read code only: what strings and comments say is not a definition.
+  const masked = maskCode(text, lang)
+  const lines = masked.split('\n')
   const out: CodeSymbol[] = []
   const seen = new Set<string>()
   const patterns =
     lang === 'js' ? JS_PATTERNS : lang === 'py' ? PY_PATTERNS : lang === 'go' ? GO_PATTERNS : RB_PATTERNS
   for (const { re, kind, nameGroup } of patterns) {
     re.lastIndex = 0
-    for (let m = re.exec(text); m !== null; m = re.exec(text)) {
+    for (let m = re.exec(masked); m !== null; m = re.exec(masked)) {
       const name = m[nameGroup]
       if (name === undefined || JS_KEYWORDS.has(name)) continue
-      const line = lineAt(text, m.index + (m[0].length - m[0].trimStart().length))
+      const line = lineAt(masked, m.index + (m[0].length - m[0].trimStart().length))
       const key = `${name}:${line}`
       if (seen.has(key)) continue
       // A "method" match on a line some other pattern already took is that symbol.
@@ -149,7 +222,7 @@ export function extractSymbols(text: string, path: string): CodeSymbol[] {
       seen.add(key)
       const endLine = lang === 'py' ? indentEnd(lines, line) : lang === 'rb' ? rubyEnd(lines, line) : braceEnd(lines, line)
       const head = m[0]
-      const isComponent = lang === 'js' && /^[A-Z]/.test(name) && kind !== 'class' && /\.(j|t)sx$/i.test(path)
+      const isComponent = lang === 'js' && /^[A-Z]/.test(name) && !/^[A-Z0-9_]+$/.test(name) && kind !== 'class' && /\.(j|t)sx$/i.test(path)
       out.push({
         name,
         kind: isComponent ? 'component' : kind,
@@ -161,7 +234,7 @@ export function extractSymbols(text: string, path: string): CodeSymbol[] {
       })
     }
   }
-  for (const route of extractRoutes(text, path)) out.push(route)
+  for (const route of extractRoutes(text, path, masked)) out.push(route)
   return out.sort((a, b) => a.line - b.line)
 }
 
@@ -175,21 +248,25 @@ function rubyEnd(lines: readonly string[], startLine: number): number {
   return Math.min(lines.length, startLine + 30)
 }
 
-export function extractRoutes(text: string, path: string): CodeSymbol[] {
+export function extractRoutes(text: string, path: string, masked = maskCode(text, langOf(path))): CodeSymbol[] {
   const out: CodeSymbol[] = []
   const lang = langOf(path)
   const re = lang === 'py' ? PY_ROUTE_RE : ROUTE_RE
   re.lastIndex = 0
+  const lines = masked.split('\n')
   for (let m = re.exec(text); m !== null; m = re.exec(text)) {
+    // A route quoted in a string or written in a comment registers nothing.
+    const at = m.index + (m[0].length - m[0].trimStart().length)
+    if (masked[at] !== text[at]) continue
     const method = (lang === 'py' ? (m[2] === 'route' ? 'ANY' : m[2]) : m[2])?.toUpperCase() ?? 'ANY'
     const url = (lang === 'py' ? m[3] : m[4]) ?? ''
     if (!url.startsWith('/')) continue
-    const rest = (lang === 'py' ? '' : m[5]) ?? ''
+    // The handlers, read from code only (a trailing comment names none).
+    const rest = lang === 'py' ? '' : masked.slice(m.index + m[0].length - (m[5] ?? '').length, m.index + m[0].length)
     const handlers = [...rest.matchAll(/([A-Za-z_$][\w$.]*)/g)]
       .map(h => (h[1] ?? '').split('.').pop() ?? '')
       .filter(h => h !== '' && !JS_KEYWORDS.has(h) && !/^(req|res|next|async|ctx)$/.test(h))
     const line = lineAt(text, m.index)
-    const lines = text.split('\n')
     let handlerNames = handlers
     let endLine = line
     if (lang === 'py') {
@@ -273,9 +350,10 @@ export function findCalls(body: string, firstLine: number): CallSite[] {
 // Topics: what a piece of code is about, read off its words.
 
 export const TOPICS: Record<string, RegExp> = {
-  authentication: /\b(auth\w*|login|logout|sign[_-]?in|jwt|token|session|password|bcrypt|argon|oauth|credential|verify\w*|cookie)\b/i,
-  security: /\b(csrf|xss|sanitize|escape|hash\w*|encrypt\w*|decrypt\w*|permission|role|acl|secret|cors)\b/i,
-  database: /\b(db|database|query|sql|select|insert|update|delete from|transaction|prisma|sequelize|mongoose|knex|repository|collection|findOne|findMany|migration|schema)\b/i,
+  // Whole words only: "author" is not auth, a "session" or "token" count is not sign-in, `hash(text)` is not security.
+  authentication: /\b(auth(entic\w*|ori[sz]\w*|n|z)?|login|logout|sign[_-]?in|jwt|token|password\w*|bcrypt|argon2?|oauth|credentials?|cookies?|session[_-]?id)\b|[a-z](password|login|logout|jwt|oauth|credential)/i,
+  security: /\b(csrf|xss|sanitiz\w*|encrypt\w*|decrypt\w*|permissions?|acl|secrets?|cors|hmac|crypto)\b/i,
+  database: /\b(db|database|sql|transaction|prisma|sequelize|mongoose|knex|findOne|findMany|migrations?|insert into|delete from|select\s+[\w*, ]+\s+from)\b|\bupdate\s+\w+\s+set\b|\.query\(/i,
   api: /\b(router|route|endpoint|app\.(get|post|put|delete|patch)|fetch|axios|request|response|res\.(json|send|status)|express|fastapi|handler|middleware)\b/i,
   async: /\b(async|await|promise|then\(|callback|setTimeout|setInterval|asyncio|goroutine|channel)\b/i,
   'error handling': /\b(try|catch|throw|raise|except|error|reject|finally)\b/i,
@@ -332,7 +410,7 @@ export type FileChange = {
   path: string
   /** File text before the batch; null when the batch created the file. */
   before: string | null
-  /** File text after the batch; null when unreadable. */
+  /** File text after the batch; '' when the batch deleted the file, null when unreadable. */
   after: string | null
   /** Edit snippets when whole-file text is unavailable. */
   snippets: { old: string; new: string }[]
@@ -349,6 +427,8 @@ export type ChangeAnalysis = {
   addedLines: number
   removedLines: number
   topics: string[]
+  /** New-side line ranges the change touches, as [first, last]; empty when only edit snippets are known. */
+  ranges: [number, number][]
   newImports: string[]
   isTrivial: boolean
   reasons: string[]
@@ -443,13 +523,30 @@ export function analyzeChange(change: FileChange): ChangeAnalysis {
   const afterNames = new Set(afterSyms.map(s => s.name))
   const added = afterSyms.filter(s => !beforeNames.has(s.name))
   const removed = beforeSyms.filter(s => !afterNames.has(s.name)).map(s => s.name)
-  const modified = afterSyms.filter(s => {
+  const changedSyms = afterSyms.filter(s => {
     const old = beforeNames.get(s.name)
     return old !== undefined && stripComments(body(before, old)) !== stripComments(body(after, s))
   })
+  const ranges = change.after !== null ? (summarizeDiff(`--- a/f\n+++ b/f\n${unifiedDiff(before, after, 0)}`)[0]?.ranges ?? []) : []
+  // A class (or any symbol) changed only inside its changed methods is not itself what changed.
+  const inner = (s: CodeSymbol) => [...added, ...changedSyms].filter(t => t !== s && t.kind !== 'route' && t.line >= s.line && t.endLine <= s.endLine && t.endLine - t.line < s.endLine - s.line)
+  const modified = changedSyms.filter(s => {
+    const parts = inner(s)
+    if (parts.length === 0) return true
+    if (ranges.length === 0) return false
+    return ranges.some(([a, b]) => {
+      for (let l = Math.max(a, s.line); l <= Math.min(b, s.endLine); l++) if (!parts.some(t => t.line <= l && l <= t.endLine)) return true
+      return false
+    })
+  })
   const { added: addedLines, removed: removedLines } = lineDelta(before, after)
-  const changedText = [...added, ...modified].map(s => body(after, s)).join('\n') +
-    '\n' + change.snippets.map(s => s.new).join('\n') + (isNew ? '\n' + after : '')
+  // Topics come from the lines that changed, not from everything around them.
+  const afterLines = after.split('\n')
+  const changedText = isNew
+    ? after
+    : ranges.length > 0
+      ? ranges.map(([a, b]) => afterLines.slice(a - 1, b).join('\n')).join('\n')
+      : [...added, ...modified].map(s => body(after, s)).join('\n') + '\n' + change.snippets.map(s => s.new).join('\n')
   const topics = topicsOf(changedText + ' ' + change.path)
   const beforeImports = new Set(importsOf(before))
   let newImports = importsOf(after).filter(i => !beforeImports.has(i))
@@ -479,7 +576,7 @@ export function analyzeChange(change: FileChange): ChangeAnalysis {
     if (/\.(md|txt|rst)$/i.test(change.path)) score = Math.min(score, 1)
     if (/(^|\/)(test|tests|__tests__|spec)\/|\.(test|spec)\./.test(change.path)) score = Math.max(0, score - 1)
   }
-  return { path: change.path, isNew, added, removed, modified, addedLines, removedLines, topics, newImports, isTrivial, reasons, score: Math.min(10, score) }
+  return { path: change.path, isNew, added, removed, modified, addedLines, removedLines, topics, ranges, newImports, isTrivial, reasons, score: Math.min(10, score) }
 }
 
 /** Does a batch match a focus such as "database queries"? */

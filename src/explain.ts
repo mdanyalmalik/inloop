@@ -21,7 +21,11 @@ import { type Repo, RepoError } from './repo'
 import { redact } from './security'
 import { changedLines, unifiedDiff } from './diff'
 
-export type ModelRequest = { model: string; system: string; prompt: string; maxTokens?: number; signal?: AbortSignal }
+/**
+ * `maxTokens` caps thinking and the reply together, so it is set well above the
+ * reply's length: a model that thinks first would otherwise be cut off mid-reply.
+ */
+export type ModelRequest = { model: string; system: string; prompt: string; maxTokens?: number; effort?: 'low' | 'medium' | 'high'; signal?: AbortSignal }
 /** Resolves the reply's text, or rejects saying why there is none. */
 export type Model = (request: ModelRequest) => Promise<string>
 
@@ -70,43 +74,178 @@ function data(label: string, text: string): string {
   return `<repo_data source="${label}">\n${redact(text)}\n</repo_data>`
 }
 
-/** The first JSON object in a reply, tolerating code fences and prose around it. */
-export function extractJson(text: string): Record<string, unknown> | null {
-  const fenced = /```(?:json)?\s*([\s\S]*?)```/.exec(text)
-  const candidates = [fenced?.[1], text]
-  for (const c of candidates) {
-    if (c === undefined) continue
-    const start = c.indexOf('{')
-    if (start < 0) continue
-    let depth = 0
-    let inString = false
-    for (let i = start; i < c.length; i++) {
-      const ch = c[i]
-      if (inString) {
-        if (ch === '\\') i++
-        else if (ch === '"') inString = false
-        continue
-      }
-      if (ch === '"') inString = true
-      else if (ch === '{') depth++
-      else if (ch === '}') {
-        depth--
-        if (depth === 0) {
-          try {
-            const parsed: unknown = JSON.parse(c.slice(start, i + 1))
-            if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as Record<string, unknown>
-          } catch {
-            break
-          }
-        }
-      }
+/** The usual slips of hand-written JSON mended: raw line breaks and tabs inside strings, trailing commas. */
+function mendJson(text: string): string {
+  let out = ''
+  let inString = false
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!
+    if (inString) {
+      if (ch === '\\') { out += ch + (text[i + 1] ?? ''); i++; continue }
+      if (ch === '"') inString = false
+      out += ch === '\n' ? '\\n' : ch === '\r' ? '\\r' : ch === '\t' ? '\\t' : ch
+      continue
+    }
+    if (ch === '"') inString = true
+    if (ch === ',' && /^\s*[}\]]/.test(text.slice(i + 1, i + 200))) continue
+    out += ch
+  }
+  return out
+}
+
+function parseObject(text: string): Record<string, unknown> | null {
+  for (const attempt of [text, mendJson(text)]) {
+    try {
+      const parsed: unknown = JSON.parse(attempt)
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as Record<string, unknown>
+    } catch {
+      // Try the mended text, then give up on this object.
     }
   }
   return null
 }
 
+/**
+ * The first JSON object with something in it in a reply, tolerating code
+ * fences, prose around it (even prose holding a `{}`), trailing commas and raw
+ * line breaks inside strings.
+ */
+export function extractJson(text: string): Record<string, unknown> | null {
+  const fenced = /```(?:json)?\s*([\s\S]*?)```/.exec(text)
+  const candidates = [fenced?.[1], text]
+  for (const c of candidates) {
+    if (c === undefined) continue
+    let tries = 0
+    for (let start = c.indexOf('{'); start >= 0 && tries < 20; start = c.indexOf('{', start + 1), tries++) {
+      const end = closeOf(c, start)
+      // An object that never closes was cut off: what is inside it is not the reply.
+      if (end < 0 && /^\{\s*"/.test(c.slice(start, start + 20))) break
+      if (end < 0) continue
+      const parsed = parseObject(c.slice(start, end + 1))
+      if (parsed !== null && Object.keys(parsed).length > 0) return parsed
+    }
+  }
+  return null
+}
+
+/** Index of the bracket closing the object or array that opens at `start`, or -1 when the text ends first. */
+function closeOf(text: string, start: number): number {
+  let depth = 0
+  let inString = false
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i]
+    if (inString) {
+      if (ch === '\\') i++
+      else if (ch === '"') inString = false
+      continue
+    }
+    if (ch === '"') inString = true
+    else if (ch === '{' || ch === '[') depth++
+    else if (ch === '}' || ch === ']') {
+      depth--
+      if (depth === 0) return i
+    }
+  }
+  return -1
+}
+
+/**
+ * The top-level fields of a JSON object that were written out in full before
+ * the text ended: strings, numbers, booleans, and objects or arrays that
+ * closed. What was cut off mid-value is left out.
+ */
+function finishedFields(text: string, start: number): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  let i = start + 1
+  const skipSpace = () => { while (i < text.length && /[\s,]/.test(text[i]!)) i++ }
+  const readString = (): string | undefined => {
+    const from = i
+    for (i++; i < text.length; i++) {
+      if (text[i] === '\\') i++
+      else if (text[i] === '"') {
+        i++
+        try {
+          return JSON.parse(mendJson(text.slice(from, i))) as string
+        } catch {
+          return undefined
+        }
+      }
+    }
+    return undefined
+  }
+  while (i < text.length) {
+    skipSpace()
+    if (text[i] !== '"') break
+    const key = readString()
+    skipSpace()
+    if (key === undefined || text[i] !== ':') break
+    i++
+    while (i < text.length && /\s/.test(text[i]!)) i++
+    const ch = text[i]
+    if (ch === '"') {
+      const value = readString()
+      if (value === undefined) break
+      out[key] = value
+    } else if (ch === '{' || ch === '[') {
+      const end = closeOf(text, i)
+      if (end < 0) break
+      try {
+        out[key] = JSON.parse(mendJson(text.slice(i, end + 1)))
+      } catch {
+        break
+      }
+      i = end + 1
+    } else {
+      const lit = /^(true|false|null|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)(?=\s*[,}])/.exec(text.slice(i))
+      if (lit === null) break
+      out[key] = JSON.parse(lit[1]!)
+      i += lit[1]!.length
+    }
+  }
+  return out
+}
+
+/**
+ * A model reply read as JSON. A reply that starts an object and never finishes
+ * it was cut off (`isCutOff`): its fields written out in full are kept, and
+ * `json` is null when there are none, so raw JSON never reaches the developer.
+ */
+export function parseReply(reply: string): { json: Record<string, unknown> | null; isCutOff: boolean } {
+  const json = extractJson(reply)
+  if (json !== null) return { json, isCutOff: false }
+  const start = /\{\s*"[^"\n]{1,40}"\s*:/.exec(reply)?.index
+  if (start === undefined) return { json: null, isCutOff: false }
+  const kept = finishedFields(reply, start)
+  return { json: Object.keys(kept).length > 0 ? kept : null, isCutOff: true }
+}
+
 function str(v: unknown, max = 20_000): string {
   return typeof v === 'string' ? v.slice(0, max) : ''
+}
+
+/** A model's "no", whether written as `false` or as the string "false". */
+function isNo(v: unknown): boolean {
+  return v === false || (typeof v === 'string' && /^\s*(false|no)\s*$/i.test(v))
+}
+
+/** A whole number from a model's JSON, which sometimes writes `"12"` for 12. */
+function int(v: unknown): number | undefined {
+  const n = typeof v === 'number' ? v : typeof v === 'string' && /^\s*\d+\s*$/.test(v) ? Number(v) : NaN
+  return Number.isFinite(n) ? Math.floor(n) : undefined
+}
+
+/**
+ * The explanation in a reply that should be prose, or that wrapped its prose
+ * in JSON under `keys`; throws when the reply was cut off before any of it.
+ */
+function proseOf(reply: string, keys: readonly string[]): string {
+  // Prose that merely quotes some JSON is still prose.
+  if (!/^\s*(```(json)?\s*)?\{/.test(reply)) return reply.trim()
+  const { json, isCutOff } = parseReply(reply)
+  const text = json === null ? '' : keys.map(k => str(json[k])).find(t => t.trim() !== '') ?? ''
+  if (text !== '') return text
+  if (isCutOff || json !== null) throw new Error(isCutOff ? 'the reply was cut off' : 'the reply had no explanation')
+  return reply.trim()
 }
 
 function numbered(lines: readonly string[], from: number, to: number): string {
@@ -136,9 +275,10 @@ async function groundRefs(repo: Repo, raw: unknown, rev?: string): Promise<Inloo
       continue
     }
     const count = text.split('\n').length
-    const line = typeof o.line === 'number' && o.line >= 1 && o.line <= count ? Math.floor(o.line) : undefined
-    const endRaw = typeof o.end_line === 'number' ? o.end_line : typeof o.endLine === 'number' ? o.endLine : undefined
-    const endLine = line !== undefined && endRaw !== undefined && endRaw >= line ? Math.min(count, Math.floor(endRaw)) : undefined
+    const lineRaw = int(o.line)
+    const line = lineRaw !== undefined && lineRaw >= 1 && lineRaw <= count ? lineRaw : undefined
+    const endRaw = int(o.end_line) ?? int(o.endLine)
+    const endLine = line !== undefined && endRaw !== undefined && endRaw >= line ? Math.min(count, endRaw) : undefined
     out.push({ path: repo.rel(path), line, endLine, rev: refRev, label: str(o.label ?? o.note, 200) || undefined })
   }
   return out
@@ -169,7 +309,8 @@ async function groundSteps(repo: Repo, raw: unknown, rev?: string): Promise<Inlo
     const text = str(o.say ?? o.text ?? o.label ?? o.note, 600).trim()
     if (text === '') continue
     const [ref] = await groundRefs(repo, [o], rev)
-    if (ref === undefined) continue
+    // A part is read with its code on screen: one whose line is not in the file points at nothing.
+    if (ref?.line === undefined) continue
     out.push(await captureStep(repo, text, { ...ref, label: undefined }))
   }
   return out
@@ -198,6 +339,11 @@ export function combinedDiff(diffs: readonly { path: string; hunks: string }[]):
   return diffs.map(d => `--- a/${d.path}\n+++ b/${d.path}\n${d.hunks}`).join('\n')
 }
 
+/** `login()`, or `POST /api/login` for a route, which is no call. */
+function symbolLabel(s: CodeSymbol): string {
+  return s.kind === 'route' ? s.name : `${s.name}()`
+}
+
 function mainSymbols(analyses: readonly ChangeAnalysis[]): CodeSymbol[] {
   return analyses.flatMap(a => [...a.added, ...a.modified])
 }
@@ -209,46 +355,72 @@ export function staticCard(batch: Batch, callers: Map<string, string[]>, id: str
   const fns = added.filter(s => s.kind !== 'route')
   const modified = batch.analyses.flatMap(a => a.modified)
   const files = batch.analyses.map(a => a.path)
+  const named = (list: readonly CodeSymbol[]) => [...new Set(list.map(symbolLabel))].slice(0, 3).join(', ')
   let title: string
   if (routes.length > 0) title = `New endpoint: ${routes[0]!.name}`
-  else if (fns.length === 1) title = `New ${fns[0]!.kind}: ${fns[0]!.name}()`
-  else if (fns.length > 1) title = `New: ${fns.slice(0, 3).map(s => s.name + '()').join(', ')}`
-  else if (modified.length > 0) title = `Changed: ${modified.slice(0, 3).map(s => s.name + '()').join(', ')}`
+  else if (fns.length === 1) title = `New ${fns[0]!.kind}: ${symbolLabel(fns[0]!)}`
+  else if (fns.length > 1) title = `New: ${named(fns)}`
+  else if (modified.length > 0) title = `Changed: ${named(modified)}`
   else if (batch.analyses.some(a => a.isNew)) title = `New file: ${files.find((_, i) => batch.analyses[i]?.isNew)}`
   else title = `Edited ${files.length === 1 ? files[0] : `${files.length} files`}`
+  // Where in each symbol the edit landed: a changed symbol is shown at its changed lines, not from its top.
+  const where = (a: ChangeAnalysis, s: CodeSymbol): [number, number] => {
+    if (a.added.includes(s)) return [s.line, s.endLine]
+    const hit = a.ranges.find(([from, to]) => from <= s.endLine && to >= s.line)
+    return hit === undefined ? [s.line, s.endLine] : [Math.max(hit[0], s.line), Math.min(hit[1], s.endLine)]
+  }
   const lines: string[] = []
   for (const a of batch.analyses) {
     lines.push(`**${a.path}**${a.isNew ? ' (new file)' : ''}: ${a.reasons.join('; ') || `${a.addedLines} lines added, ${a.removedLines} removed`}`)
     for (const s of [...a.added, ...a.modified].slice(0, 5)) {
       const who = callers.get(s.name)
       const tags = [s.isAsync === true ? 'async' : '', s.isExported === true ? 'exported' : ''].filter(Boolean).join(', ')
-      lines.push(`- \`${s.name}\` (${s.kind}${tags ? ', ' + tags : ''}) at line ${s.line}` +
+      lines.push(`- \`${s.name}\` (${s.kind}${tags ? ', ' + tags : ''}) at line ${where(a, s)[0]}` +
         (who !== undefined && who.length > 0 ? `; called from ${who.slice(0, 3).join(', ')}` : s.kind === 'route' ? '' : '; no callers found yet'))
     }
   }
   const topics = [...new Set(batch.analyses.flatMap(a => a.topics))]
   if (topics.length > 0) lines.push(`\nTopics: ${topics.join(', ')}`)
-  const refs: InloopRef[] = mainSymbols(batch.analyses).slice(0, 8).map(s => ({ path: s.path, line: s.line, endLine: s.endLine, symbol: s.name, label: s.name }))
+  const refs: InloopRef[] = batch.analyses.flatMap(a => [...a.added, ...a.modified].map(s => {
+    const [line, endLine] = where(a, s)
+    return { path: s.path, line, endLine, symbol: s.name, label: s.name }
+  })).slice(0, 8)
   if (refs.length === 0) {
     for (const d of batch.diffs) refs.push({ path: d.path, line: changedLines(d.hunks)[0] ?? 1, label: d.path })
   }
   const steps: InloopStep[] = []
+  const lineWords = (from: number, to: number) => (from === to ? `line ${from}` : `lines ${from}-${to}`)
   for (const a of batch.analyses) {
     const change = batch.changes.find(c => c.path === a.path)
     const fileLines = change?.after?.split('\n')
-    for (const sym of [...a.added, ...a.modified].slice(0, 4)) {
+    const step = (text: string, ref: InloopRef, from: number, to: number) => steps.push({
+      text,
+      ref,
+      code: fileLines?.slice(from - 1, Math.min(to, from + STEP_LINES - 1)).join('\n'),
+      codeStart: fileLines === undefined ? undefined : from,
+    })
+    const syms = [...a.added, ...a.modified].slice(0, 4)
+    for (const sym of syms) {
       if (steps.length >= 5) break
       const isNew = a.added.includes(sym)
       const who = callers.get(sym.name) ?? []
-      const text = `${isNew ? 'New' : 'Changed'} ${sym.kind === 'route' ? 'endpoint' : sym.kind} ${sym.kind === 'route' ? sym.name : `${sym.name}()`}` +
-        (who.length > 0 ? `, called from ${who.slice(0, 2).map(w => w.split(' ')[0]).join(' and ')}.` : '.')
-      const to = Math.min(sym.endLine, sym.line + STEP_LINES - 1)
-      steps.push({
-        text,
-        ref: { path: sym.path, line: sym.line, endLine: sym.endLine, symbol: sym.name },
-        code: fileLines?.slice(sym.line - 1, to).join('\n'),
-        codeStart: fileLines === undefined ? undefined : sym.line,
-      })
+      const [from, to] = where(a, sym)
+      const calledFrom = who.length > 0 ? `called from ${who.slice(0, 2).map(w => w.split(' ')[0]).join(' and ')}` : ''
+      const text = isNew
+        ? `New ${sym.kind === 'route' ? 'endpoint' : sym.kind} ${symbolLabel(sym)}${calledFrom !== '' ? `, ${calledFrom}` : ''}.`
+        : `Changed ${sym.kind === 'route' ? 'endpoint' : sym.kind} ${symbolLabel(sym)}, ${lineWords(from, to)}${calledFrom !== '' ? `; ${calledFrom}` : ''}.`
+      step(text, { path: sym.path, line: from, endLine: to, symbol: sym.name }, from, to)
+    }
+    // Edits outside any function or class are still shown, at their own lines.
+    if (syms.length === 0 && fileLines !== undefined) {
+      if (a.isNew) {
+        if (steps.length < 5) step(`New file ${a.path}.`, { path: a.path, line: 1, endLine: Math.min(fileLines.length, STEP_LINES) }, 1, fileLines.length)
+        continue
+      }
+      for (const [from, to] of a.ranges.slice(0, 2)) {
+        if (steps.length >= 5) break
+        step(`Changed ${lineWords(from, to)}.`, { path: a.path, line: from, endLine: to }, from, to)
+      }
     }
   }
   return {
@@ -301,9 +473,10 @@ export function calleeContext(index: CodeIndex, batch: Batch, max = 4): string {
 
 /**
  * A card written by the model from the batch's diffs and the static facts.
- * Resolves null when the model judges the batch not worth a card.
+ * Resolves null when the model judges the batch not worth a card, unless the
+ * person asked for it (`isAsked`).
  */
-export async function modelCard(env: Env, batch: Batch, base: InloopCard, focus: string, index?: CodeIndex): Promise<InloopCard | null> {
+export async function modelCard(env: Env, batch: Batch, base: InloopCard, focus: string, index?: CodeIndex, isAsked = false): Promise<InloopCard | null> {
   const facts = base.summary
   const related = index === undefined ? '' : calleeContext(index, batch)
   let budget = 14_000
@@ -329,12 +502,15 @@ Reply with JSON only:
     model: env.settings.autoModel,
     system: `${BASE_SYSTEM}\n${depthGuide(env.settings.depth)}`,
     prompt,
-    maxTokens: 900,
+    maxTokens: 4000,
+    effort: 'low',
     signal: env.signal,
   })
-  const json = extractJson(reply)
-  if (json === null) return { ...base, summary: `${reply.trim()}\n\n---\n${base.summary}`, isHeuristic: false }
-  if (json.worth_explaining === false) return null
+  const { json, isCutOff } = parseReply(reply)
+  // A reply cut off before its summary is a failed one: say so, never show it raw.
+  if (isCutOff && (json === null || (str(json.summary) === '' && !isNo(json.worth_explaining)))) throw new Error('the reply was cut off')
+  if (json === null) return { ...base, summary: `${clip(reply.trim(), 3000)}\n\n---\n${base.summary}`, isHeuristic: false }
+  if (isNo(json.worth_explaining) && !isAsked) return null
   const steps = await groundSteps(env.repo, json.steps ?? json.key_lines)
   return {
     ...base,
@@ -622,14 +798,17 @@ export async function ask(env: Env, question: string, kind: AskKind, extra = '')
       model: env.settings.askModel,
       system: `${BASE_SYSTEM}\n${depthGuide(env.settings.depth)}`,
       prompt,
-      maxTokens: isLast ? 2500 : 1800,
+      maxTokens: 8000,
       signal: env.signal,
     })
-    const json = extractJson(reply)
+    const { json, isCutOff } = parseReply(reply)
     if (json === null) {
+      if (isCutOff) throw new Error('the reply was cut off')
       return { answer: reply.trim(), refs: [], steps: [], flow: null, scope: undefined, rev: st.rev, revLabel: st.revLabel, lookups }
     }
     const wanted = Array.isArray(json.lookups) ? json.lookups.slice(0, 4) : []
+    // Cut off before the answer was written out, and asking for nothing: there is nothing to show.
+    if (isCutOff && str(json.answer) === '' && wanted.length === 0) throw new Error('the reply was cut off')
     if (json.answer === undefined && wanted.length > 0 && !isLast) {
       for (const w of wanted) {
         if (w === null || typeof w !== 'object') continue
@@ -729,8 +908,8 @@ ${data('patch', clip(patch, 16_000))}
 
 ${env.ctx.scope ? `Scope requested: "${env.ctx.scope}". Concentrate on that.\n` : ''}Cover, under short markdown headings: What changed; How it worked before and after; Concepts involved; Effect on the application; Purpose (state what the commit message records, and label anything beyond it as inference — never claim to know the author's reasoning).
 Reply with JSON only: {"title": "short title", "concept": "1-4 words", "summary": "markdown", "refs": [{"path": "file", "line": 10, "end_line": 20, "label": "...", "side": "after or before"}]}`
-  const reply = await env.model({ model: env.settings.askModel, system: `${BASE_SYSTEM}\n${depthGuide(env.settings.depth)}`, prompt, maxTokens: 2500, signal: env.signal })
-  const json = extractJson(reply) ?? { summary: reply }
+  const reply = await env.model({ model: env.settings.askModel, system: `${BASE_SYSTEM}\n${depthGuide(env.settings.depth)}`, prompt, maxTokens: 8000, signal: env.signal })
+  const { json, summary } = summaryOf(reply)
   const rawRefs = Array.isArray(json.refs) ? json.refs : []
   const refs: InloopRef[] = []
   for (const r of rawRefs.slice(0, 10)) {
@@ -744,7 +923,7 @@ Reply with JSON only: {"title": "short title", "concept": "1-4 words", "summary"
     at: env.now,
     title: str(json.title, 120) || `${meta.short}: ${meta.subject}`,
     concept: str(json.concept, 60) || undefined,
-    summary: `*Commit ${meta.short} · ${meta.date.slice(0, 10)} · ${meta.author}*\n\n${str(json.summary) || reply}`,
+    summary: `*Commit ${meta.short} · ${meta.date.slice(0, 10)} · ${meta.author}*\n\n${summary}`,
     files: files.map(f => f.path),
     symbols: [],
     refs,
@@ -752,6 +931,15 @@ Reply with JSON only: {"title": "short title", "concept": "1-4 words", "summary"
     rev: sha,
     source: 'commit',
   }
+}
+
+/** The JSON and the markdown summary of a reply asked for `{"summary": ...}`; prose stands as the summary, raw JSON never does. */
+function summaryOf(reply: string): { json: Record<string, unknown>; summary: string } {
+  const { json, isCutOff } = parseReply(reply)
+  if (json === null && !isCutOff) return { json: {}, summary: reply.trim() }
+  const summary = str(json?.summary)
+  if (summary === '') throw new Error(isCutOff ? 'the reply was cut off' : 'the reply had no explanation')
+  return { json: json ?? {}, summary }
 }
 
 export async function compareRevs(env: Env, from: string, to: string, topic: string): Promise<InloopCard> {
@@ -790,13 +978,13 @@ ${data('diff', clip(patch, 16_000))}
 
 Explain how the behaviour and structure changed between the two: what the code did before, what it does after, and why that matters. Mark inferences as such.
 Reply with JSON only: {"title": "...", "summary": "markdown", "refs": [{"path": "file", "line": 1, "label": "..."}]}`
-  const reply = await env.model({ model: env.settings.askModel, system: `${BASE_SYSTEM}\n${depthGuide(env.settings.depth)}`, prompt, maxTokens: 2500, signal: env.signal })
-  const json = extractJson(reply) ?? { summary: reply }
+  const reply = await env.model({ model: env.settings.askModel, system: `${BASE_SYSTEM}\n${depthGuide(env.settings.depth)}`, prompt, maxTokens: 8000, signal: env.signal })
+  const { json, summary } = summaryOf(reply)
   return {
     id: env.newId(),
     at: env.now,
     title: str(json.title, 120) || `${ma.short} → ${mb.short}`,
-    summary: `*${ma.short} → ${mb.short}${topic !== '' ? ` · ${topic}` : ''}*\n\n${str(json.summary) || reply}`,
+    summary: `*${ma.short} → ${mb.short}${topic !== '' ? ` · ${topic}` : ''}*\n\n${summary}`,
     files: paths,
     symbols: [],
     refs: await groundRefs(env.repo, json.refs, b),
@@ -808,6 +996,9 @@ Reply with JSON only: {"title": "...", "summary": "markdown", "refs": [{"path": 
 
 // ---------------------------------------------------------------------------
 // Flow steps
+
+/** Where a model that wrapped its prose in JSON anyway put it. */
+const PROSE_KEYS = ['explanation', 'answer', 'summary', 'text']
 
 export async function explainStep(env: Env, flow: InloopFlow, nodeId: string): Promise<string> {
   const node = flow.nodes.find(n => n.id === nodeId)
@@ -823,7 +1014,7 @@ export async function explainStep(env: Env, flow: InloopFlow, nodeId: string): P
   const prompt = `In the flow "${flow.title}", explain what this one step does and what it hands to the next step. 2-5 sentences.${env.ctx.scope ? ` Scope: "${env.ctx.scope}".` : ''}
 ${data(`${node.ref.path}:${node.ref.line}`, body)}
 Connections: ${[...into, ...out].join('; ') || 'none'}`
-  return env.model({ model: env.settings.autoModel, system: `${BASE_SYSTEM}\n${depthGuide(env.settings.depth)}`, prompt, maxTokens: 600, signal: env.signal })
+  return proseOf(await env.model({ model: env.settings.autoModel, system: `${BASE_SYSTEM}\n${depthGuide(env.settings.depth)}`, prompt, maxTokens: 3000, effort: 'low', signal: env.signal }), PROSE_KEYS)
 }
 
 export async function explainLink(env: Env, flow: InloopFlow, edge: InloopFlowEdge): Promise<string> {
@@ -844,7 +1035,7 @@ From:
 ${await snippet(from)}
 To:
 ${await snippet(to)}`
-  return env.model({ model: env.settings.autoModel, system: `${BASE_SYSTEM}\n${depthGuide(env.settings.depth)}`, prompt, maxTokens: 500, signal: env.signal })
+  return proseOf(await env.model({ model: env.settings.autoModel, system: `${BASE_SYSTEM}\n${depthGuide(env.settings.depth)}`, prompt, maxTokens: 3000, effort: 'low', signal: env.signal }), PROSE_KEYS)
 }
 
 /**

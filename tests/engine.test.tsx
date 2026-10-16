@@ -1,24 +1,30 @@
 import type { On } from 'claude-code'
 import { describe, expect, test } from 'claude-code/testing'
 
+import { unifiedDiff } from '../src/diff'
 import { DEMO_HEAD } from './fixtures'
 import { ROOT, start, world, type World } from './harness'
 
 type Edit = { file_path: string; old_string: string; new_string: string }
 
-/** The bottom of tool.call: applies Edit and Write to the virtual files, as the tools would. */
+/**
+ * The bottom of tool.call: applies Edit and Write to the virtual files, as the
+ * tools would, answering with core's records (the file as it was before).
+ */
 function tools(on: On, w: World): void {
   on('tool.call', ($, e) => {
     const input = e as unknown as Record<string, unknown>
     const rel = String(input.file_path).slice(ROOT.length + 1)
+    const originalFile = w.files.get(rel) ?? null
     if (String(e.tool) === 'Write') {
       w.files.set(rel, String(input.content))
-      return { result: { type: 'create' }, text: `wrote ${rel}` } as never
+      return { result: { type: originalFile === null ? 'create' : 'update', filePath: input.file_path, content: input.content, structuredPatch: [], originalFile }, text: `wrote ${rel}` } as never
     }
     if (String(e.tool) === 'Edit') {
-      const held = w.files.get(rel) ?? ''
-      w.files.set(rel, held.replace(String(input.old_string), String(input.new_string)))
-      return { result: { filePath: rel }, text: `edited ${rel}` } as never
+      const held = originalFile ?? ''
+      const [old, now] = [String(input.old_string), String(input.new_string)]
+      w.files.set(rel, input.replace_all === true ? held.split(old).join(now) : held.replace(old, () => now))
+      return { result: { filePath: input.file_path, oldString: old, newString: now, originalFile, structuredPatch: [], userModified: false, replaceAll: input.replace_all === true }, text: `edited ${rel}` } as never
     }
     return { result: {}, text: 'ok' } as never
   })
@@ -144,6 +150,97 @@ describe('automatic explanations', () => {
     await ui.unmount()
   })
 
+  test('"explain anyway" explains even when the model would call the change too minor', async ($, on) => {
+    const w = world(on, () => JSON.stringify({ worth_explaining: false, title: 'Tables comment', summary: 'A comment names the tables.', steps: [] }))
+    tools(on, w)
+    await start($)
+    await $.tool.call({ tool: 'Edit', file_path: `${ROOT}/server/db/index.js`, old_string: 'const tables', new_string: '// in-memory tables\nconst tables' } as never)
+    await w.clock.advance(10_000)
+    const ui = await $.ui.mount({ plugin: 'inloop', surface: 'terminal', component: 'Pane', requestId: 'inloop', props: PANE_PROPS as never })
+    await ui.press({ key: `feed:again:${(w.get('cards') ?? [])[0]!.id}` })
+    await w.clock.advance(10_000)
+    expect((w.get('cards') ?? []).map(c => [c.title, c.skipped])).toEqual([['Tables comment', undefined]])
+    await ui.unmount()
+  })
+
+  test('several edits to one file that land together are all in its explanation', async ($, on) => {
+    const w = world(on)
+    tools(on, w)
+    await start($)
+    // Parallel tool calls: every edit is in the file before inloop reads it.
+    await Promise.all([
+      $.tool.call({ tool: 'Edit', ...editTokens() } as never),
+      $.tool.call({ tool: 'Edit', file_path: `${ROOT}/server/auth/tokens.js`, old_string: "const LIFETIME = '1h'", new_string: "const LIFETIME = '15m'" } as never),
+    ])
+    await w.clock.advance(10_000)
+    const diff = (w.get('cards') ?? [])[0]!.diff ?? ''
+    expect(diff.includes('+function refreshToken(token) {')).toBe(true)
+    expect(diff.includes("+const LIFETIME = '15m'")).toBe(true)
+    expect(diff.includes("-const LIFETIME = '1h'")).toBe(true)
+  })
+
+  test('a reply cut off mid-JSON is a failed explanation, never shown raw', async ($, on) => {
+    const w = world(on, () => '{"worth_explaining": true, "title": "Token refresh", "summary": "The agent added')
+    tools(on, w)
+    await start($)
+    await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
+    await w.clock.advance(10_000)
+    const cards = w.get('cards') ?? []
+    expect(cards.map(c => c.failed)).toEqual(['the reply was cut off'])
+    expect(cards[0]!.summary.includes('worth_explaining')).toBe(false)
+    expect(w.get('history') ?? []).toEqual([])
+  })
+
+  for (const [shape, reply] of [
+    ['fenced', '```json\n{"worth_explaining": true, "title": "Token refresh", "summary": "The agent added'],
+    ['after prose', 'Here is the card:\n{"worth_explaining": true, "title": "Token refresh", "summary": "The agent added'],
+  ] as const) {
+    test(`a cut-off reply ${shape} is a failed explanation too, never shown raw`, async ($, on) => {
+      const w = world(on, () => reply)
+      tools(on, w)
+      await start($)
+      await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
+      await w.clock.advance(10_000)
+      const cards = w.get('cards') ?? []
+      expect(cards.map(c => c.failed)).toEqual(['the reply was cut off'])
+      expect(cards[0]!.summary.includes('worth_explaining')).toBe(false)
+    })
+  }
+
+  test('"try again" after a cut-off reply asks the model again; one cut off after its summary keeps the summary', async ($, on) => {
+    let calls = 0
+    const w = world(on, () => {
+      calls++
+      return calls === 1
+        ? '{"worth_explaining": true, "title": "Token refresh", "summary": "The agent added'
+        : '{"worth_explaining": true, "title": "Token refresh", "summary": "The agent added a refresh helper.", "steps": [{"say": "First the'
+    })
+    tools(on, w)
+    await start($)
+    await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
+    await w.clock.advance(10_000)
+    const failed = (w.get('cards') ?? [])[0]!
+    expect(failed.failed).toBe('the reply was cut off')
+    // A cut-off reply is never served again from the cache.
+    const ui = await $.ui.mount({ plugin: 'inloop', surface: 'terminal', component: 'Pane', requestId: 'inloop', props: PANE_PROPS as never })
+    await ui.press({ key: `feed:card:${failed.id}` })
+    await ui.press({ key: `feed:again:${failed.id}` })
+    await w.clock.advance(10_000)
+    expect(calls).toBe(2)
+    const card = (w.get('cards') ?? [])[0]!
+    expect([card.title, card.summary, card.failed]).toEqual(['Token refresh', 'The agent added a refresh helper.', undefined])
+    await ui.unmount()
+  })
+
+  test('worth_explaining written as the string "false" still skips', async ($, on) => {
+    const w = world(on, () => '{"worth_explaining": "false", "title": "x", "summary": "y"}')
+    tools(on, w)
+    await start($)
+    await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
+    await w.clock.advance(10_000)
+    expect((w.get('cards') ?? []).map(c => c.skipped)).toEqual(['the model judged it too minor to explain'])
+  })
+
   test('the model saying "not worth explaining" shows as not explained, not as nothing', async ($, on) => {
     const w = world(on, () => JSON.stringify({ worth_explaining: false }))
     tools(on, w)
@@ -153,24 +250,109 @@ describe('automatic explanations', () => {
     expect((w.get('cards') ?? []).map(c => c.skipped)).toEqual(['the model judged it too minor to explain'])
   })
 
-  test('a failed model call says so plainly, with the changes and "try again"; a cut-off call is retried once', async ($, on) => {
+  test('a failed model call says so plainly, with the changes and "try again"', async ($, on) => {
     const w = world(on)
-    w.failModel = call => (call <= 2 ? { reason: 'aborted' } : { reason: 'api-error', status: 529, error: 'overloaded' })
+    w.failModel = () => ({ reason: 'api-error', status: 400, error: 'bad request' })
     tools(on, w)
     await start($)
     await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
     await w.clock.advance(10_000)
-    expect(w.prompts.length).toBe(2)
+    // A request the API refuses is not one waiting cures: no retries.
+    expect(w.prompts.length).toBe(1)
     const card = (w.get('cards') ?? [])[0]!
-    expect(card.failed).toBe('aborted')
+    expect(card.failed).toBe('API error 400 bad request')
     expect(card.steps).toEqual([])
     const ui = await $.ui.mount({ plugin: 'inloop', surface: 'terminal', component: 'Pane', requestId: 'inloop', props: PANE_PROPS as never })
     expect(await ui.find({ text: /⚠ explanation failed/ })).toBeDefined()
     await ui.press({ key: `feed:card:${card.id}` })
     expect(await ui.find({ text: /server\/auth\/tokens\.js/ })).toBeDefined()
+    w.failModel = () => undefined
     await ui.press({ key: `feed:again:${card.id}` })
     await w.clock.advance(10_000)
-    expect((w.get('cards') ?? [])[0]!.failed).toBe('API error 529 overloaded')
+    expect((w.get('cards') ?? [])[0]!.failed).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('an overloaded, rate-limited or cut-off call is waited out and retried, as Claude Code does', async ($, on) => {
+    const w = world(on)
+    w.failModel = call => (call === 1 ? { reason: 'aborted' } : call === 2 ? { reason: 'api-error', status: 429, error: 'rate limited' } : call === 3 ? { reason: 'api-error', status: 529, error: 'overloaded' } : undefined)
+    tools(on, w)
+    await start($)
+    await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
+    await w.clock.advance(60_000)
+    expect(w.prompts.length).toBe(4)
+    expect((w.get('cards') ?? []).map(c => c.failed)).toEqual([undefined])
+  })
+
+  test('a call that keeps failing gives up after about a minute', async ($, on) => {
+    const w = world(on)
+    w.failModel = () => ({ reason: 'api-error', status: 529, error: 'overloaded' })
+    tools(on, w)
+    await start($)
+    await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
+    await w.clock.advance(120_000)
+    expect(w.prompts.length).toBe(5)
+    expect((w.get('cards') ?? []).map(c => c.failed)).toEqual(['API error 529 overloaded'])
+  })
+
+  test('"explain anyway" still works after a reload, from the diff the card carries', async ($, on) => {
+    const w = world(on, () => JSON.stringify({ worth_explaining: true, title: 'Tables comment', summary: 'A comment names the tables.', steps: [] }))
+    tools(on, w)
+    await start($)
+    await $.tool.call({ tool: 'Edit', file_path: `${ROOT}/server/db/index.js`, old_string: 'const tables', new_string: '// in-memory tables\nconst tables' } as never)
+    await w.clock.advance(10_000)
+    // The plugin reloads: the feed is kept, the change behind it is not.
+    await start($)
+    const ui = await $.ui.mount({ plugin: 'inloop', surface: 'terminal', component: 'Pane', requestId: 'inloop', props: PANE_PROPS as never })
+    await ui.press({ key: `feed:again:${(w.get('cards') ?? [])[0]!.id}` })
+    await w.clock.advance(10_000)
+    expect((w.get('cards') ?? []).map(c => [c.title, c.skipped])).toEqual([['Tables comment', undefined]])
+    expect(w.prompts.at(-1)?.prompt.includes('+// in-memory tables')).toBe(true)
+    expect(w.get('status')?.lastError).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('pressing "explain anyway" twice before the pane redraws explains once, with no error', async ($, on) => {
+    const w = world(on, () => JSON.stringify({ worth_explaining: true, title: 'Tables comment', summary: 'A comment names the tables.', steps: [] }))
+    tools(on, w)
+    await start($)
+    await $.tool.call({ tool: 'Edit', file_path: `${ROOT}/server/db/index.js`, old_string: 'const tables', new_string: '// in-memory tables\nconst tables' } as never)
+    await w.clock.advance(10_000)
+    const ui = await $.ui.mount({ plugin: 'inloop', surface: 'terminal', component: 'Pane', requestId: 'inloop', props: PANE_PROPS as never })
+    const id = (w.get('cards') ?? [])[0]!.id
+    await ui.press({ key: `feed:again:${id}` })
+    await ui.press({ key: `feed:again:${id}` })
+    await w.clock.advance(10_000)
+    expect((w.get('cards') ?? []).map(c => c.title)).toEqual(['Tables comment'])
+    expect(w.prompts.length).toBe(1)
+    expect(w.get('status')?.lastError).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('the busy line stays while a question runs, though an explanation started beside it is done', async ($, on) => {
+    const w = world(on, prompt => (prompt.includes('in-memory tables')
+      ? JSON.stringify({ worth_explaining: true, title: 'Tables comment', summary: 'A comment names the tables.', steps: [] })
+      : JSON.stringify({ answer: 'It checks the password.', refs: [] })))
+    tools(on, w)
+    let release = (): void => undefined
+    w.holdModel = prompt => (prompt.includes('in-memory tables') ? undefined : new Promise<void>(resolve => { release = resolve }))
+    await start($)
+    await $.tool.call({ tool: 'Edit', file_path: `${ROOT}/server/db/index.js`, old_string: 'const tables', new_string: '// in-memory tables\nconst tables' } as never)
+    await w.clock.advance(10_000)
+    const ui = await $.ui.mount({ plugin: 'inloop', surface: 'terminal', component: 'Pane', requestId: 'inloop', props: PANE_PROPS as never })
+    const id = (w.get('cards') ?? [])[0]!.id
+    await $.command.run({ command: 'inloop', args: 'how does login work' } as never)
+    await w.clock.advance(10)
+    await ui.press({ key: 'tab:feed' })
+    await ui.press({ key: `feed:again:${id}` })
+    await w.clock.advance(10)
+    expect((w.get('cards') ?? [])[0]!.title).toBe('Tables comment')
+    // The question is still being answered: its spinner and line stay.
+    expect(w.get('status')?.busy).toBe('investigating')
+    expect(await ui.find({ text: /investigating/ })).toBeDefined()
+    release()
+    await w.clock.advance(10_000)
+    expect(w.get('status')?.busy).toBe(null)
     await ui.unmount()
   })
 
@@ -291,6 +473,25 @@ describe('history', () => {
     expect(after.map(c => c.id)).toEqual([mine.id])
     await ui.unmount()
   })
+
+  test('one explanation can be deleted from History, and stays deleted', async ($, on) => {
+    const other = { id: 'other1', at: 1, title: 'From another session', summary: 'x', files: [], symbols: [], refs: [], source: 'auto' }
+    const w = world(on, undefined, { history: [other] })
+    tools(on, w)
+    await start($)
+    await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
+    await w.clock.advance(10_000)
+    const mine = (w.get('cards') ?? [])[0]!
+    const ui = await $.ui.mount({ plugin: 'inloop', surface: 'terminal', component: 'Pane', requestId: 'inloop', props: PANE_PROPS as never })
+    await ui.press({ key: 'tab:history' })
+    // The newest explanation is open; its delete removes it everywhere, the other stays.
+    await ui.press({ key: `history:delete:${mine.id}` })
+    expect((w.get('history') ?? []).map(c => c.id)).toEqual(['other1'])
+    expect((w.stored.get('history') as { id: string }[]).map(c => c.id)).toEqual(['other1'])
+    expect((w.get('cards') ?? []).some(c => c.id === mine.id)).toBe(false)
+    expect(await ui.find({ text: /1 saved explanations/ })).toBeDefined()
+    await ui.unmount()
+  })
 })
 
 describe('surfaces without fields', () => {
@@ -316,14 +517,23 @@ describe('lifecycle', () => {
     await w.clock.advance(10_000)
     expect((w.get('cards') ?? []).length).toBe(1)
     expect(w.prompts.length).toBe(1)
-    // The same change seen again (an undo and redo) is not explained twice.
+  })
+
+  test('a change undone and then made again is shown again, not dropped as already seen', async ($, on) => {
+    const w = world(on)
+    tools(on, w)
+    await start($)
+    await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
+    await w.clock.advance(10_000)
     const e = editTokens()
     await $.tool.call({ tool: 'Edit', file_path: e.file_path, old_string: e.new_string, new_string: e.old_string } as never)
     await w.clock.advance(10_000)
     await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
     await w.clock.advance(10_000)
-    const titles = (w.get('cards') ?? []).map(c => c.title)
-    expect(titles.length).toBe(2)
+    const cards = w.get('cards') ?? []
+    // Otherwise the feed would end on the undo, as if the change were gone.
+    expect(cards.length).toBe(3)
+    expect(cards[0]!.diff?.includes('+function refreshToken(token) {')).toBe(true)
   })
 
   test('many rapid edits stay bounded: batches fold instead of queueing without limit', async ($, on) => {
@@ -383,6 +593,24 @@ describe('changes made outside the edit tools', () => {
     await $.tool.call({ tool: 'Bash', command: 'ls' } as never)
     await w.clock.advance(10_000)
     expect((w.get('cards') ?? []).length).toBe(1)
+  })
+
+  test('a script that changes a file the agent already edited is still explained', async ($, on) => {
+    const w = world(on)
+    tools(on, w)
+    await start($)
+    await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
+    await $.tool.call({ tool: 'Bash', command: 'npx tsc' } as never)
+    await w.clock.advance(10_000)
+    expect((w.get('cards') ?? []).length).toBe(1)
+    const tokens = w.files.get('server/auth/tokens.js')!
+    w.files.set('server/auth/tokens.js', tokens.replace('module.exports', 'function revokeToken(token) {\n  return revoked.add(token)\n}\n\nmodule.exports'))
+    await $.tool.call({ tool: 'Bash', command: 'python3 - <<EOF ... EOF' } as never)
+    await w.clock.advance(10_000)
+    const cards = w.get('cards') ?? []
+    expect(cards.length).toBe(2)
+    expect(cards[0]!.diff?.includes('+function revokeToken(token) {')).toBe(true)
+    expect(cards[0]!.diff?.includes('+function refreshToken(token) {')).toBe(false)
   })
 
   test("uncommitted work from before the session is the person's, never explained", async ($, on) => {
@@ -462,6 +690,146 @@ describe('changes made outside the edit tools', () => {
     const cards = w.get('cards') ?? []
     expect(cards.length).toBe(1)
     expect(cards[0]!.files).toEqual(['server/auth/passwords.js'])
+  })
+})
+
+describe('what each change was', () => {
+  const CONTROLLER = `${ROOT}/server/auth/controller.js`
+
+  test('an edit whose new text also appears earlier in the file shows where it really changed', async ($, on) => {
+    const w = world(on)
+    tools(on, w)
+    await start($)
+    const before = w.files.get('server/auth/controller.js')!
+    // register now answers like login does: login already has this very line.
+    await $.tool.call({ tool: 'Edit', file_path: CONTROLLER, old_string: '  res.status(201).json({ id: user.id })', new_string: '  res.json({ token })' } as never)
+    await w.clock.advance(10_000)
+    const diff = (w.get('cards') ?? [])[0]!.diff ?? ''
+    expect(diff.includes(unifiedDiff(before, w.files.get('server/auth/controller.js')!))).toBe(true)
+  })
+
+  test('a deletion followed by another edit to the same file is not shown as a new file', async ($, on) => {
+    const w = world(on)
+    tools(on, w)
+    await start($)
+    await $.tool.call({ tool: 'Edit', file_path: CONTROLLER, old_string: "const { hashPassword, verifyPassword } = require('./passwords')\n", new_string: '' } as never)
+    await w.clock.advance(1000)
+    await $.tool.call({ tool: 'Edit', file_path: CONTROLLER, old_string: '  res.status(201).json({ id: user.id })', new_string: '  res.status(201).json({ id: user.id, email })' } as never)
+    await w.clock.advance(10_000)
+    const card = (w.get('cards') ?? [])[0]!
+    expect(card.diff?.includes("-const { hashPassword, verifyPassword } = require('./passwords')")).toBe(true)
+    expect(card.diff?.includes('+  res.status(201).json({ id: user.id, email })')).toBe(true)
+    expect(card.diff?.includes("+const { findUserByEmail, createUser } = require('../db/users')")).toBe(false)
+  })
+
+  test('a shell command that puts a file back the way a scan last saw it is still a change', async ($, on) => {
+    const w = world(on)
+    tools(on, w)
+    await start($)
+    await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
+    await $.tool.call({ tool: 'Bash', command: 'npm test' } as never)
+    await w.clock.advance(10_000)
+    const tested = w.files.get('server/auth/tokens.js')!
+    await $.tool.call({ tool: 'Edit', file_path: `${ROOT}/server/auth/tokens.js`, old_string: "const LIFETIME = '1h'", new_string: "const LIFETIME = '15m'" } as never)
+    await w.clock.advance(10_000)
+    // The agent undoes its last edit from the shell.
+    w.files.set('server/auth/tokens.js', tested)
+    await $.tool.call({ tool: 'Bash', command: "sed -i \"s/'15m'/'1h'/\" server/auth/tokens.js" } as never)
+    await w.clock.advance(10_000)
+    const cards = w.get('cards') ?? []
+    expect(cards.length).toBe(3)
+    expect(cards[0]!.diff?.includes("-const LIFETIME = '15m'")).toBe(true)
+  })
+
+  test('a file a shell command deletes is a change, and shows in the changes since the prompt', async ($, on) => {
+    const w = world(on)
+    tools(on, w)
+    await start($)
+    await $.prompt.submit({ text: 'drop the users module', wait: false } as never)
+    await w.clock.advance(100)
+    w.files.delete('server/db/users.js')
+    await $.tool.call({ tool: 'Bash', command: 'rm server/db/users.js' } as never)
+    await w.clock.advance(10_000)
+    const cards = w.get('cards') ?? []
+    expect(cards.map(c => c.files)).toEqual([['server/db/users.js']])
+    expect(cards[0]!.diff?.includes('-async function findUserByEmail(email) {')).toBe(true)
+    expect(w.get('changes')?.files.map(f => [f.path, f.isDeleted])).toEqual([['server/db/users.js', true]])
+  })
+
+  test('a session in a subfolder of the repository sees shell changes there', async ($, on) => {
+    const w = world(on)
+    w.root = `${ROOT}/server`
+    tools(on, w)
+    await start($)
+    w.files.set('server/app.js', w.files.get('server/app.js')! + '\nfunction health(req, res) {\n  res.json({ ok: true })\n}\n')
+    await $.tool.call({ tool: 'Bash', command: 'python3 fix.py' } as never)
+    await w.clock.advance(10_000)
+    const cards = w.get('cards') ?? []
+    expect(cards.map(c => c.files)).toEqual([['app.js']])
+    expect(cards[0]!.diff?.includes('+function health(req, res) {')).toBe(true)
+    expect(cards[0]!.diff?.includes('-const express')).toBe(false)
+  })
+
+  test('after the agent commits, a later shell change shows against the new commit', async ($, on) => {
+    const w = world(on)
+    tools(on, w)
+    await start($)
+    w.files.set('server/app.js', w.files.get('server/app.js')! + '\nfunction health(req, res) {\n  res.json({ ok: true })\n}\n')
+    await $.tool.call({ tool: 'Bash', command: 'python3 fix.py' } as never)
+    await w.clock.advance(10_000)
+    w.commit()
+    await $.tool.call({ tool: 'Bash', command: 'git commit -am "health"' } as never)
+    await w.clock.advance(10_000)
+    await $.tool.call({ tool: 'Bash', command: 'npm test' } as never)
+    await w.clock.advance(10_000)
+    w.files.set('server/app.js', w.files.get('server/app.js')! + '\nfunction ready(req, res) {\n  res.json({ ready: true })\n}\n')
+    await $.tool.call({ tool: 'Bash', command: 'python3 fix2.py' } as never)
+    await w.clock.advance(10_000)
+    const cards = w.get('cards') ?? []
+    expect(cards.length).toBe(2)
+    expect(cards[0]!.diff?.includes('+function ready(req, res) {')).toBe(true)
+    expect(cards[0]!.diff?.includes('+function health(req, res) {')).toBe(false)
+  })
+
+  test("the end of a turn waits for a scan still running, so the turn's changes are one step", async ($, on) => {
+    const w = world(on)
+    tools(on, w)
+    await start($)
+    await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
+    w.files.set('server/app.js', w.files.get('server/app.js')! + '\nfunction health(req, res) {\n  res.json({ ok: true })\n}\n')
+    let release = () => undefined as void
+    const held = new Promise<void>(resolve => { release = resolve })
+    w.gitGate = args => (args[0] === 'status' ? held : undefined)
+    await $.tool.call({ tool: 'Bash', command: 'python3 fix.py' } as never)
+    await w.clock.advance(1)
+    await $.turn.complete({ answer: '', durationMs: 1000, isAborted: false, turnId: 't1' } as never)
+    await w.clock.advance(1)
+    w.gitGate = () => undefined
+    release()
+    await w.clock.advance(10_000)
+    const cards = w.get('cards') ?? []
+    expect(cards.map(c => [...c.files].sort())).toEqual([['server/app.js', 'server/auth/tokens.js']])
+  })
+
+  test("the person's own edits between turns are theirs, not the agent's", async ($, on) => {
+    const w = world(on)
+    tools(on, w)
+    await start($)
+    // Between turns, the person changes a file in their editor, then asks for something.
+    w.files.set('server/db/users.js', w.files.get('server/db/users.js')! + '\nfunction countUsers() {\n  return 0\n}\n')
+    await $.prompt.submit({ text: 'run the tests', wait: false } as never)
+    await w.clock.advance(100)
+    await $.tool.call({ tool: 'Bash', command: 'npm test' } as never)
+    await $.turn.complete({ answer: '', durationMs: 1000, isAborted: false, turnId: 't1' } as never)
+    await w.clock.advance(10_000)
+    expect(w.get('cards') ?? []).toEqual([])
+    // The agent's next change to that file shows against the person's version.
+    w.files.set('server/db/users.js', w.files.get('server/db/users.js')!.replace('return 0', 'return db.count()'))
+    await $.tool.call({ tool: 'Bash', command: 'sed -i ...' } as never)
+    await w.clock.advance(10_000)
+    const diff = (w.get('cards') ?? [])[0]?.diff ?? ''
+    expect(diff.includes('+  return db.count()')).toBe(true)
+    expect(diff.includes('+function countUsers() {')).toBe(false)
   })
 })
 
@@ -563,6 +931,32 @@ describe('what is asked about', () => {
     const answer = (w.get('convo') ?? []).at(-1)
     expect(answer?.text.includes('not a project')).toBe(true)
     expect(w.prompts.length).toBe(0)
+  })
+
+  test('outside git, the commit commands say so instead of finding no commit', async ($, on) => {
+    const w = world(on)
+    w.isGit = false
+    tools(on, w)
+    await start($)
+    const found = await $.command.run({ command: 'inloop-commit', args: 'fix login' } as never) as { text: string }
+    expect(found.text).toBe('This project is not a git repository.')
+    const compared = await $.command.run({ command: 'inloop-compare', args: 'HEAD~1 HEAD' } as never) as { text: string }
+    expect(compared.text).toBe('This project is not a git repository.')
+  })
+
+  test('an answer cut off mid-JSON is never shown raw; one cut off after its answer keeps the answer', async ($, on) => {
+    let reply = '{"answer": "The password is checked by'
+    const w = world(on, () => reply)
+    tools(on, w)
+    await start($)
+    await $.command.run({ command: 'inloop', args: 'how is the password checked?' } as never)
+    await w.clock.advance(10)
+    const said = (w.get('convo') ?? []).filter(t => t.role === 'inloop').map(t => t.text)
+    expect(said).toEqual(['Could not answer: the reply was cut off'])
+    reply = '```json\n{"answer": "By `verifyPassword`, which compares the hash.", "refs": [{"path": "server/auth/pass'
+    await $.command.run({ command: 'inloop', args: 'how is the password hash compared?' } as never)
+    await w.clock.advance(10)
+    expect((w.get('convo') ?? []).at(-1)?.text).toBe('By `verifyPassword`, which compares the hash.')
   })
 
   test('a question about the whole repo starts from its big picture', async ($, on) => {
@@ -821,6 +1215,24 @@ describe('styles', () => {
     expect(w.setupRuns).toBe(0)
   })
 
+  test('"reload voices" redraws the voice controls with what it found', async ($, on) => {
+    const w = world(on, undefined, { settings: { style: 'written', autoVoiceSetup: false } })
+    w.kokoro = true
+    w.isKokoroInstalled = false
+    tools(on, w)
+    await start($)
+    await w.clock.advance(1)
+    const ui = await $.ui.mount({ plugin: 'inloop', surface: 'terminal', component: 'Pane', requestId: 'inloop', props: PANE_PROPS as never })
+    await ui.press({ key: 'tab:settings' })
+    expect(await ui.find({ key: 'set:kokoro' })).toBeDefined()
+    // Installed meanwhile (another session's /inloop-voice setup).
+    w.isKokoroInstalled = true
+    await ui.press({ key: 'set:reloadvoices' })
+    await w.clock.advance(1)
+    expect(await ui.find({ key: 'set:kokoro' })).toBe(undefined)
+    await ui.unmount()
+  })
+
   for (const [platform, players] of [['Linux', ['aplay', 'paplay']], ['Windows', ['powershell']]] as const) {
     test(`${platform}: Kokoro's clips play through the player the machine has`, { timeoutMs: 20_000 }, async ($, on) => {
       const w = world(on, STEPPED)
@@ -936,6 +1348,21 @@ describe('styles', () => {
     const composed = await $.prompt.compose({ model: 'claude-opus-5-5', promptModel: 'claude-opus-5-5', surfaces: [], tools: [], outputStyle: null, traits: ['print'] } as never)
     expect(composed.sections.map(x => x.id)).toEqual(['intro'])
     void w
+  })
+
+  test('headless runs explain changes but never read them aloud', { timeoutMs: 20_000 }, async ($, on) => {
+    const w = world(on, STEPPED)
+    tools(on, w)
+    await $.session.start({ cwd: ROOT, surface: null, isInteractive: false } as never)
+    await $.command.run({ command: 'inloop-style', args: 'spoken' } as never)
+    await w.clock.advance(10_000)
+    w.said.length = 0
+    await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
+    await w.clock.advance(10_000)
+    expect((w.get('cards') ?? []).map(c => c.title)).toEqual(['Token refresh'])
+    await w.clock.advance(10_000)
+    expect(w.said).toEqual([])
+    expect(w.get('narration') ?? null).toBe(null)
   })
 
   test('spoken, with the pane hidden: the part and its code show above the prompt', { timeoutMs: 20_000 }, async ($, on) => {

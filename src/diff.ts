@@ -29,10 +29,11 @@ function lcsOps(a: readonly string[], b: readonly string[]): Op[] | null {
   while (i < n || j < m) {
     if (i < n && j < m && a[start + i] === b[start + j]) {
       ops.push({ kind: ' ', text: a[start + i]!, a: start + i, b: start + j }); i++; j++
-    } else if (j < m && (i >= n || dp[i]![j + 1]! >= dp[i + 1]![j]!)) {
-      ops.push({ kind: '+', text: b[start + j]!, a: start + i, b: start + j }); j++
-    } else {
+    } else if (i < n && (j >= m || dp[i + 1]![j]! >= dp[i]![j + 1]!)) {
+      // Removals first, as git shows a replaced line.
       ops.push({ kind: '-', text: a[start + i]!, a: start + i, b: start + j }); i++
+    } else {
+      ops.push({ kind: '+', text: b[start + j]!, a: start + i, b: start + j }); j++
     }
   }
   for (let k = 0; k < a.length - endA; k++) ops.push({ kind: ' ', text: a[endA + k]!, a: endA + k, b: endB + k })
@@ -41,8 +42,10 @@ function lcsOps(a: readonly string[], b: readonly string[]): Op[] | null {
 
 /** Unified-diff hunks (no file header) from `before` to `after`, `context` lines around each change. */
 export function unifiedDiff(before: string, after: string, context = 3): string {
-  const a = before === '' ? [] : before.split('\n')
-  const b = after === '' ? [] : after.split('\n')
+  // A file's last newline ends its last line; it does not start another.
+  const lines = (text: string) => (text === '' ? [] : text.replace(/\n$/, '').split('\n'))
+  const a = lines(before)
+  const b = lines(after)
   const ops = lcsOps(a, b)
   if (ops === null) {
     return [`@@ -1,${a.length} +1,${b.length} @@`, ...a.map(l => '-' + l), ...b.map(l => '+' + l)].join('\n')

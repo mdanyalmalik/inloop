@@ -1,9 +1,9 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { analyzeChange, extractSymbols, findCalls, matchesFocus } from '../src/analysis'
+import { analyzeChange, extractSymbols, findCalls, matchesFocus, topicsOf } from '../src/analysis'
 import { Batcher, hash } from '../src/batcher'
 import { changedLines, formatRanges, summarizeDiff, unifiedDiff } from '../src/diff'
-import { describeFlow, extractJson, speakable, staticCard, diffBatch } from '../src/explain'
+import { describeFlow, extractJson, parseReply, speakable, staticCard, diffBatch } from '../src/explain'
 import { buildIndex, callersOf, findSymbols, lookup, traceFlow, urlMatches } from '../src/graph'
 import { isSafeRev, isSensitive, redact, toRelative } from '../src/security'
 import { DEMO_FIRST, DEMO_HEAD } from './fixtures'
@@ -116,6 +116,25 @@ describe('diff and batching', () => {
     expect(d.includes('-c')).toBe(true)
     expect(d.includes('+C')).toBe(true)
     expect(changedLines(d)).toEqual([3, 8])
+  })
+
+  test('a replaced line reads as git shows it: removed, then added', () => {
+    const d = unifiedDiff('a\nb\nold\nc\n', 'a\nb\nnew\nc\n')
+    expect(d.split('\n').filter(l => /^[-+]/.test(l))).toEqual(['-old', '+new'])
+  })
+
+  test('a new file has no extra empty line at its end', () => {
+    expect(unifiedDiff('', 'a\nb\n')).toBe('@@ -0,0 +1,2 @@\n+a\n+b')
+    expect(unifiedDiff('a\nb\n', '')).toBe('@@ -1,2 +0,0 @@\n-a\n-b')
+  })
+
+  test('an edit known only by its snippets, merged with one known whole, is never taken for a new file', () => {
+    const b = new Batcher({ quietMs: 1000, maxWaitMs: 10_000, maxFiles: 10 })
+    b.add({ path: 'a.js', before: null, after: null, snippets: [{ old: 'x\n', new: '' }], tools: ['Edit'], at: 0 })
+    b.add({ path: 'a.js', before: 'y\nz\n', after: 'y\nZ\n', snippets: [], tools: ['Edit'], at: 100 })
+    const [held] = b.take()
+    expect(held!.before === null && held!.after !== null).toBe(false)
+    expect(held!.snippets.length).toBe(2)
   })
 
   test('edits close together form one batch per file, flushed after quiet', () => {
@@ -299,5 +318,91 @@ describe('diff summaries', () => {
     const files = summarizeDiff(patch)
     expect(files.map(f => [f.path, f.added, f.removed])).toEqual([['a.js', 1, 1], ['new.js', 1, 0]])
     expect(files[0]!.hunks.includes('diff --git')).toBe(false)
+  })
+})
+
+describe('explanation quality', () => {
+  test('calls, routes and words inside strings or comments are not definitions', () => {
+    const text = [
+      "test('x', () => {",
+      "  expect(diff.includes('+function refreshToken(token) {')).toBe(true)",
+      "  const edit = { old_string: \"app.post('/api/register', register)\" }",
+      "  // app.get('/api/old', handler)",
+      '  const STEPPED = () => JSON.stringify({',
+      '    a: 1,',
+      '  })',
+      '})',
+    ].join('\n')
+    expect(extractSymbols(text, 'tests/engine.test.tsx').map(s => `${s.kind} ${s.name}`)).toEqual(['function STEPPED'])
+  })
+
+  test('a return type with braces does not end the method on its first line', () => {
+    const text = 'class Repo {\n  async dirtyEntries(): Promise<{ path: string }[]> {\n    const out = []\n    return out\n  }\n\n  head(): string { return "x" }\n}\n'
+    const syms = extractSymbols(text, 'src/repo.ts')
+    expect(syms.map(s => [s.name, s.line, s.endLine])).toEqual([['Repo', 1, 8], ['dirtyEntries', 2, 5], ['head', 7, 7]])
+  })
+
+  test('one method changed in a big class: the method is what changed, and only its lines set the topics', () => {
+    const before = ['export class Store {', '  login(user) {', '    return createToken(user.password)', '  }', '', '  count() {', '    return 1', '  }', '}', ''].join('\n')
+    const after = before.replace('return 1', 'return 2')
+    const a = analyzeChange({ path: 'src/store.js', before, after, snippets: [], tools: ['Edit'], at: 0 })
+    expect(a.modified.map(s => s.name)).toEqual(['count'])
+    expect(a.topics.includes('authentication')).toBe(false)
+    expect(a.reasons.some(r => r.includes('auth'))).toBe(false)
+    expect(a.ranges).toEqual([[7, 7]])
+  })
+
+  test('topic words are whole concepts, not fragments of common words', () => {
+    expect(topicsOf('const author = meta.author').includes('authentication')).toBe(false)
+    expect(topicsOf('await state.update(s => s)').includes('database')).toBe(false)
+    expect(topicsOf('const key = hash(text)').includes('security')).toBe(false)
+    expect(topicsOf('if (!(await verifyPassword(password, user.passwordHash)))').includes('authentication')).toBe(true)
+  })
+
+  test('the static card points a changed method at its changed lines, not at its whole enclosing class', () => {
+    const body = Array.from({ length: 60 }, (_, i) => `    const v${i} = ${i}`).join('\n')
+    const before = `export class App {\n  start() {\n${body}\n    return 1\n  }\n}\n`
+    const after = before.replace('return 1', 'return 2')
+    const changes = [{ path: 'src/app.js', before, after, snippets: [], tools: ['Edit'], at: 0 }]
+    const card = staticCard({ changes, analyses: changes.map(analyzeChange), diffs: diffBatch(changes) }, new Map(), 'c1', 0)
+    expect(card.title).toBe('Changed: start()')
+    expect(card.steps!.map(s => [s.text, s.ref.line, s.code])).toEqual([['Changed method start(), line 63.', 63, '    return 2']])
+  })
+
+  test('the static card names routes without call parentheses and each name once', () => {
+    const before = "app.get('/a', a)\napp.get('/a', b)\n"
+    const after = "app.get('/a', a2)\napp.get('/a', b2)\n"
+    const changes = [{ path: 'server/app.js', before, after, snippets: [], tools: ['Edit'], at: 0 }]
+    const card = staticCard({ changes, analyses: changes.map(analyzeChange), diffs: diffBatch(changes) }, new Map(), 'c1', 0)
+    expect(card.title.includes('()')).toBe(false)
+    expect(card.title.split('GET /a').length - 1 <= 1).toBe(true)
+  })
+
+  test('a change outside any function still gets a step at its lines', () => {
+    const changes = [{ path: 'src/config.js', before: 'const a = 1\nconst b = 2\n', after: 'const a = 1\nconst b = 3\n', snippets: [], tools: ['Edit'], at: 0 }]
+    const card = staticCard({ changes, analyses: changes.map(analyzeChange), diffs: diffBatch(changes) }, new Map(), 'c1', 0)
+    expect(card.steps!.map(s => [s.text, s.ref.path, s.ref.line, s.code])).toEqual([['Changed line 2.', 'src/config.js', 2, 'const b = 3']])
+  })
+
+  test('a member call on some other object is not a call to a same-named plain function', () => {
+    const index = buildIndex([
+      { path: 'src/app.js', text: 'function run() {\n  return 1\n}\n' },
+      { path: 'src/repo.js', text: "function probe(host) {\n  return host.run(['git'])\n}\n" },
+    ])
+    expect(callersOf(index, lookup(index, 'run')!).map(e => e.from.name)).toEqual([])
+  })
+
+  test('replies with trailing commas, raw newlines or a stray {} still parse', () => {
+    expect(extractJson('{"a": [1, 2,], "b": "x",}')).toEqual({ a: [1, 2], b: 'x' })
+    expect(extractJson('{"summary": "line one\nline two"}')).toEqual({ summary: 'line one\nline two' })
+    expect(extractJson('Use `{}` as the default. {"title": "T"}')).toEqual({ title: 'T' })
+  })
+
+  test('a reply cut off mid-JSON is recognised, fenced or after prose, and its finished fields are kept', () => {
+    expect(parseReply('```json\n{"title": "T", "summary": "S done.", "steps": [{"say": "Fir')).toEqual({ json: { title: 'T', summary: 'S done.' }, isCutOff: true })
+    expect(parseReply('Here it is:\n{"worth_explaining": false, "title": "T", "summ')).toEqual({ json: { worth_explaining: false, title: 'T' }, isCutOff: true })
+    expect(parseReply('{"summary": "The agent added')).toEqual({ json: null, isCutOff: true })
+    expect(parseReply('The agent added a helper.')).toEqual({ json: null, isCutOff: false })
+    expect(parseReply('{"title": "T"}')).toEqual({ json: { title: 'T' }, isCutOff: false })
   })
 })

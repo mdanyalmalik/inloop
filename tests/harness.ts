@@ -30,6 +30,8 @@ export type World = {
   commit: () => void
   /** A model call to fail, by its count from 1: the reason (and status) it fails with, or undefined to answer. */
   failModel: (call: number) => { reason: string; status?: number; error?: string } | undefined
+  /** A model call to hold until the promise it returns settles (a slow call), by its prompt; undefined answers at once. */
+  holdModel: (prompt: string) => Promise<void> | undefined
   prompts: { model: string; prompt: string; system: string }[]
   reads: string[]
   writes: string[]
@@ -43,6 +45,8 @@ export type World = {
   finishSpeech: () => void
   /** The folder the session runs in. */
   root: string
+  /** Whether that folder is in a git repository. */
+  isGit: boolean
   /** Whether a fake `uv` with Kokoro set up is on this machine. */
   kokoro: boolean
   /** Kokoro clip paths, to the text each was rendered from. */
@@ -69,6 +73,8 @@ export type World = {
   /** Base system prompt sections the engine would compose. */
   sections: { id: string; text: string; scope: 'shared' | 'session' }[]
   gitCalls: string[][]
+  /** Holds a git command until the promise it returns settles (a slow scan); undefined lets it run. */
+  gitGate: (args: string[]) => Promise<void> | undefined
   reply: (prompt: string) => string
   classify: string
   clock: ReturnType<typeof mock.clock>
@@ -98,6 +104,7 @@ export function world(
     commits: [],
     commit: () => undefined,
     failModel: () => undefined,
+    holdModel: () => undefined,
     prompts: [],
     reads: [],
     writes: [],
@@ -108,6 +115,7 @@ export function world(
     said: [],
     finishSpeech: () => undefined,
     root: ROOT,
+    isGit: true,
     kokoro: false,
     clips: new Map(),
     players: ['afplay'],
@@ -123,6 +131,7 @@ export function world(
     pane: 'shown',
     sections: [{ id: 'intro', text: 'You are Claude Code.', scope: 'shared' }],
     gitCalls: [],
+    gitGate: () => undefined,
     reply,
     classify: 'unrelated',
     clock: mock.clock(on, { now: 1_000_000 }),
@@ -169,7 +178,10 @@ export function world(
     w.writes.push(e.path)
     throw new Error('inloop must never write')
   })
-  on('fs.list', () => ({ value: [] }))
+  // Outside git, the folder's own entries say whether it is a project (a package.json).
+  on('fs.list', ($, e) => ({
+    value: w.isGit || rel(e.path) !== ROOT ? [] : [...new Set([...w.files.keys()].map(p => p.split('/')[0]!))].map(name => ({ name, kind: w.files.has(name) ? 'file' as const : 'dir' as const })),
+  }) as never)
   on('process.run', async ($, e) => {
     const argv = [...e.argv]
     w.gitCalls.push(argv)
@@ -194,16 +206,26 @@ export function world(
         return ok('ready\n')
       }
     }
+    if (argv[0] === 'git' && !w.isGit) return ok('', 128, 'fatal: not a git repository (or any of the parent directories): .git')
+    // Git as run from the session's folder, which may be a subfolder of the repository (ROOT).
+    const cwd = String(e.init?.cwd ?? ROOT)
+    const prefix = cwd.startsWith(ROOT + '/') ? cwd.slice(ROOT.length + 1).replace(/\/*$/, '/') : ''
+    const here = (paths: Iterable<string>) => [...paths].filter(p => p.startsWith(prefix)).map(p => p.slice(prefix.length))
+    if (argv[0] === 'git') await w.gitGate(args)
     if (args[0] === 'rev-parse' && args[1] === '--is-inside-work-tree') return ok('true\n')
-    if (args[0] === 'ls-files') return ok([...w.files.keys()].join('\n') + '\n')
+    if (args[0] === 'rev-parse' && args[1] === '--show-prefix') return ok(`${prefix}\n`)
+    if (args[0] === 'ls-files') return ok(here(w.files.keys()).join('\n') + '\n')
     if (args[0] === 'status') {
+      // Porcelain paths are the repository's wherever git runs; a `-- .` pathspec keeps to the folder.
+      const isHere = (path: string) => !args.slice(args.indexOf('--')).includes('.') || path.startsWith(prefix)
       const lines: string[] = []
       for (const [path, text] of w.files) {
+        if (!isHere(path)) continue
         if (path === '.env') continue
         if (!w.head.has(path)) lines.push(`?? ${path}`)
         else if (w.head.get(path) !== text) lines.push(` M ${path}`)
       }
-      for (const path of w.head.keys()) if (!w.files.has(path)) lines.push(` D ${path}`)
+      for (const path of w.head.keys()) if (!w.files.has(path) && isHere(path)) lines.push(` D ${path}`)
       return ok(lines.join('\n') + (lines.length > 0 ? '\n' : ''))
     }
     if (args[0] === 'show' && /^[0-9a-zA-Z]+:/.test(args[1] ?? '')) {
@@ -217,10 +239,12 @@ export function world(
       const revs = args.filter(a => /^c\d+$/.test(a))
       const [a, b] = revs.map(r => w.commits.find(c => c.sha === r)!.tree)
       const paths = new Set([...a!.keys(), ...b!.keys()])
-      return ok([...paths].filter(p => a!.get(p) !== b!.get(p)).join('\n') + '\n')
+      const changed = [...paths].filter(p => a!.get(p) !== b!.get(p))
+      return ok((args.includes('--relative') ? here(changed) : changed).join('\n') + '\n')
     }
     if (argv[1] === 'hash-object') {
-      const paths = String(e.init?.stdin ?? "").split('\n').filter(Boolean)
+      // Paths from the session's folder.
+      const paths = String(e.init?.stdin ?? "").split('\n').filter(Boolean).map(p => prefix + p)
       if (paths.some(p => !w.files.has(p))) return ok('', 128, 'fatal: could not open')
       return ok(paths.map(p => `h${hashText(w.files.get(p)!)}`).join('\n') + '\n')
     }
@@ -236,7 +260,8 @@ export function world(
     }
     return ok('', 128, `fatal: not mocked: git ${args.join(' ')}`)
   })
-  on('model.complete', ($, e) => {
+  on('model.complete', async ($, e) => {
+    await w.holdModel(e.prompt)
     w.prompts.push({ model: e.model, prompt: e.prompt, system: e.system ?? '' })
     const failure = w.failModel(w.prompts.length)
     if (failure !== undefined) return { value: { isAnswered: false, ...failure, usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } } } as never

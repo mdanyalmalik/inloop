@@ -213,6 +213,8 @@ export type InloopStatus = {
   isPreparingAudio?: boolean
   /** The natural voice is being downloaded and set up. */
   isVoiceSettingUp?: boolean
+  /** The voices found when last looked for: the pane's voice controls are drawn again when they change. */
+  voicesFound?: string
 }
 
 declare module 'claude-code' {

@@ -52,13 +52,17 @@ export class Repo {
     readonly isGit: boolean,
     /** Null when the session runs in a project; otherwise why it does not. */
     readonly notProject: string | null,
+    /** Where the session's folder is inside the repository ('' at its top, else ending in '/'). */
+    private readonly prefix = '',
   ) {}
 
   static async open(host: Host): Promise<Repo> {
     const root = await host.root()
     const probe = await host.run(['git', 'rev-parse', '--is-inside-work-tree'], { cwd: root, timeoutMs: 5000 }).catch(() => undefined)
     const isGit = probe?.exitCode === 0 && probe.stdout.trim() === 'true'
-    return new Repo(host, root, isGit, await notAProject(host, root, isGit))
+    const where = isGit ? await host.run(['git', 'rev-parse', '--show-prefix'], { cwd: root, timeoutMs: 5000 }).catch(() => undefined) : undefined
+    const prefix = where?.exitCode === 0 ? where.stdout.trim() : ''
+    return new Repo(host, root, isGit, await notAProject(host, root, isGit), prefix)
   }
 
   /** Runs git read-only in the project; rejects with git's message on failure. */
@@ -88,11 +92,14 @@ export class Repo {
   /** Files that differ from HEAD or are untracked (not ignored, noise or secrets), and whether each is deleted. */
   async dirtyEntries(): Promise<{ path: string; isDeleted: boolean }[]> {
     if (!this.isGit || this.notProject !== null) return []
-    const out = await this.git(['status', '--porcelain', '--no-renames', '-uall'])
+    // Porcelain paths are the repository's even from a subfolder: kept to the session's folder, made relative to it.
+    const out = await this.git(['status', '--porcelain', '--no-renames', '-uall', '--', '.'])
     return out
       .split('\n')
       .filter(line => line.length > 3)
       .map(line => ({ path: line.slice(3).replace(/^"(.*)"$/, '$1'), isDeleted: line[0] === 'D' || line[1] === 'D' }))
+      .filter(e => e.path.startsWith(this.prefix))
+      .map(e => ({ ...e, path: e.path.slice(this.prefix.length) }))
       .filter(e => !isNoise(e.path) && !isSensitive(e.path))
   }
 
@@ -104,7 +111,7 @@ export class Repo {
 
   /** Files that differ between two commits (not noise, not secrets). */
   async changedBetween(from: string, to: string): Promise<string[]> {
-    const out = await this.git(['diff', '--name-only', '--no-renames', this.checkRev(from), this.checkRev(to), '--'])
+    const out = await this.git(['diff', '--name-only', '--no-renames', '--relative', this.checkRev(from), this.checkRev(to), '--'])
     return out.split('\n').filter(p => p !== '' && !isNoise(p) && !isSensitive(p))
   }
 
@@ -147,7 +154,8 @@ export class Repo {
     let text: string
     if (rev !== undefined) {
       if (!isSafeRev(rev)) throw new RepoError(`${rev} is not a revision inloop accepts.`)
-      text = await this.git(['show', `${rev}:${rel}`])
+      // A path after `rev:` is from the repository's top, wherever git runs.
+      text = await this.git(['show', `${rev}:${this.prefix}${rel}`])
     } else {
       try {
         text = await this.host.readFile(`${this.root}/${rel}`)
@@ -155,7 +163,8 @@ export class Repo {
         throw new RepoError(`Cannot read ${rel}: ${String((err as Error).message ?? err)}`)
       }
     }
-    this.files.set(key, text)
+    // HEAD moves with each commit the agent makes: its text is read again each time.
+    if (rev !== 'HEAD') this.files.set(key, text)
     return text
   }
 
@@ -290,7 +299,7 @@ export class Repo {
     if (names.length === 0) return []
     const r = await this.host.run(['git', 'cat-file', '--batch'], {
       cwd: this.root,
-      stdin: names.map(n => `${sha}:${n}`).join('\n') + '\n',
+      stdin: names.map(n => `${sha}:${this.prefix}${n}`).join('\n') + '\n',
       timeoutMs: 30_000,
     })
     if (r.exitCode !== 0) throw new RepoError(r.stderr.trim())
