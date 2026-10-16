@@ -1,5 +1,6 @@
 {
   "name": "inloop",
+  "description": "inloop: a Claude Code plugin that explains the coding agent's edits as they happen, aloud or in writing, traces code flows, and walks through git history. Read-only.",
   "owner": {
     "name": "Danyal Malik"
   },
