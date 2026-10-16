@@ -1,0 +1,11 @@
+{
+  "name": "inloop",
+  "owner": { "name": "inloop" },
+  "plugins": [
+    {
+      "name": "inloop",
+      "source": "./",
+      "description": "A second presence beside the coding agent: explains the agent's edits as they happen, traces code flows, and walks through git history, read-only."
+    }
+  ]
+}

@@ -1,0 +1,201 @@
+export type InloopDepth = 'beginner' | 'intermediate' | 'advanced'
+export type InloopMode = 'auto' | 'ask' | 'focus' | 'paused'
+/** How explanations reach you: read in the panel, or narrated with the code shown step by step. */
+export type InloopStyle = 'written' | 'spoken'
+export type InloopTab = 'feed' | 'code' | 'flow' | 'ask' | 'history' | 'git' | 'settings'
+
+/** A pointer into the code: a file, a line range, and the revision it belongs to. */
+export type InloopRef = {
+  path: string
+  line?: number
+  endLine?: number
+  /** A commit sha; absent means the working tree. */
+  rev?: string
+  label?: string
+  symbol?: string
+}
+
+/** One part of an explanation: a sentence or two, and the code it is about. */
+export type InloopStep = {
+  text: string
+  ref: InloopRef
+  /** The lines of code as they were when explained. */
+  code?: string
+  /** The line number `code` starts at. */
+  codeStart?: number
+}
+
+/** One explanation in the feed or the history. */
+export type InloopCard = {
+  id: string
+  at: number
+  title: string
+  concept?: string
+  /** Markdown. */
+  summary: string
+  files: string[]
+  symbols: string[]
+  refs: InloopRef[]
+  /** The explanation walked through in order, each part with its code. */
+  steps?: InloopStep[]
+  /** Unified diff hunks behind the card, when it explains a change. */
+  diff?: string
+  rev?: string
+  source: 'auto' | 'ask' | 'commit' | 'compare' | 'recent' | 'flow'
+  question?: string
+  bookmarked?: boolean
+  /** True when no model call was made (static analysis only). */
+  isHeuristic?: boolean
+  flowId?: string
+}
+
+export type InloopConfidence = 'confirmed' | 'inferred' | 'runtime'
+
+export type InloopFlowNode = {
+  id: string
+  label: string
+  kind: string
+  ref?: InloopRef
+  depth: number
+}
+
+export type InloopFlowEdge = {
+  from: string
+  to: string
+  label: string
+  confidence: InloopConfidence
+}
+
+export type InloopFlow = {
+  id: string
+  title: string
+  rev?: string
+  nodes: InloopFlowNode[]
+  edges: InloopFlowEdge[]
+  notes: string[]
+  at: number
+}
+
+export type InloopViewer = {
+  path: string
+  rev?: string
+  /** First highlighted line (1-based). */
+  line: number
+  endLine: number
+  /** First line drawn. */
+  top: number
+  /** Unified diff to draw instead of the file, when set. */
+  diff?: string
+  note?: string
+}
+
+/** One screen to come back to: the tab, the code open, and the explanation expanded. */
+export type InloopNav = {
+  tab: InloopTab
+  viewer: InloopViewer | null
+  expanded: string | null
+}
+
+export type InloopTurn = {
+  role: 'you' | 'inloop'
+  text: string
+  at: number
+  refs?: InloopRef[]
+}
+
+export type InloopSettings = {
+  mode: InloopMode
+  depth: InloopDepth
+  focus: string
+  /** Written explanations with snippets, or narration with the code shown as it is discussed. */
+  style: InloopStyle
+  /** Ask the coding agent to keep its own replies short while inloop explains the changes. */
+  briefAgent: boolean
+  /** System voice to speak with; '' picks the best installed. */
+  voice: string
+  /** Model for automatic change explanations. */
+  autoModel: string
+  /** Model for questions, flows and commits. */
+  askModel: string
+  /** 'model' asks a model for automatic cards; 'static' explains from analysis alone. */
+  autoEngine: 'model' | 'static'
+  /** Minimum significance score (0-10) before a change batch gets a card. */
+  minScore: number
+  /** Seconds of quiet after the last edit before a batch is explained. */
+  quietSeconds: number
+}
+
+/** What the person is looking at: questions are answered about this. */
+export type InloopContext = {
+  rev?: string
+  revLabel?: string
+  path?: string
+  line?: number
+  endLine?: number
+  symbol?: string
+  flowId?: string
+  cardId?: string
+  scope?: string
+}
+
+export type InloopCommit = {
+  sha: string
+  short: string
+  author: string
+  date: string
+  subject: string
+}
+
+export type InloopGitView = {
+  query: string
+  commits: InloopCommit[]
+  selected?: string
+  files: { status: string; path: string }[]
+  compareFrom?: string
+  error?: string
+}
+
+/** The explanation being read aloud, and where in it the narration is. */
+export type InloopNarration = {
+  cardId: string
+  title: string
+  steps: InloopStep[]
+  /** The step being read; -1 while the title is read. */
+  index: number
+  isPaused: boolean
+  /** Explanations waiting to be read after this one. */
+  queued: number
+}
+
+export type InloopUsage = { calls: number; inputTokens: number; outputTokens: number }
+
+export type InloopStatus = {
+  busy: string | null
+  queued: number
+  pendingChanges: number
+  recentBatches: number
+  lastError?: string
+}
+
+declare module 'claude-code' {
+  interface PluginState {
+    inloop: {
+      cards: InloopCard[]
+      history: InloopCard[]
+      tab: InloopTab
+      expanded: string | null
+      viewer: InloopViewer | null
+      nav: InloopNav[]
+      flow: InloopFlow | null
+      flowSelected: string | null
+      flowNote: string | null
+      convo: InloopTurn[]
+      settings: InloopSettings
+      ctx: InloopContext
+      git: InloopGitView
+      usage: InloopUsage
+      status: InloopStatus
+      narration: InloopNarration | null
+    }
+  }
+}
