@@ -42,6 +42,9 @@ export type World = {
   kokoro: boolean
   /** Kokoro clip paths, to the text each was rendered from. */
   clips: Map<string, string>
+  /** While true, Kokoro renders nothing until releaseRender() (a slow first render). */
+  isRenderHeld: boolean
+  releaseRender: () => void
   /** The inloop pane: in front, open behind another panel, or closed. */
   pane: 'shown' | 'behind' | 'closed'
   /** Base system prompt sections the engine would compose. */
@@ -77,6 +80,8 @@ export function world(
     root: ROOT,
     kokoro: false,
     clips: new Map(),
+    isRenderHeld: false,
+    releaseRender: () => undefined,
     pane: 'shown',
     sections: [{ id: 'intro', text: 'You are Claude Code.', scope: 'shared' }],
     gitCalls: [],
@@ -185,6 +190,7 @@ export function world(
       // Kokoro renders every text and prints each clip's path.
       const texts = JSON.parse(e.input ?? '[]') as string[]
       const voice = argv[argv.indexOf('synth') + 1]
+      if (w.isRenderHeld) await new Promise<void>(resolve => { w.releaseRender = resolve })
       for (const [i, text] of texts.entries()) {
         const path = `/virtual/tts/${w.clips.size}-${i}.wav`
         w.clips.set(path, `${voice}|${text}`)
@@ -209,6 +215,7 @@ export function world(
     return { value: { code: 0, signal: null } }
   })
   on('prompt.compose', () => ({ sections: w.sections }))
+  on('prompt.submit', (_, e) => ({ text: e.text, context: e.context }))
   on('audio.speak', ($, e) => {
     w.spoken.push(e.text)
     w.voicesUsed.push((e as unknown as { options?: { voice?: string }; voice?: string }).options?.voice ?? (e as unknown as { voice?: string }).voice)

@@ -169,6 +169,28 @@ export type InloopNarration = {
   isPaused: boolean
   /** Explanations waiting to be read after this one. */
   queued: number
+  /** The voice is still rendering the part to read (Kokoro can take a few seconds). */
+  isPreparing?: boolean
+}
+
+/** One file's net change since the person's last prompt. */
+export type InloopFileChange = {
+  path: string
+  added: number
+  removed: number
+  /** New-side line ranges changed, as [first, last]. */
+  ranges: [number, number][]
+  /** This file's hunks, from its text at the prompt to its text now. */
+  hunks: string
+  isNew?: boolean
+  isDeleted?: boolean
+}
+
+/** What the files went through since the person's last prompt, net: an edit undone shows no change. */
+export type InloopTurnChanges = {
+  /** When the prompt was sent; 0 before the first one. */
+  since: number
+  files: InloopFileChange[]
 }
 
 export type InloopUsage = { calls: number; inputTokens: number; outputTokens: number }
@@ -179,6 +201,8 @@ export type InloopStatus = {
   pendingChanges: number
   recentBatches: number
   lastError?: string
+  /** Speech is being rendered and nothing is playing yet. */
+  isPreparingAudio?: boolean
 }
 
 declare module 'claude-code' {
@@ -202,6 +226,7 @@ declare module 'claude-code' {
       usage: InloopUsage
       status: InloopStatus
       narration: InloopNarration | null
+      changes: InloopTurnChanges
     }
   }
 }

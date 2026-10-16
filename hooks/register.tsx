@@ -30,6 +30,7 @@ const ctxAtom = atom({ plugin: 'inloop', key: 'ctx' } as const, {})
 const gitAtom = atom({ plugin: 'inloop', key: 'git' } as const, { query: '', commits: [], files: [] })
 const usageAtom = atom({ plugin: 'inloop', key: 'usage' } as const, { calls: 0, inputTokens: 0, outputTokens: 0 })
 const narrationAtom = atom({ plugin: 'inloop', key: 'narration' } as const, null)
+const changesAtom = atom({ plugin: 'inloop', key: 'changes' } as const, { since: 0, files: [] })
 const statusAtom = atom({ plugin: 'inloop', key: 'status' } as const, { busy: null, queued: 0, pendingChanges: 0, recentBatches: 0 })
 
 const BRIEF_REPLIES = `inloop is open beside this conversation. It explains every code change you make, with the code, in its own panel, so do not duplicate that work.
@@ -151,6 +152,7 @@ export const register: Register = on => {
         usage: { get: () => read($, usageAtom), update: change => update($, usageAtom, change) },
         status: { get: () => read($, statusAtom), update: change => update($, statusAtom, change) },
         narration: { get: () => read($, narrationAtom), update: change => update($, narrationAtom, change) },
+        changes: { get: () => read($, changesAtom), update: change => update($, changesAtom, change) },
       },
       status: text => $.ui.status(text),
       toast: (text, options) => $.ui.toast(text, options),
@@ -274,7 +276,9 @@ export const register: Register = on => {
 
   // The same, as a note beside each prompt the person types (the model never shows it).
   on('prompt.submit', async ($, e, next) => {
-    if (app === null || e.command !== undefined || e.isMeta === true || !(await app.isBriefActive())) return next(e)
+    if (app === null || e.command !== undefined || e.isMeta === true) return next(e)
+    app.markPrompt()
+    if (!(await app.isBriefActive())) return next(e)
     return next({ ...e, context: [...(e.context ?? []), BRIEF_REMINDER] })
   }).catch(($, e, next) => next(e))
 
@@ -330,6 +334,7 @@ export const register: Register = on => {
       git: await read($, gitAtom),
       usage: await read($, usageAtom),
       narration: await read($, narrationAtom),
+      changes: await read($, changesAtom),
     }
     return renderPane({
       el: $.ui.resolve(e),

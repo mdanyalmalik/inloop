@@ -16,6 +16,7 @@ import type {
   InloopStep,
   InloopTab,
   InloopTurn,
+  InloopTurnChanges,
   InloopUsage,
   InloopViewer,
 } from '../types'
@@ -43,6 +44,7 @@ export type Snapshot = {
   git: InloopGitView
   usage: InloopUsage
   narration: InloopNarration | null
+  changes: InloopTurnChanges
 }
 
 /** What a draw has: the surface's elements, the state as read for this draw, the controller, the room. */
@@ -121,8 +123,9 @@ export function narrationBand(el: Kit['el'], n: InloopNarration, app: App, colum
   return (
     <Box flexDirection="column" width={columns}>
       <Box flexDirection="row" columnGap={1}>
-        <Text color="suggestion" weight="bold" wrap="truncate-end">{n.isPaused ? '⏸' : '▶'} inloop: {n.title}</Text>
+        <Text color="suggestion" weight="bold" wrap="truncate-end">{n.isPaused ? '⏸' : n.isPreparing === true ? '⟳' : '▶'} inloop: {n.title}</Text>
         <Text dimColor>{n.index < 0 ? '' : `${n.index + 1}/${n.steps.length}`}</Text>
+        {n.isPreparing === true && !n.isPaused && <Text color="warning">generating audio…</Text>}
       </Box>
       {n.index >= 0 && step !== undefined && <Text wrap="truncate-end">{step.text.replace(/`/g, '')}</Text>}
       {lines.length > 0 && step !== undefined && (
@@ -151,11 +154,12 @@ function narrationBox(k: Kit): RenderElement | null {
   const lines = step?.code?.split('\n') ?? []
   return (
     <Box flexDirection="column" marginTop={1} borderStyle="round" borderColor="suggestion" paddingX={1}>
-      <Text color="suggestion" weight="bold" wrap="truncate-end">{n.isPaused ? '⏸ ' : '▶ '}{n.title}</Text>
+      <Text color="suggestion" weight="bold" wrap="truncate-end">{n.isPaused ? '⏸ ' : n.isPreparing === true ? '⟳ ' : '▶ '}{n.title}</Text>
       <Text dimColor>
         {n.index < 0 ? 'starting' : `part ${n.index + 1} of ${n.steps.length}`}
         {n.queued > 0 ? ` · ${n.queued} more waiting` : ''}
       </Text>
+      {n.isPreparing === true && !n.isPaused && <Text color="warning">⟳ generating audio… it plays as soon as it is ready</Text>}
       {n.index >= 0 && step !== undefined && <Markdown text={step.text} />}
       {step !== undefined && step.ref.path !== '' && (
         <Text dimColor wrap="truncate-start">{step.ref.path}{step.ref.line !== undefined ? `:${step.ref.line}` : ''}</Text>
@@ -225,6 +229,7 @@ export async function renderPane(k: Kit): Promise<RenderElement> {
         </Box>
       )}
       {status.busy !== null && tab !== 'ask' && <Text color="suggestion">⟳ {status.busy}</Text>}
+      {status.isPreparingAudio === true && k.s.narration === null && <Text color="warning">⟳ generating audio…</Text>}
       {status.lastError !== undefined && status.busy === null && (
         <Box flexDirection="row" columnGap={1}>
           <Text color="error" wrap="truncate-end">! {status.lastError}</Text>
@@ -274,6 +279,7 @@ export async function renderPane(k: Kit): Promise<RenderElement> {
 
   return (
     <Box flexDirection="column" width={width}>
+      {turnChangesView(k)}
       {header}
       {statusLine}
       {narrationBox(k)}
@@ -308,6 +314,48 @@ export async function renderPane(k: Kit): Promise<RenderElement> {
  * The files a change touched: each path, lines added and removed, and the
  * line ranges changed; a press opens that file's diff in the Code tab.
  */
+const STRIP_FILES = 5
+
+/** The strip over the tabs: every file changed since the person's last prompt, net, each opening its diff. */
+function turnChangesView(k: Kit): RenderElement {
+  const { Box, Text, Button } = k.el
+  const { since, files } = k.s.changes
+  const added = files.reduce((n, f) => n + f.added, 0)
+  const removed = files.reduce((n, f) => n + f.removed, 0)
+  return (
+    <Box flexDirection="column" borderStyle="round" borderColor={files.length > 0 ? 'suggestion' : undefined} borderDimColor={files.length === 0} paddingX={1} marginBottom={1}>
+      <Box flexDirection="row" columnGap={1}>
+        <Text weight="bold" wrap="truncate-end">{since === 0 ? 'Changes' : 'Since your last prompt'}</Text>
+        {files.length > 0 && (
+          <Text dimColor wrap="truncate-end">
+            {files.length} file{files.length === 1 ? '' : 's'}
+            <Text color="success"> +{added}</Text>
+            <Text color="error"> −{removed}</Text>
+          </Text>
+        )}
+      </Box>
+      {files.length === 0 && (
+        <Text dimColor wrap="truncate-end">{since === 0 ? 'Files changed after your next prompt show here.' : 'No files changed yet.'}</Text>
+      )}
+      {files.slice(0, STRIP_FILES).map((f, i) => (
+        <Button
+          key={`strip:${i}:${f.path}`}
+          plain
+          onPress={() => k.app.openRef({ path: f.path, line: f.ranges[0]?.[0] ?? 1 }, { diff: f.hunks === '' ? undefined : f.hunks, note: `${f.path} since your last prompt` })}
+        >
+          {f.isNew === true && <Text color="success">new </Text>}
+          {f.isDeleted === true && <Text color="error">deleted </Text>}
+          <Text wrap="truncate-start">{f.path}</Text>
+          <Text color="success"> +{f.added}</Text>
+          <Text color="error"> −{f.removed}</Text>
+          {f.ranges.length > 0 && f.isDeleted !== true && <Text dimColor>  lines {formatRanges(f.ranges)}</Text>}
+        </Button>
+      ))}
+      {files.length > STRIP_FILES && <Text dimColor>… {files.length - STRIP_FILES} more files</Text>}
+    </Box>
+  )
+}
+
 function changesView(k: Kit, card: InloopCard, list: string): RenderElement | null {
   if (card.diff === undefined || card.diff === '' || !['auto', 'recent', 'commit', 'compare'].includes(card.source)) return null
   const files = summarizeDiff(card.diff)

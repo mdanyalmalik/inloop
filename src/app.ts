@@ -13,6 +13,7 @@ import type {
   InloopSettings,
   InloopStep,
   InloopTab,
+  InloopFileChange,
   InloopTurn,
   InloopViewer,
 } from '../types'
@@ -37,6 +38,7 @@ import {
   staticFlow,
 } from './explain'
 import { enclosingSymbol } from './graph'
+import { summarizeDiff, unifiedDiff } from './diff'
 import { Repo, RepoError } from './repo'
 import { parseVoices, pickVoice, planVoice, type Voice, type VoicePlan } from './voices'
 import { isNoise, isSensitive, toRelative } from './security'
@@ -190,6 +192,7 @@ export class App {
     if (cards.length > 0) parts.push(`${cards.length} explained`)
     if (status.busy !== null) parts.push(status.busy)
     else if (status.pendingChanges > 0) parts.push('watching edits…')
+    if (status.isPreparingAudio === true) parts.push('generating audio…')
     this.host.status(parts.join(' · '))
   }
 
@@ -209,6 +212,38 @@ export class App {
     const edits = this.raw.splice(0)
     for (const edit of edits) this.batcher.add(await this.toChange(edit))
     await this.schedule()
+    if (edits.length > 0) await this.refreshTurnChanges()
+  }
+
+  // ---- changes since the last prompt -------------------------------------------
+
+  /** Each file touched since the person's last prompt, with its text as it was then (null: it did not exist). */
+  private turnStart = new Map<string, string | null>()
+
+  /** The person sent a prompt: what changes from here is what the changes strip shows. */
+  markPrompt(): void {
+    this.turnStart.clear()
+    const since = Date.now()
+    this.detach(() => this.host.state.changes.update(() => ({ since, files: [] })))
+  }
+
+  /** Recomputes the net change of every file touched since the prompt, from its text then to its text now. */
+  async refreshTurnChanges(): Promise<void> {
+    const files: InloopFileChange[] = []
+    for (const [path, start] of this.turnStart) {
+      const now = await this.repo.readFresh(path)
+      if (now === start) continue
+      if ((start?.length ?? 0) > 400_000 || (now?.length ?? 0) > 400_000) {
+        files.push({ path, added: 0, removed: 0, ranges: [], hunks: '' })
+        continue
+      }
+      const hunks = unifiedDiff(start ?? '', now ?? '')
+      if (hunks === '') continue
+      const summary = summarizeDiff(`--- a/${path}\n+++ b/${path}\n${hunks}`)[0]
+      if (summary === undefined) continue
+      files.push({ ...summary, ...(start === null ? { isNew: true } : {}), ...(now === null ? { isDeleted: true } : {}) })
+    }
+    await this.host.state.changes.update(cur => ({ since: cur.since, files }))
   }
 
   /**
@@ -217,6 +252,16 @@ export class App {
    * that cannot be done exactly, the edit's own snippets stand in.
    */
   private async toChange(edit: RawEdit): Promise<FileChange> {
+    const prior = this.baseline.get(edit.rel)
+    const change = await this.reconstruct(edit)
+    if (!this.turnStart.has(edit.rel)) {
+      const known = change.before ?? (edit.tool === 'Write' && edit.before === null ? null : undefined)
+      this.turnStart.set(edit.rel, known !== undefined ? known : prior !== undefined ? prior : await this.repo.read(edit.rel, 'HEAD').catch(() => null))
+    }
+    return change
+  }
+
+  private async reconstruct(edit: RawEdit): Promise<FileChange> {
     const after = await this.repo.read(edit.rel).catch(() => null)
     if (after !== null) this.baseline.set(edit.rel, after)
     const base = { path: edit.rel, tools: [edit.tool], at: edit.at }
@@ -281,22 +326,28 @@ export class App {
         this.isScanAgain = false
         const dirty = await this.repo.dirtyFiles().catch(() => [] as string[])
         let isFound = false
+        let isMoved = false
         for (const path of new Set([...dirty, ...this.baseline.keys()])) {
           // An edit tool is already reporting this one.
           if (this.raw.some(r => r.rel === path)) continue
           const now = await this.repo.readFresh(path)
           if (now === null) {
-            this.baseline.delete(path)
+            // Deleted: the changes since the prompt show it gone.
+            if (!this.turnStart.has(path) && this.baseline.has(path)) this.turnStart.set(path, this.baseline.get(path)!)
+            if (this.baseline.delete(path)) isMoved = true
             continue
           }
           const known = this.baseline.has(path) ? this.baseline.get(path)! : await this.repo.read(path, 'HEAD').catch(() => null)
           if (now === known) continue
           this.baseline.set(path, now)
+          if (!this.turnStart.has(path)) this.turnStart.set(path, known)
+          isMoved = true
           if (now.length > 400_000) continue
           this.batcher.add({ path, before: known, after: now, snippets: [], tools: ['Bash'], at: Date.now() })
           isFound = true
         }
         if (isFound) await this.schedule()
+        if (isMoved) await this.refreshTurnChanges()
       } while (this.isScanAgain)
     } finally {
       this.isScanning = false
@@ -559,7 +610,7 @@ export class App {
    * that can be cut off; the system voice speaks each directly. A piece Kokoro
    * could not render falls back to the system voice.
    */
-  private async speaker(texts: readonly string[], isInterrupted: () => boolean): Promise<Speaker> {
+  private async speaker(texts: readonly string[], isInterrupted: () => boolean, onPreparing?: (isPreparing: boolean) => Promise<void>): Promise<Speaker> {
     const plan = this.voicePlan((await this.settings()).voice)
     const systemName = plan.engine === 'system' ? plan.name : pickVoice(this.voices, '')
     let current: { stop: () => void } | null = null
@@ -595,10 +646,17 @@ export class App {
     return {
       play: async i => {
         if (ready[i] === undefined) {
-          await new Promise<void>(resolve => {
+          // Rendering is behind (the first part, while the model loads): say so until it is ready.
+          const rendered = new Promise<void>(resolve => {
             waiters.set(i, resolve)
             cancelWait = resolve
           })
+          await this.preparingAudio(true, onPreparing)
+          try {
+            if (ready[i] === undefined) await rendered
+          } finally {
+            await this.preparingAudio(false, onPreparing)
+          }
         }
         cancelWait = null
         if (isInterrupted()) return
@@ -622,6 +680,13 @@ export class App {
     }
   }
 
+  /** Shows that speech is being generated: on the part being read, and in the status line. */
+  private async preparingAudio(isPreparing: boolean, onPreparing?: (isPreparing: boolean) => Promise<void>): Promise<void> {
+    await this.host.state.status.update(s => ({ ...s, isPreparingAudio: isPreparing }))
+    await onPreparing?.(isPreparing)
+    await this.refreshStatus()
+  }
+
   private async runNarration(): Promise<void> {
     this.isNarrating = true
     try {
@@ -636,11 +701,17 @@ export class App {
         // but not if the person closed it (the band above the prompt stands in then).
         if (!this.isPaneClosedByPerson) void this.host.openPane().catch(() => undefined)
         await this.host.state.narration.update(() => ({ cardId: card.id, title: card.title, steps, index: 0, isPaused: false, queued: this.narrationQueue.length }))
-        const speaker = await this.speaker(steps.map((st, i) => speakable(st.text, i === 0 ? 900 : 320)), () => this.currentControl() !== 'none')
+        const speaker = await this.speaker(
+          steps.map((st, i) => speakable(st.text, i === 0 ? 900 : 320)),
+          () => this.currentControl() !== 'none',
+          isPreparing => this.host.state.narration.update(n => (n === null ? n : { ...n, isPreparing })).then(() => undefined),
+        )
         this.speakerNow = speaker
         try {
           let i = 0
           while (i < steps.length) {
+            // Stopped (or the style switched to written) while the voice was getting ready: say nothing.
+            if (this.currentControl() === 'stop' || this.currentControl() === 'skip') break
             if (this.currentControl() === 'pause') {
               await new Promise<void>(resolve => { this.resume = resolve })
               const after = this.currentControl()
@@ -665,7 +736,7 @@ export class App {
           speaker.close()
           this.speakerNow = null
         }
-        if (this.currentControl() === 'stop') break
+        // A stop emptied the queue; whatever is queued now came after it and is read.
       }
     } finally {
       this.isNarrating = false
@@ -1045,7 +1116,11 @@ export class App {
       for (const c of held) this.batcher.add(c)
     }
     if (change.mode === 'paused' || change.mode === 'ask') this.queue.length = 0
-    if (change.style === 'written') this.narrationStop()
+    if (change.style === 'written') {
+      this.narrationStop()
+      this.oneOff?.close()
+      this.oneOff = null
+    }
     await this.refreshStatus()
     return next
   }

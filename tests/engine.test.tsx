@@ -363,6 +363,42 @@ describe('changes made outside the edit tools', () => {
   })
 })
 
+describe('changes since the last prompt', () => {
+  test('the strip over the tabs shows each file changed since the prompt, net, and opens its diff', async ($, on) => {
+    const w = world(on)
+    tools(on, w)
+    await start($)
+    const ui = await $.ui.mount({ plugin: 'inloop', surface: 'terminal', component: 'Pane', requestId: 'inloop', props: PANE_PROPS as never })
+    expect(await ui.find({ text: /Files changed after your next prompt show here/ })).toBeDefined()
+    await $.prompt.submit({ text: 'add token refresh and a health check', wait: false } as never)
+    await w.clock.advance(100)
+    expect(await ui.find({ text: /No files changed yet/ })).toBeDefined()
+    // One file by the edit tool, one by a shell command, one created and then removed again.
+    await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
+    w.files.set('server/app.js', w.files.get('server/app.js')! + '\nfunction health(req, res) {\n  res.json({ ok: true })\n}\n')
+    w.files.set('server/scratch.js', 'const x = 1\n')
+    await $.tool.call({ tool: 'Bash', command: 'python3 edit.py' } as never)
+    w.files.delete('server/scratch.js')
+    await $.tool.call({ tool: 'Bash', command: 'rm server/scratch.js' } as never)
+    await w.clock.advance(100)
+    const files = w.get('changes')?.files ?? []
+    expect(files.map(f => f.path).sort()).toEqual(['server/app.js', 'server/auth/tokens.js'])
+    expect(files.find(f => f.path === 'server/auth/tokens.js')?.added).toBe(7)
+    expect(await ui.find({ text: /Since your last prompt/ })).toBeDefined()
+    expect(await ui.find({ text: /2 files/ })).toBeDefined()
+    expect(await ui.find({ text: /lines 18-24/ })).toBeDefined()
+    await ui.press({ key: 'strip:1:server/auth/tokens.js' }).catch(() => ui.press({ key: 'strip:0:server/auth/tokens.js' }))
+    expect(w.get('tab')).toBe('code')
+    expect(w.get('viewer')?.path).toBe('server/auth/tokens.js')
+    expect(w.get('viewer')?.diff?.includes('+function refreshToken(token) {')).toBe(true)
+    // The next prompt starts over.
+    await $.prompt.submit({ text: 'thanks', wait: false } as never)
+    await w.clock.advance(100)
+    expect(w.get('changes')?.files).toEqual([])
+    await ui.unmount()
+  })
+})
+
 describe('navigation', () => {
   test('tabs are independent; the Code tab alone steps back between code locations', async ($, on) => {
     const w = world(on, () => JSON.stringify({
@@ -463,9 +499,12 @@ describe('narrow dock', () => {
 })
 
 /** Lets the confirmation a command speaks finish, and forgets it. */
+/** Lets a confirmation that is being said (or still rendering) finish, then forgets it. */
 async function quiet(w: World): Promise<void> {
-  await w.clock.advance(1)
-  w.finishSpeech()
+  for (let i = 0; i < 3; i++) {
+    await w.clock.advance(1)
+    w.finishSpeech()
+  }
   await w.clock.advance(1)
   w.said.length = 0
 }
@@ -558,6 +597,53 @@ describe('styles', () => {
     await ui.unmount()
   })
 
+  test('switching style mid-explanation: written silences at once, spoken picks up with the next change', { timeoutMs: 20_000 }, async ($, on) => {
+    const w = world(on, STEPPED)
+    tools(on, w)
+    await start($)
+    await $.command.run({ command: 'inloop-style', args: 'spoken' } as never)
+    await w.clock.advance(1)
+    // Written while the confirmation is still being said: it is cut off.
+    await $.command.run({ command: 'inloop-style', args: 'written' } as never)
+    await w.clock.advance(1)
+    expect(w.said.length).toBe(1)
+    expect(w.said[0]!.isCut).toBe(true)
+    await $.command.run({ command: 'inloop-style', args: 'spoken' } as never)
+    await quiet(w)
+    const before = w.said.length
+    await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
+    await w.clock.advance(10_000)
+    expect(w.get('narration')?.index).toBe(0)
+    // Written mid-explanation: the part being read stops, nothing more is said, and the card stays open to read.
+    await $.command.run({ command: 'inloop-style', args: 'written' } as never)
+    await w.clock.advance(1)
+    expect(w.get('narration')).toBe(null)
+    expect(w.said.length).toBe(before + 1)
+    expect(w.said.at(-1)!.isCut).toBe(true)
+    const card = (w.get('cards') ?? [])[0]!
+    expect(w.get('expanded')).toBe(card.id)
+    // A change while written is shown, not said.
+    w.files.set('server/app.js', w.files.get('server/app.js')! + '\nfunction health(req, res) {\n  res.json({ ok: true })\n}\n')
+    await $.tool.call({ tool: 'Bash', command: 'python3 edit.py' } as never)
+    await w.clock.advance(10_000)
+    expect((w.get('cards') ?? []).length).toBe(2)
+    expect(w.said.length).toBe(before + 1)
+    expect(w.get('expanded')).toBe((w.get('cards') ?? [])[0]!.id)
+    // Back to spoken: the next change is read aloud from its start.
+    await $.command.run({ command: 'inloop-style', args: 'spoken' } as never)
+    await quiet(w)
+    const spokenAt = w.said.length
+    w.files.set('server/db/users.js', w.files.get('server/db/users.js')! + '\nfunction countUsers() {\n  return 0\n}\n')
+    await $.tool.call({ tool: 'Bash', command: 'python3 edit2.py' } as never)
+    await w.clock.advance(10_000)
+    expect(w.get('narration')?.index).toBe(0)
+    expect(w.said.length).toBe(spokenAt + 1)
+    expect(w.said.at(-1)!.text).toBe('The agent added refreshToken.')
+    await $.command.run({ command: 'inloop-style', args: 'written' } as never)
+    await w.clock.advance(1)
+    expect(w.get('narration')).toBe(null)
+  })
+
   test('spoken with Kokoro set up: parts are rendered by Kokoro and played as clips that stop at once', { timeoutMs: 20_000 }, async ($, on) => {
     const w = world(on, STEPPED)
     w.kokoro = true
@@ -580,6 +666,32 @@ describe('styles', () => {
     await w.clock.advance(1)
     expect(w.get('narration')).toBe(null)
     expect(w.said.at(-1)?.isCut).toBe(true)
+    await ui.unmount()
+  })
+
+  test('while Kokoro is still rendering, the pane and status line say audio is being generated', { timeoutMs: 20_000 }, async ($, on) => {
+    const w = world(on, STEPPED)
+    w.kokoro = true
+    tools(on, w)
+    await start($)
+    await $.command.run({ command: 'inloop-style', args: 'spoken' } as never)
+    await quiet(w)
+    w.isRenderHeld = true
+    await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
+    await w.clock.advance(10_000)
+    expect(w.get('narration')?.isPreparing).toBe(true)
+    expect(w.get('status')?.isPreparingAudio).toBe(true)
+    const ui = await $.ui.mount({ plugin: 'inloop', surface: 'terminal', component: 'Pane', requestId: 'inloop', props: PANE_PROPS as never })
+    expect(await ui.find({ text: /generating audio/ })).toBeDefined()
+    expect(w.said.length).toBe(0)
+    w.releaseRender()
+    await w.clock.advance(1)
+    expect(w.get('narration')?.isPreparing).toBe(false)
+    expect(w.get('status')?.isPreparingAudio).toBe(false)
+    expect(w.said.map(x => x.text)).toEqual(['The agent added refreshToken.'])
+    expect(await ui.find({ text: /generating audio/ })).toBeUndefined()
+    await ui.press({ key: 'say:stop' })
+    await w.clock.advance(1)
     await ui.unmount()
   })
 

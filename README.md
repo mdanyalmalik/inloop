@@ -41,7 +41,7 @@ Requirements: Claude Code 2.1.301 or newer (inloop uses the plugin mod API: func
 
 ```bash
 claude plugin validate .        # manifest + hooks module, as the engine reads them
-claude plugin test .            # 48 tests: logic + engine-level (hooks, pane on terminal/desktop/mobile)
+claude plugin test .            # 60 tests: logic + engine-level (hooks, pane on terminal/desktop/mobile)
 claude --plugin-dir .           # a live session with inloop loaded
 ```
 
@@ -59,6 +59,8 @@ cd /tmp/inloop-demo && claude --plugin-dir /path/to/inloop
 ### The pane
 
 inloop opens a pane docked beside the transcript when the terminal is wide enough (the fullscreen layout, about 144 columns for a pane nobody asked for). `/inloop` opens it at any width. Drag the divider to resize it. inloop asks for 64 columns, but a width you set yourself wins. When Claude Code's own Diff panel is open, inloop is the tab beside it. Click it, or press Tab to reach it and then Enter.
+
+Above the tabs, a small **Since your last prompt** box lists every file changed since you last sent Claude a prompt, with lines added and removed and the line ranges touched. Edits made through the edit tools and through shell commands are both counted, net: a change that was made and then undone doesn't show. Press a file to open its diff (from the text at your prompt to now) in the Code tab. The box starts over with each prompt. Claude Code can't stack a second pane above another (a second pane becomes a tab behind it), so the box sits at the top of the inloop pane instead.
 
 | Tab | What it shows |
 | --- | --- |
@@ -137,7 +139,7 @@ Every explanation is a short summary plus a few **parts**, each a sentence or tw
 - **Written** (default): the newest explanation opens by itself in the Feed, with every part's code snippet inline (`↗` opens the full file). An explanation you opened yourself stays open; new ones don't push it closed.
 - **Spoken**: each new explanation is read aloud part by part, and a box pinned at the top of the panel shows the code for the part being read, with **⏮ ⏸ ⏭ ■** controls that take effect immediately, even mid-sentence. Up to three explanations wait their turn. If the panel is hidden behind another panel (such as Claude Code's Diff panel) or you closed it, the same narration and code show in the strip above the prompt. inloop never reopens a panel you closed; `/inloop` brings it back. Any explanation can also be played with **▶ listen**.
 
-**The voice is Kokoro** (Kokoro-82M, Apache-2.0), a free neural voice that runs locally and sounds close to a person. Set it up once with `/inloop-voice setup` (or Settings → *install natural voice*). That downloads ~200 MB into `~/.cache/inloop/` and runs through `uv` in an isolated environment, with nothing installed system-wide. After setup it runs offline, and nothing is sent anywhere. Every part of an explanation is rendered ahead in one go, so there is no gap between parts, and each part plays as a clip that stop, pause and skip cut off at once. Without Kokoro (or without `uv`), inloop uses the Mac's best installed voice instead.
+**The voice is Kokoro** (Kokoro-82M, Apache-2.0), a free neural voice that runs locally and sounds close to a person. Set it up once with `/inloop-voice setup` (or Settings → *install natural voice*). That downloads ~200 MB into `~/.cache/inloop/` and runs through `uv` in an isolated environment, with nothing installed system-wide. After setup it runs offline, and nothing is sent anywhere. Every part of an explanation is rendered ahead in one go, so there is no gap between parts, and each part plays as a clip that stop, pause and skip cut off at once. Without Kokoro (or without `uv`), inloop uses the Mac's best installed voice instead. Kokoro can take several seconds to start, so while a part is still being rendered the narration box shows **⟳ generating audio…**, and so does the status line. Playback starts as soon as the audio is ready.
 
 Each spoken part is one short plain sentence that doesn't read out code names, paths or line numbers, since the code is on screen. Choose a voice in Settings (with **test voice**) or with `/inloop-voice`, which lists the Kokoro and Mac voices; `/inloop-voice heart`, `/inloop-voice george`, or `/inloop-voice auto`. Only one thing speaks at a time: a confirmation never plays over an explanation.
 
@@ -218,7 +220,7 @@ It's a single mod: one hooks module, no MCP server, no extra process, no web ser
 
 ## Testing
 
-`claude plugin test .` runs 48 tests in the engine's own test kit:
+`claude plugin test .` runs 60 tests in the engine's own test kit:
 
 - **Logic** (26): path, sensitive-file, revision and secret rules; symbol, route, React and HTTP-call extraction; significance scoring; focus matching; diffs; batching windows; the demo app's login flow, from the button to the database, with every node checked against its source line and every edge's confidence; callers; natural-language search; the first commit's index (sessions, no JWT); JSON recovery; static cards; voice listing, ranking and choice; spoken-text cleanup.
 - **Engine** (22): the plugin loaded by the engine over a virtual project, with a scripted model:
@@ -241,6 +243,9 @@ It's a single mod: one hooks module, no MCP server, no extra process, no web ser
   - with the panel hidden, the narration and code show above the prompt
   - the coding agent is asked for brief replies only while inloop is active (panel open or spoken style, auto mode, brief on), never in headless runs
   - the narrow dock (30 columns) uses short tab labels and leaves paths out of the flow tree
+  - the **Since your last prompt** box counts edit-tool and shell changes net, opens a file's diff, and starts over with each prompt
+  - switching style mid-explanation: written silences at once (a confirmation too), spoken picks up with the next change
+  - while Kokoro is still rendering, the pane and status line say audio is being generated
 
 Verified by hand with real Claude Code 2.1.301, the real model and real git, on the demo app:
 
