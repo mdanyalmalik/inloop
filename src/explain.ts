@@ -18,7 +18,7 @@ import type {
 import { type ChangeAnalysis, type CodeSymbol, type FileChange } from './analysis'
 import { callersOf, calleesOf, type CodeIndex, findSymbols, flowOrder, lookup, symbolId, traceFlow } from './graph'
 import { type Repo, RepoError } from './repo'
-import { redact } from './security'
+import { isNoise, redact } from './security'
 import { changedLines, unifiedDiff } from './diff'
 
 /**
@@ -472,6 +472,22 @@ export function calleeContext(index: CodeIndex, batch: Batch, max = 4): string {
 }
 
 /**
+ * How much a change deserves, from its size and spread: no parts for a one-liner
+ * the summary already covers, up to six for a change across many functions and files.
+ */
+export function partsFor(batch: Pick<Batch, 'analyses'>): { min: number; max: number; summary: string } {
+  const lines = batch.analyses.reduce((n, a) => n + a.addedLines + a.removedLines, 0)
+  const symbols = batch.analyses.reduce((n, a) => n + a.added.length + a.modified.length + a.removed.length, 0)
+  const files = batch.analyses.length
+  const weight = symbols + (files - 1) + Math.floor(lines / 40)
+  const isNew = batch.analyses.some(a => a.added.length > 0 || a.isNew)
+  if (lines <= 6 && symbols <= 1 && files === 1 && !isNew) return { min: 0, max: 1, summary: '1-2 sentences (at most 40 words)' }
+  if (weight <= 2) return { min: 1, max: 2, summary: '2 connected sentences (at most 55 words)' }
+  if (weight <= 5) return { min: 2, max: 4, summary: '2-3 connected sentences (at most 70 words)' }
+  return { min: 3, max: 6, summary: '3-4 connected sentences (at most 90 words)' }
+}
+
+/**
  * A card written by the model from the batch's diffs and the static facts.
  * Resolves null when the model judges the batch not worth a card, unless the
  * person asked for it (`isAsked`).
@@ -485,6 +501,7 @@ export async function modelCard(env: Env, batch: Batch, base: InloopCard, focus:
     budget -= text.length
     return data(d.path, text)
   }).join('\n')
+  const size = partsFor(batch)
   const prompt = `The coding agent just made these edits as one step of its work.
 
 Static analysis (computed by inloop, reliable):
@@ -493,9 +510,9 @@ ${facts}
 Diffs:
 ${diffs}
 ${related !== '' ? `\nDefinitions the changed code calls (current files, for context):\n${related}\n` : ''}${focus !== '' ? `\nThe developer only wants explanations about: "${focus}". If this step has nothing to do with that, set worth_explaining to false.\n` : ''}
-Write one explanation card for this step:
-- "summary": 2-3 connected sentences (at most 70 words) telling the whole story as one explanation: what the agent did, why the code needs it, and how it fits with the rest of the project.
-- "steps": 2-3 parts in the order someone should read the change, each pointing at the code it describes (the new or changed lines, a caller, the data it touches) and adding a detail the summary does not already say. Each part may be read aloud while its code is on screen.
+Write one explanation card for this step, sized to the change (it is ${size.min === 0 ? 'tiny' : size.max <= 2 ? 'small' : size.max <= 4 ? 'medium-sized' : 'large'}):
+- "summary": ${size.summary} telling the whole story as one explanation: what the agent did, why the code needs it, and how it fits with the rest of the project.
+- "steps": ${size.min}-${size.max} parts, as many as the change needs and no more: one for each distinct piece worth looking at, in the order someone should read the change, each pointing at the code it describes (the new or changed lines, a caller, the data it touches) and adding a detail the summary does not already say. Never pad: when the summary already says it all, give fewer${size.min === 0 ? ' (an empty list is right for a one-line change)' : ''}. Each part may be read aloud while its code is on screen.
 Reply with JSON only:
 {"worth_explaining": true, "title": "short title naming the concept", "concept": "the programming concept in 1-4 words", "summary": "markdown", "steps": ${STEPS_SHAPE}}`
   const reply = await env.model({
@@ -511,13 +528,16 @@ Reply with JSON only:
   if (isCutOff && (json === null || (str(json.summary) === '' && !isNo(json.worth_explaining)))) throw new Error('the reply was cut off')
   if (json === null) return { ...base, summary: `${clip(reply.trim(), 3000)}\n\n---\n${base.summary}`, isHeuristic: false }
   if (isNo(json.worth_explaining) && !isAsked) return null
-  const steps = await groundSteps(env.repo, json.steps ?? json.key_lines)
+  const rawSteps = json.steps ?? json.key_lines
+  const steps = await groundSteps(env.repo, rawSteps)
+  // No parts asked for is an answer (the summary covers it); only parts that could not be placed fall back.
+  const isNoneMeant = Array.isArray(rawSteps) && rawSteps.length === 0
   return {
     ...base,
     title: str(json.title, 120) || base.title,
     concept: str(json.concept, 60) || base.concept,
     summary: str(json.summary) || base.summary,
-    steps: steps.length > 0 ? steps : base.steps,
+    steps: steps.length > 0 ? steps : isNoneMeant ? [] : base.steps,
     refs: steps.length > 0 ? steps.map(st => st.ref) : base.refs,
     isHeuristic: false,
   }
@@ -891,20 +911,111 @@ export async function staticFlow(repo: Repo, query: string, rev: string | undefi
 // ---------------------------------------------------------------------------
 // Commits
 
+// ---------------------------------------------------------------------------
+// Reading a whole commit (or the change between two revisions), whatever its size
+
+export type FileStat = { path: string; added: number; removed: number; isBinary: boolean }
+export type ChangeKind = 'code' | 'docs' | 'data' | 'skip'
+
+/**
+ * What a changed file is, for reading a commit: code and docs are read; data,
+ * fixtures and vendored files are named with their counts; binaries, lockfiles
+ * and build output are skipped.
+ */
+export function kindOf(f: FileStat): ChangeKind {
+  if (f.isBinary || isNoise(f.path)) return 'skip'
+  if (/(^|\/)(__fixtures__|fixtures|testdata|third[-_]party|vendor(ed)?)\//i.test(f.path)) return 'data'
+  if (/\.(md|mdx|rst|adoc)$/i.test(f.path)) return 'docs'
+  const size = f.added + f.removed
+  if (/\.(json|jsonl|csv|tsv|txt|snap|xml|svg)$/i.test(f.path) && size > 300) return 'data'
+  // A file this size in one commit is generated or vendored, not written by hand.
+  if (size > 5000) return 'data'
+  return 'code'
+}
+
+const FILE_MAX = 55_000
+const DIRECT_MAX = 120_000
+const PART_MAX = 60_000
+const MAX_PARTS = 8
+const DOCS_MAX = 16_000
+
+/** A file's patch without git's preamble, clipped with a note when huge. */
+function filePatch(patch: string, max: number): string {
+  const body = patch.split('\n').filter(l => !/^(diff --git |index [0-9a-f]|similarity index|rename (from|to) |new file mode|deleted file mode|old mode|new mode|--- |\+\+\+ )/.test(l)).join('\n')
+  return clip(body, max)
+}
+
+/**
+ * Everything a commit or comparison changed, laid out for the model: every file
+ * listed with its counts; every code and doc file's changes read. When the code
+ * is more than one reply can take in, the small model first notes what each part
+ * changes, so the explanation still covers the whole of it.
+ */
+async function readChanges(env: Env, label: string, stats: readonly FileStat[], patchOf: (path: string) => Promise<string>): Promise<{ text: string; diff: string; files: FileStat[] }> {
+  const kinds = stats.map(f => ({ f, kind: kindOf(f) }))
+  const tag: Record<ChangeKind, string> = { code: 'read', docs: 'read', data: 'named only (data, fixture, generated or vendored)', skip: 'skipped (binary, lockfile or build output)' }
+  const listing = kinds.map(({ f, kind }) => `${f.path}  ${f.isBinary ? 'binary' : `+${f.added} −${f.removed}`}  [${tag[kind]}]`).join('\n')
+  const patches: { path: string; kind: ChangeKind; text: string }[] = []
+  for (const { f, kind } of kinds) {
+    if (kind !== 'code' && kind !== 'docs') continue
+    const text = filePatch(await patchOf(f.path).catch(() => ''), kind === 'docs' ? 6000 : FILE_MAX)
+    if (text.trim() !== '') patches.push({ path: f.path, kind, text })
+  }
+  const code = patches.filter(p => p.kind === 'code')
+  let docsLeft = DOCS_MAX
+  const docs = patches.filter(p => p.kind === 'docs').filter(p => (docsLeft -= p.text.length) >= 0)
+  const block = (p: { path: string; text: string }) => `### ${p.path}\n${p.text}`
+  const codeSize = code.reduce((n, p) => n + p.text.length, 0)
+  let body: string
+  if (codeSize <= DIRECT_MAX) {
+    body = `The changes, file by file:\n${data('patch', [...code, ...docs].map(block).join('\n\n'))}`
+  } else {
+    // Too much for one reply: read it in parts, each noted by the small model.
+    const parts: (typeof code)[] = []
+    for (const p of code) {
+      const last = parts.at(-1)
+      if (last !== undefined && last.reduce((n, q) => n + q.text.length, 0) + p.text.length <= PART_MAX) last.push(p)
+      else parts.push([p])
+    }
+    const read = parts.slice(0, MAX_PARTS)
+    const notes: string[] = []
+    for (const [i, part] of read.entries()) {
+      env.progress?.(`reading ${label}, part ${i + 1} of ${read.length}`)
+      const note = await env.model({
+        model: env.settings.autoModel,
+        system: BASE_SYSTEM,
+        prompt: `Part ${i + 1} of ${read.length} of ${label}. It changes these ${part.length} files: ${part.map(p => p.path).join(', ')}. Write one paragraph for every one of them, each starting with its path, saying factually what changed: the functions, types or settings added, changed or removed, and how the behaviour differs (a test file: what it checks, in a line). At most 120 words a file. Leave none out, and do not guess at intent.\n\n${data('patch', part.map(block).join('\n\n'))}`,
+        maxTokens: 3000,
+        signal: env.signal,
+      })
+      notes.push(note.trim())
+    }
+    const unread = parts.slice(MAX_PARTS).flat().map(p => p.path)
+    body = `The code changes were too large to show at once, so here are notes on every part, written from the full patches:\n${data('notes', notes.join('\n\n'))}` +
+      (unread.length > 0 ? `\n\nNot read (beyond what one explanation can cover): ${unread.join(', ')}` : '') +
+      (docs.length > 0 ? `\n\nDocumentation changes:\n${data('patch', docs.map(block).join('\n\n'))}` : '')
+  }
+  // For the card: every read file's hunks under its own header, so its changes box and diffs work.
+  let room = 60_000
+  const diff = patches.map(p => `--- a/${p.path}\n+++ b/${p.path}\n${clip(p.text, 8000)}`).filter(d => (room -= d.length) >= 0).join('\n')
+  return {
+    text: `Every file changed (${stats.length}):\n${data('files', listing)}\n\n${body}`,
+    diff,
+    files: kinds.filter(k => k.kind !== 'skip').map(k => k.f),
+  }
+}
+
 export async function explainCommit(env: Env, rev: string): Promise<InloopCard> {
   const sha = await env.repo.resolve(rev)
   const meta = await env.repo.commitMeta(sha)
-  const files = await env.repo.commitFiles(sha)
-  const patch = await env.repo.commitPatch(sha)
-  const prompt = `Explain this commit to the developer.
+  const stats = await env.repo.changeStats(null, sha)
+  const changes = await readChanges(env, `commit ${meta.short}`, stats, path => env.repo.commitPatch(sha, path))
+  env.progress?.(`explaining commit ${meta.short}`)
+  const prompt = `Explain this commit to the developer: all of it, not only its first files.
 
 ${data(`commit ${meta.short}`, `Commit ${meta.short} by ${meta.author} on ${meta.date}\nSubject: ${meta.subject}\n${meta.body}`)}
 
-Files changed (status path):
-${files.map(f => `${f.status} ${f.path}`).join('\n')}
-
-Patch:
-${data('patch', clip(patch, 16_000))}
+${changes.text}
 
 ${env.ctx.scope ? `Scope requested: "${env.ctx.scope}". Concentrate on that.\n` : ''}Cover, under short markdown headings: What changed; How it worked before and after; Concepts involved; Effect on the application; Purpose (state what the commit message records, and label anything beyond it as inference — never claim to know the author's reasoning).
 Reply with JSON only: {"title": "short title", "concept": "1-4 words", "summary": "markdown", "refs": [{"path": "file", "line": 10, "end_line": 20, "label": "...", "side": "after or before"}]}`
@@ -924,10 +1035,11 @@ Reply with JSON only: {"title": "short title", "concept": "1-4 words", "summary"
     title: str(json.title, 120) || `${meta.short}: ${meta.subject}`,
     concept: str(json.concept, 60) || undefined,
     summary: `*Commit ${meta.short} · ${meta.date.slice(0, 10)} · ${meta.author}*\n\n${summary}`,
-    files: files.map(f => f.path),
+    files: stats.map(f => f.path),
+    fileStats: changes.files.map(f => ({ path: f.path, added: f.added, removed: f.removed })),
     symbols: [],
     refs,
-    diff: clip(patch, 60_000),
+    diff: changes.diff,
     rev: sha,
     source: 'commit',
   }
@@ -946,23 +1058,23 @@ export async function compareRevs(env: Env, from: string, to: string, topic: str
   const a = await env.repo.resolve(from)
   const b = await env.repo.resolve(to)
   const [ma, mb] = await Promise.all([env.repo.commitMeta(a), env.repo.commitMeta(b)])
-  const stat = await env.repo.diff(a, b, [], true)
+  const all = await env.repo.changeStats(a, b)
   const commits = await env.repo.log({ range: [a, b], limit: 60 }).catch(() => [])
   let paths: string[] = []
   if (topic !== '') {
     const terms = topic.toLowerCase().split(/[^a-z0-9_]+/).filter(w => w.length > 2)
-    const changed = stat.split('\n').map(l => l.split('|')[0]?.trim() ?? '').filter(p => p !== '' && !p.includes('changed'))
-    paths = changed.filter(p => terms.some(t => p.toLowerCase().includes(t)))
+    paths = all.map(f => f.path).filter(p => terms.some(t => p.toLowerCase().includes(t)))
     if (paths.length === 0) {
       // Fall back to files whose diff mentions the topic.
-      const full = await env.repo.diff(a, b)
-      const byFile = full.split(/^diff --git /m)
-      paths = byFile.filter(chunk => terms.some(t => chunk.toLowerCase().includes(t)))
-        .map(chunk => /^a\/(\S+)/.exec(chunk)?.[1] ?? '')
-        .filter(p => p !== '')
+      for (const f of all.filter(x => kindOf(x) === 'code' || kindOf(x) === 'docs').slice(0, 200)) {
+        const text = (await env.repo.diff(a, b, [f.path]).catch(() => '')).toLowerCase()
+        if (terms.some(t => text.includes(t))) paths.push(f.path)
+      }
     }
   }
-  const patch = await env.repo.diff(a, b, paths)
+  const stats = paths.length > 0 ? all.filter(f => paths.includes(f.path)) : all
+  const changes = await readChanges(env, `the change from ${ma.short} to ${mb.short}`, stats, path => env.repo.diff(a, b, [path]))
+  env.progress?.('comparing revisions')
   const prompt = `Compare two revisions of the project${topic !== '' ? `, only regarding: "${topic}"` : ''}.
 Older: ${ma.short} (${ma.date.slice(0, 10)}) "${ma.subject}"
 Newer: ${mb.short} (${mb.date.slice(0, 10)}) "${mb.subject}"
@@ -970,11 +1082,7 @@ Newer: ${mb.short} (${mb.date.slice(0, 10)}) "${mb.subject}"
 Commits in between:
 ${data('git log', commits.map(c => `${c.short} ${c.date} ${c.subject}`).join('\n') || '(none listed)')}
 
-Diff stat:
-${data('stat', clip(stat, 3000))}
-
-Diff${paths.length > 0 ? ` (files relevant to the topic: ${paths.join(', ')})` : ''}:
-${data('diff', clip(patch, 16_000))}
+${paths.length > 0 ? `Files relevant to the topic (${paths.length} of ${all.length} changed):\n` : ''}${changes.text}
 
 Explain how the behaviour and structure changed between the two: what the code did before, what it does after, and why that matters. Mark inferences as such.
 Reply with JSON only: {"title": "...", "summary": "markdown", "refs": [{"path": "file", "line": 1, "label": "..."}]}`
@@ -985,10 +1093,11 @@ Reply with JSON only: {"title": "...", "summary": "markdown", "refs": [{"path": 
     at: env.now,
     title: str(json.title, 120) || `${ma.short} → ${mb.short}`,
     summary: `*${ma.short} → ${mb.short}${topic !== '' ? ` · ${topic}` : ''}*\n\n${summary}`,
-    files: paths,
+    files: stats.map(f => f.path),
+    fileStats: changes.files.map(f => ({ path: f.path, added: f.added, removed: f.removed })),
     symbols: [],
     refs: await groundRefs(env.repo, json.refs, b),
-    diff: clip(patch, 60_000),
+    diff: changes.diff,
     rev: b,
     source: 'compare',
   }

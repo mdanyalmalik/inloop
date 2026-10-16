@@ -365,6 +365,22 @@ export class Repo {
   }
 
   /** The commit's patch, without secrets files, optionally for one path. */
+  /**
+   * Lines added and removed in each file: of a commit (against its first parent)
+   * when `from` is null, else between two revisions. Binary files have no counts;
+   * secrets files are left out.
+   */
+  async changeStats(from: string | null, to: string): Promise<{ path: string; added: number; removed: number; isBinary: boolean }[]> {
+    const args = from === null
+      ? ['show', '--format=', '--numstat', '--no-renames', '--diff-merges=first-parent', this.checkRev(to)]
+      : ['diff', '--numstat', '--no-renames', this.checkRev(from), this.checkRev(to)]
+    const out = await this.git([...args, '--', '.', ':(exclude).env*'])
+    return out.split('\n').filter(l => l.includes('\t')).map(l => {
+      const [a = '', r = '', ...rest] = l.split('\t')
+      return { path: rest.join('\t'), added: Number(a) || 0, removed: Number(r) || 0, isBinary: a === '-' }
+    }).filter(f => f.path !== '' && !isSensitive(f.path))
+  }
+
   async commitPatch(sha: string, path?: string, context = 3): Promise<string> {
     const args = ['show', '--no-color', '--format=', `-U${context}`, '-M', this.checkRev(sha), '--', path === undefined ? '.' : this.rel(path), ':(exclude).env*', ':(exclude)*.pem', ':(exclude)*.key']
     return this.git(args)

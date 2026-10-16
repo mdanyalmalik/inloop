@@ -143,6 +143,8 @@ In the Git tab, or with commands:
 /inloop-at 3 months ago           # study the code as of a date or sha; "/inloop-at working" to return
 ```
 
+A commit is read in full, whatever its size. Every changed file is listed with its line counts, and every code and documentation file's changes are read. Lockfiles, binaries, build output, fixtures, data and vendored files are named but not read. When the code is more than one reply can take in, the small model first notes what every file in each part changed, and the explanation is written from those notes, so a 30-file commit is covered end to end instead of being cut off after its first few files. Comparing two revisions works the same way. The card's **changes** list shows every file; press one for its diff.
+
 History is read straight from git's object store (`git show <rev>:<path>`, `git cat-file --batch`, `git log`, `git diff-tree`). There is no checkout, no worktree and no stash, so your branch, index and uncommitted work are never touched. For an approximate date, inloop picks the last commit at or before it and says which one it picked. If nothing is that old, it uses the first commit and says so. While a revision is being studied, questions, the code viewer and flows all read that revision. The index for a commit is built from that commit alone, never mixed with your working tree.
 
 ### Two styles: written and spoken
@@ -164,6 +166,8 @@ You can switch styles at any time, even mid-explanation. Switching to written st
 | System voice | `say`, with a voice picker; stop and skip cut it off mid-sentence | the platform synthesizer through Claude Code (`$.audio.speak`); no voice picker, and stop and skip take effect after the current part | same as Linux |
 
 If no player is found, Kokoro isn't downloaded and the system voice speaks. A clip that a player fails to play (no sound device, say) is read by the system voice instead of being skipped. Kokoro can take several seconds to start, so while a part is still being rendered the narration box shows **⟳ generating audio…**, and so does the status line. Playback starts as soon as the audio is ready.
+
+How many parts an explanation has depends on the change: a one-line edit is explained in its summary alone, a small change gets one or two parts, and a change spread over many functions or files gets up to six.
 
 Each spoken part is one short plain sentence that doesn't read out code names, paths or line numbers, since the code is on screen. Choose a voice in Settings (with **test voice**) or with `/inloop-voice`, which lists the Kokoro and Mac voices; `/inloop-voice heart`, `/inloop-voice george`, or `/inloop-voice auto`. Only one thing speaks at a time: a confirmation never plays over an explanation. Voice files live in `~/.cache/inloop/` (the model in `kokoro/`, clips in `tts/`, which are deleted after an hour).
 

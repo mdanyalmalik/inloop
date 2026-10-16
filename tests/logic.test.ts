@@ -3,7 +3,7 @@ import { describe, expect, test } from 'claude-code/testing'
 import { analyzeChange, extractSymbols, findCalls, matchesFocus, topicsOf } from '../src/analysis'
 import { Batcher, hash } from '../src/batcher'
 import { changedLines, formatRanges, summarizeDiff, unifiedDiff } from '../src/diff'
-import { describeFlow, extractJson, parseReply, speakable, staticCard, diffBatch } from '../src/explain'
+import { describeFlow, extractJson, kindOf, parseReply, partsFor, speakable, staticCard, diffBatch } from '../src/explain'
 import { buildIndex, callersOf, findSymbols, lookup, traceFlow, urlMatches } from '../src/graph'
 import { isSafeRev, isSensitive, redact, toRelative } from '../src/security'
 import { DEMO_FIRST, DEMO_HEAD } from './fixtures'
@@ -279,6 +279,34 @@ describe('voices', () => {
     const long = 'One sentence here. '.repeat(60)
     expect(speakable(long).length <= 450).toBe(true)
     expect(speakable(long).endsWith('.')).toBe(true)
+  })
+})
+
+describe('explanations sized to the change', () => {
+  test('a one-liner gets no parts, a small change one or two, a spread-out change up to six', () => {
+    const one = analyzeChange({ path: 'server/app.js', before: DEMO_HEAD['server/app.js']!, after: DEMO_HEAD['server/app.js']!.replace('3000', '3001'), snippets: [], tools: ['Edit'], at: 0 })
+    expect(partsFor({ analyses: [one] })).toEqual({ min: 0, max: 1, summary: '1-2 sentences (at most 40 words)' })
+    const fn = (name: string) => `\nfunction ${name}(a) {\n  const b = a + 1\n  return b * 2\n}\n`
+    const small = analyzeChange({ path: 'server/app.js', before: DEMO_HEAD['server/app.js']!, after: DEMO_HEAD['server/app.js']! + fn('health'), snippets: [], tools: ['Edit'], at: 0 })
+    expect(partsFor({ analyses: [small] }).max).toBe(2)
+    const many = ['a.js', 'b.js', 'c.js', 'd.js'].map(path => analyzeChange({ path, before: '', after: fn('one') + fn('two') + fn('three'), snippets: [], tools: ['Write'], at: 0 }))
+    expect(partsFor({ analyses: many }).max).toBe(6)
+  })
+})
+
+describe('reading a whole commit', () => {
+  test('code and docs are read; data, fixtures and vendored files are named; binaries and lockfiles skipped', () => {
+    const k = (path: string, added = 10, removed = 0, isBinary = false) => kindOf({ path, added, removed, isBinary })
+    expect(k('src/runtime/onnx/moe-split.ts', 535)).toBe('code')
+    expect(k('tools/export/export_flux3.py', 589)).toBe('code')
+    expect(k('README.md')).toBe('docs')
+    expect(k('package-lock.json', 4000)).toBe('skip')
+    expect(k('src/runtime/onnx/__fixtures__/tiny-moe.onnx', 0, 0, true)).toBe('skip')
+    expect(k('src/runtime/image/__fixtures__/flux3-prompts.json', 1)).toBe('data')
+    expect(k('public/third-party/onnxruntime-web/ort.mjs', 200)).toBe('data')
+    expect(k('src/tokenizer/qwen-tokenizer.json', 669)).toBe('data')
+    expect(k('tsconfig.json', 6)).toBe('code')
+    expect(k('src/generated/schema.ts', 9000)).toBe('data')
   })
 })
 

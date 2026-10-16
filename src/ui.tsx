@@ -385,18 +385,24 @@ function turnChangesView(k: Kit): RenderElement {
 }
 
 function changesView(k: Kit, card: InloopCard, list: string): RenderElement | null {
-  if (card.diff === undefined || card.diff === '' || !['auto', 'recent', 'commit', 'compare'].includes(card.source)) return null
-  const files = summarizeDiff(card.diff)
+  if (!['auto', 'recent', 'commit', 'compare'].includes(card.source)) return null
+  const read = summarizeDiff(card.diff ?? '')
+  // A commit or comparison lists every file it changed, read or not; a file not read opens its own diff.
+  const files = card.fileStats !== undefined
+    ? card.fileStats.map(f => read.find(r => r.path === f.path) ?? { path: f.path, added: f.added, removed: f.removed, ranges: [] as [number, number][], hunks: '' })
+    : read
   if (files.length === 0) return null
   const { Box, Text, Button } = k.el
   return (
     <Box flexDirection="column" borderStyle="round" borderDimColor paddingX={1} marginBottom={1}>
       <Text dimColor>changes</Text>
-      {files.slice(0, 12).map((f, i) => (
+      {files.slice(0, 30).map((f, i) => (
         <Button
           key={`${list}:chg:${card.id}:${i}`}
           plain
-          onPress={() => k.app.openRef({ path: f.path, line: f.ranges[0]?.[0] ?? 1, rev: card.rev }, { diff: f.hunks, note: `${f.path} in "${card.title}"` })}
+          onPress={() => f.hunks === '' && card.rev !== undefined && card.source === 'commit'
+            ? k.app.openCommitFile(card.rev, f.path, true)
+            : k.app.openRef({ path: f.path, line: f.ranges[0]?.[0] ?? 1, rev: card.rev }, { diff: f.hunks || undefined, note: `${f.path} in "${card.title}"` })}
         >
           <Text wrap="truncate-start">{f.path}</Text>
           <Text color="success"> +{f.added}</Text>
@@ -404,7 +410,7 @@ function changesView(k: Kit, card: InloopCard, list: string): RenderElement | nu
           {f.ranges.length > 0 && <Text dimColor>  lines {formatRanges(f.ranges)}</Text>}
         </Button>
       ))}
-      {files.length > 12 && <Text dimColor>… {files.length - 12} more files</Text>}
+      {files.length > 30 && <Text dimColor>… {files.length - 30} more files</Text>}
     </Box>
   )
 }

@@ -837,6 +837,8 @@ export class App {
   /** A card's steps; a card that came without them (a commit, a comparison) gets one per reference. */
   private async withSteps(card: InloopCard): Promise<InloopCard> {
     if (card.steps !== undefined && card.steps.length > 0) return card
+    // A change explained in its summary alone was meant that way: no parts made up from its references.
+    if (card.source === 'auto' && card.steps !== undefined && !card.isHeuristic) return card
     const steps: InloopStep[] = []
     for (const ref of card.refs.slice(0, 5)) {
       if (ref.line === undefined) continue
@@ -1241,7 +1243,7 @@ export class App {
 
   async explainCommit(rev: string): Promise<InloopCard | null> {
     try {
-      const card = await this.whileBusy(`explaining commit ${rev.slice(0, 8)}…`, async () => explainCommit(await this.env(), rev))
+      const card = await this.whileBusy(`explaining commit ${rev.slice(0, 8)}…`, async progress => explainCommit(await this.env(t => progress(`${t}…`)), rev))
       await this.addCard(card)
       await this.host.state.expanded.update(() => card.id)
       if (!(await this.isPaneShown())) this.host.log(`inloop — ${card.title}\n\n${card.summary}`)
@@ -1254,7 +1256,7 @@ export class App {
 
   async compare(from: string, to: string, topic: string): Promise<InloopCard | null> {
     try {
-      const card = await this.whileBusy('comparing revisions…', async () => compareRevs(await this.env(), from, to, topic))
+      const card = await this.whileBusy('comparing revisions…', async progress => compareRevs(await this.env(t => progress(`${t}…`)), from, to, topic))
       await this.addCard(card)
       await this.host.state.expanded.update(() => card.id)
       if (!(await this.isPaneShown())) this.host.log(`inloop — ${card.title}\n\n${card.summary}`)

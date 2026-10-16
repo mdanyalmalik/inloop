@@ -38,6 +38,8 @@ export type InloopCard = {
   refs: InloopRef[]
   /** The explanation walked through in order, each part with its code. */
   steps?: InloopStep[]
+  /** Every file a commit or comparison changed, with its counts (the diff holds only the files read). */
+  fileStats?: { path: string; added: number; removed: number }[]
   /** Unified diff hunks behind the card, when it explains a change. */
   diff?: string
   rev?: string
