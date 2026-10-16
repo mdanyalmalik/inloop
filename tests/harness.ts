@@ -28,6 +28,9 @@ export type World = {
   /** Every commit's tree by sha, the last one HEAD; commit() makes one of the working files. */
   commits: { sha: string; tree: Map<string, string> }[]
   commit: () => void
+  /** While true, `git status` does not return (a hung git, a locked index) until releaseGit(). */
+  isGitStatusHung: boolean
+  releaseGit: () => void
   /** A model call to fail, by its count from 1: the reason (and status) it fails with, or undefined to answer. */
   failModel: (call: number) => { reason: string; status?: number; error?: string } | undefined
   /** A model call to hold until the promise it returns settles (a slow call), by its prompt; undefined answers at once. */
@@ -103,6 +106,8 @@ export function world(
     head: new Map(Object.entries(DEMO_HEAD)),
     commits: [],
     commit: () => undefined,
+    isGitStatusHung: false,
+    releaseGit: () => undefined,
     failModel: () => undefined,
     holdModel: () => undefined,
     prompts: [],
@@ -215,6 +220,7 @@ export function world(
     if (args[0] === 'rev-parse' && args[1] === '--is-inside-work-tree') return ok('true\n')
     if (args[0] === 'rev-parse' && args[1] === '--show-prefix') return ok(`${prefix}\n`)
     if (args[0] === 'ls-files') return ok(here(w.files.keys()).join('\n') + '\n')
+    if (args[0] === 'status' && w.isGitStatusHung) await new Promise<void>(resolve => { w.releaseGit = resolve })
     if (args[0] === 'status') {
       // Porcelain paths are the repository's wherever git runs; a `-- .` pathspec keeps to the folder.
       const isHere = (path: string) => !args.slice(args.indexOf('--')).includes('.') || path.startsWith(prefix)

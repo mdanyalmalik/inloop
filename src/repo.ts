@@ -140,6 +140,13 @@ export class Repo {
     return this.read(rel).catch(() => null)
   }
 
+  /** Drops every cached file text and the working-tree index: the next reads come from disk. */
+  forget(): void {
+    this.files = new Lru<string>(300)
+    this.worktreeIndex = null
+    this.dirty.clear()
+  }
+
   /** Marks a working-tree file changed (an edit landed). */
   touch(rel: string): void {
     this.files.delete(`@:${rel}`)

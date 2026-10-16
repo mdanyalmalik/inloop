@@ -152,6 +152,8 @@ Every explanation is a short summary plus a few **parts**, each a sentence or tw
 - **Written**: the newest explanation opens by itself in the Feed, with every part's code snippet inline (`↗` opens the full file). An explanation you opened yourself stays open; new ones don't push it closed.
 - **Spoken** (default): each new explanation is read aloud part by part, and a box pinned at the top of the panel shows the code for the part being read, with **⏮ ⏸ ⏭ ■** controls that take effect immediately, even mid-sentence. Up to three explanations wait their turn. If the panel is hidden behind another panel (such as Claude Code's Diff panel) or you closed it, the same narration and code show in the strip above the prompt. inloop never reopens a panel you closed; `/inloop` brings it back. Any explanation can also be played with **▶ listen**.
 
+When an explanation finishes, or you press **■ stop**, it stays loaded: the box goes back to part 1 and offers **↻ replay** (from the start, with the audio already made, so no wait) and **✕ close**. It's unloaded only when you close it, when other audio plays (the next explanation, **▶ listen**, a voice test), or when the session ends. **✕** while it plays closes it at once.
+
 You can switch styles at any time, even mid-explanation. Switching to written stops the voice at once, including a confirmation still being said, and leaves the explanation open to read. Switching back to spoken reads the next change aloud from its start.
 
 **The voice is Kokoro** (Kokoro-82M, Apache-2.0), a free neural voice that runs locally and sounds close to a person. It sets itself up: the first time a session starts on a machine with `uv`, inloop downloads it in the background (~200 MB, once) into `~/.cache/inloop/`. It runs through `uv` in an isolated environment, with nothing installed system-wide. While it downloads, the pane says so and the Mac voice speaks; when it's ready, a toast says so and Kokoro takes over. Sessions starting at the same time share one download. To set it up by hand instead, choose Settings → *natural voice: only when I install it*, then use `/inloop-voice setup` or **install natural voice**. inloop doesn't install `uv` itself, since that means running an installer on your machine. After setup Kokoro runs offline, and nothing is sent anywhere. Every part of an explanation is rendered ahead in one go, so there is no gap between parts, and each part plays as a clip that stop, pause and skip cut off at once. Without Kokoro (or without `uv`), inloop uses the system voice instead.
@@ -198,6 +200,7 @@ Mod commands can't contain `:`, so they're named `/inloop-…`. Every one runs i
 | `/inloop-speak on\|off` | Same as spoken / written |
 | `/inloop-brief on\|off` | Keep the coding agent's replies short while inloop is active |
 | `/inloop-voice [setup \| name \| auto]` | List the voices on this machine, choose one, or set up the natural Kokoro voice |
+| `/inloop-reload` | Restart inloop if it seems to miss changes: it lets go of anything stuck, looks at the project again, and explains what it missed |
 
 Headless use works too, which is handy for scripts:
 
@@ -313,6 +316,7 @@ Verified by hand with real Claude Code 2.1.301, the real model and real git, on 
 
 - **No pane.** Widen the terminal, or use the fullscreen layout, or run `/inloop` (it opens at any width). Commands work without the pane, and so do toasts and the status line (`inloop: auto · 3 explained`).
 - **A step says "not explained".** It scored below the threshold, was off your focus topic, or the model judged it minor. Press **explain anyway**, or lower the threshold in Settings (*explain edits from significance* → 1).
+- **inloop seems to have stopped noticing changes.** Run `/inloop-reload`. It's also safe after `/clear` or `/resume`: Claude Code starts a new conversation there without telling plugins it started, and inloop now carries on by itself (it reloads its settings and your feed too).
 - **No line at all for a change.** Check the mode (`/inloop-settings`). Changes made by a shell command need git, and files git ignores aren't seen; lockfiles, build output and virtual environments are skipped on purpose.
 - **"⚠ explanation failed".** The reason is shown, for example `aborted` (the call was cut off) or an API error such as overloaded. Press **try again**.
 - **A card says "model explanation unavailable".** The model call failed, for example because of rate limits or a model your account can't use. The static card is still shown. Change models in Settings, or choose *static analysis only*.

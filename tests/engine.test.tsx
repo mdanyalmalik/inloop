@@ -508,6 +508,46 @@ describe('surfaces without fields', () => {
 })
 
 describe('lifecycle', () => {
+  for (const reason of ['clear', 'resume'] as const) {
+    test(`after /${reason} (a session.end with no session.start), changes are still explained`, async ($, on) => {
+      const w = world(on)
+      tools(on, w)
+      on('session.end', () => ({ sessionId: 's1' }) as never)
+      await start($)
+      await $.session.end({ reason } as never)
+      await w.clock.advance(1)
+      await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
+      await w.clock.advance(10_000)
+      const cards = w.get('cards') ?? []
+      expect(cards.length).toBe(1)
+      expect(cards[0]!.skipped).toBeUndefined()
+      expect(cards[0]!.failed).toBeUndefined()
+      expect(w.prompts.length).toBe(1)
+    })
+  }
+
+  test('/inloop-reload lets a hung scan go and explains what was missed', async ($, on) => {
+    const w = world(on)
+    tools(on, w)
+    await start($)
+    // A git call that never returns leaves the scan hanging: later scans wait on it.
+    w.isGitStatusHung = true
+    w.files.set('server/app.js', w.files.get('server/app.js')! + '\nfunction health(req, res) {\n  res.json({ ok: true })\n}\n')
+    await $.tool.call({ tool: 'Bash', command: 'python3 fix.py' } as never)
+    await w.clock.advance(10_000)
+    expect((w.get('cards') ?? []).length).toBe(0)
+    w.isGitStatusHung = false
+    await $.command.run({ command: 'inloop-reload', args: '' } as never)
+    await w.clock.advance(10_000)
+    const cards = w.get('cards') ?? []
+    expect(cards.map(c => c.files)).toEqual([['server/app.js']])
+    expect(w.toasts.some(t => /inloop restarted/.test(t))).toBe(true)
+    // The hung call returns at last; nothing is explained twice.
+    w.releaseGit()
+    await w.clock.advance(10_000)
+    expect((w.get('cards') ?? []).length).toBe(1)
+  })
+
   test('a second session.start (a reload) does not double-process edits', async ($, on) => {
     const w = world(on)
     tools(on, w)
@@ -1059,7 +1099,10 @@ describe('styles', () => {
     expect(w.get('narration')?.index).toBe(2)
     w.finishSpeech()
     await w.clock.advance(1)
-    expect(w.get('narration')).toBe(null)
+    // Finished: kept loaded, back at part 1, with replay and close.
+    expect(w.get('narration')?.isEnded).toBe(true)
+    expect(w.get('narration')?.index).toBe(0)
+    expect(await ui.find({ text: /finished · back at part 1 of 3/ })).toBeDefined()
     expect(w.said.map(x => x.text)).toEqual(['The agent added refreshToken.', 'refreshToken checks the old token first.', 'It is exported next to createToken.'])
     expect(w.said.every(x => !x.isCut)).toBe(true)
     expect(w.said.at(-1)?.voice).toBe('Zoe (Premium)')
@@ -1087,9 +1130,14 @@ describe('styles', () => {
     expect(w.get('narration')?.index).toBe(1)
     await ui.press({ key: 'say:stop' })
     await w.clock.advance(1)
-    expect(w.get('narration')).toBe(null)
+    // Stopped: kept at part 1 to replay or close, nothing more said.
+    expect(w.get('narration')?.isEnded).toBe(true)
+    expect(w.get('narration')?.index).toBe(0)
     expect(w.said.map(x => x.text)).toEqual(['The agent added refreshToken.', 'refreshToken checks the old token first.', 'refreshToken checks the old token first.'])
     expect(w.said.every(x => x.isCut)).toBe(true)
+    await ui.press({ key: 'say:close' })
+    await w.clock.advance(1)
+    expect(w.get('narration')).toBe(null)
     await ui.unmount()
   })
 
@@ -1160,9 +1208,48 @@ describe('styles', () => {
     const ui = await $.ui.mount({ plugin: 'inloop', surface: 'terminal', component: 'Pane', requestId: 'inloop', props: PANE_PROPS as never })
     await ui.press({ key: 'say:stop' })
     await w.clock.advance(1)
+    expect(w.get('narration')?.isEnded).toBe(true)
+    expect(w.said.at(-1)?.isCut).toBe(true)
+    // Replay: from part 1, the clips already made, no second render.
+    const renders = w.clips.size
+    await ui.press({ key: 'say:replay' })
+    await w.clock.advance(1)
+    expect(w.get('narration')?.isEnded).not.toBe(true)
+    expect(w.get('narration')?.index).toBe(0)
+    expect(w.said.at(-1)?.text).toBe('The agent added refreshToken.')
+    expect(w.said.at(-1)?.voice).toBe('kokoro:af_heart')
+    expect(w.clips.size).toBe(renders)
+    // Close mid-replay: stops at once and unloads.
+    await ui.press({ key: 'say:close' })
+    await w.clock.advance(1)
     expect(w.get('narration')).toBe(null)
     expect(w.said.at(-1)?.isCut).toBe(true)
     await ui.unmount()
+  })
+
+  test('a finished explanation stays loaded until another one plays', { timeoutMs: 20_000 }, async ($, on) => {
+    const w = world(on, STEPPED)
+    tools(on, w)
+    await start($)
+    await $.command.run({ command: 'inloop-style', args: 'spoken' } as never)
+    await quiet(w)
+    await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
+    await w.clock.advance(10_000)
+    for (let i = 0; i < 3; i++) {
+      w.finishSpeech()
+      await w.clock.advance(1)
+    }
+    const first = w.get('narration')
+    expect(first?.isEnded).toBe(true)
+    // A new explanation replaces it.
+    w.files.set('server/app.js', w.files.get('server/app.js')! + '\nfunction health(req, res) {\n  res.json({ ok: true })\n}\n')
+    await $.tool.call({ tool: 'Bash', command: 'python3 fix.py' } as never)
+    await w.clock.advance(10_000)
+    expect(w.get('narration')?.cardId).not.toBe(first?.cardId)
+    expect(w.get('narration')?.isEnded).not.toBe(true)
+    await $.command.run({ command: 'inloop-style', args: 'written' } as never)
+    await w.clock.advance(1)
+    expect(w.get('narration')).toBe(null)
   })
 
   test('out of the box: spoken style, and the natural voice downloads in the background once', { timeoutMs: 20_000 }, async ($, on) => {
@@ -1383,6 +1470,10 @@ describe('styles', () => {
     expect(await band.find({ text: /refreshToken checks the old token first/ })).toBeDefined()
     expect(await band.find({ text: /const claims = verifyToken\(token\)/ })).toBeDefined()
     await band.press({ key: 'band:stop' })
+    await w.clock.advance(1)
+    expect(w.get('narration')?.isEnded).toBe(true)
+    expect(await band.find({ text: /finished/ })).toBeDefined()
+    await band.press({ key: 'band:close' })
     await w.clock.advance(1)
     expect(w.get('narration')).toBe(null)
     await band.unmount()

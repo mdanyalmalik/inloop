@@ -81,27 +81,40 @@ export class App {
 
   async start(): Promise<void> {
     this.repo = await Repo.open(this.host)
-    const stored = (await this.host.storeGet('settings')) as (Partial<InloopSettings> & { speak?: boolean }) | undefined
-    // Settings saved before the written/spoken styles kept a speech on/off switch.
-    const { speak: oldSpeak, ...kept } = stored ?? {}
-    const settings: InloopSettings = { ...DEFAULT_SETTINGS, ...kept }
-    if (kept.style === undefined && oldSpeak === true) settings.style = 'spoken'
-    await this.host.state.settings.update(() => settings)
+    const settings = await this.ensureState()
     this.batcher = new Batcher({ quietMs: settings.quietSeconds * 1000, maxWaitMs: 45_000, maxFiles: 12 })
-    const history = (await this.host.storeGet('history')) as InloopCard[] | undefined
-    if (Array.isArray(history)) {
-      await this.host.state.history.update(() => history)
-      // The feed picks up where this project's last session left off.
-      const earlier = await this.ownEarlier(history).catch(() => [] as InloopCard[])
-      if (earlier.length > 0) await this.host.state.cards.update(list => [...list, ...earlier.filter(c => !list.some(x => x.id === c.id))].slice(0, MAX_CARDS))
-    }
     await this.snapshotBaseline().catch(() => undefined)
     this.detach(() => this.prepareVoice())
     await this.refreshStatus()
   }
 
-  /** When this session started: the feed marks explanations from before it. */
-  readonly startedAt = Date.now()
+  /**
+   * Puts the saved settings, history and this project's earlier explanations into
+   * the session's state. A new conversation after /clear or a resume starts with
+   * fresh state and no session.start, so this runs again then (and before each
+   * prompt): loading is the same each time, and only an empty feed or history is filled.
+   */
+  async ensureState(): Promise<InloopSettings> {
+    const stored = (await this.host.storeGet('settings').catch(() => undefined)) as (Partial<InloopSettings> & { speak?: boolean }) | undefined
+    // Settings saved before the written/spoken styles kept a speech on/off switch.
+    const { speak: oldSpeak, ...kept } = stored ?? {}
+    const settings: InloopSettings = { ...DEFAULT_SETTINGS, ...kept }
+    if (kept.style === undefined && oldSpeak === true) settings.style = 'spoken'
+    await this.host.state.settings.update(() => settings)
+    const history = (await this.host.storeGet('history').catch(() => undefined)) as InloopCard[] | undefined
+    if (Array.isArray(history) && history.length > 0) {
+      if ((await this.host.state.history.get()).length === 0) await this.host.state.history.update(() => history)
+      // The feed picks up where this project's last session left off.
+      if ((await this.host.state.cards.get()).length === 0) {
+        const earlier = await this.ownEarlier(history).catch(() => [] as InloopCard[])
+        if (earlier.length > 0) await this.host.state.cards.update(list => [...list, ...earlier.filter(c => !list.some(x => x.id === c.id))].slice(0, MAX_CARDS))
+      }
+    }
+    return settings
+  }
+
+  /** When this conversation started (a /clear starts a new one): the feed marks explanations from before it. */
+  startedAt = Date.now()
 
   /**
    * This project's explanations from earlier sessions, newest first: those
@@ -152,6 +165,50 @@ export class App {
     this.aborter.abort()
     this.timer?.cancel()
     this.animate(false)
+    this.narrationQueue = []
+    this.interrupt('stop')
+    this.release()
+  }
+
+  /**
+   * A conversation ended. After /clear or a resume the process goes on under a
+   * new session and no session.start comes, so inloop must not stay stopped:
+   * what was in flight is cut off (its line says so, with "try again"), and
+   * watching goes on. Changes already noticed are still explained.
+   */
+  restart(): void {
+    this.stop()
+    this.aborter = new AbortController()
+    this.isClosing = false
+    this.startedAt = Date.now()
+    this.detach(async () => {
+      await this.ensureState().catch(() => undefined)
+      await this.schedule()
+      if (this.queue.length > 0) void this.work()
+    })
+  }
+
+  /**
+   * /inloop-reload: starts watching over as if just opened, without losing what
+   * it knows. A scan or explanation that hung is let go, cached file text is
+   * dropped, and the project is looked at again at once, so anything changed
+   * since inloop last looked is explained now.
+   */
+  async reload(): Promise<string> {
+    this.restart()
+    this.scan = null
+    this.isScanAgain = false
+    this.isWorking = false
+    this.repo.forget()
+    await this.scanWorkingTree().catch(() => undefined)
+    if (this.raw.length > 0) await this.drainRaw()
+    await this.flush('asked')
+    await this.refreshVoices().catch(() => undefined)
+    const status = await this.host.state.status.get()
+    if (this.repo.notProject !== null) return `inloop restarted, but ${this.repo.notProject}`
+    const where = this.repo.isGit ? '' : ' (no git here, so only changes made with the edit tools are seen)'
+    const waiting = status.queued + this.batcher.size
+    return `inloop restarted${where}. ${waiting > 0 ? `${waiting} change${waiting === 1 ? '' : 's'} being explained now.` : 'Nothing new to explain since it last looked.'}`
   }
 
   newId(): string {
@@ -799,8 +856,25 @@ export class App {
   /** The person closed the pane themselves; inloop does not reopen it until they ask (/inloop). */
   isPaneClosedByPerson = false
 
+  /**
+   * The explanation last read, kept loaded once it ends or is stopped: replay
+   * reads it again from part 1 with the audio already made. It is let go only
+   * when closed, when other audio plays, or when the session ends.
+   */
+  private held: { card: InloopCard; steps: InloopStep[]; speaker: Speaker } | null = null
+  private isReplaying = false
+  private isClosing = false
+
+  /** Lets the kept explanation and its audio go. */
+  private release(): void {
+    this.held?.speaker.close()
+    this.held = null
+  }
+
   /** Queues a card to be read aloud, its code shown part by part. At most three wait; the oldest gives way. */
   async narrate(card: InloopCard, first = false): Promise<void> {
+    // Another explanation to read: the one kept loaded goes.
+    this.release()
     if (first) {
       this.narrationQueue = [card, ...this.narrationQueue.filter(c => c.id !== card.id)]
       if (this.isNarrating) this.interrupt('skip')
@@ -845,9 +919,30 @@ export class App {
     this.interrupt('prev')
   }
 
+  /** Stops reading; the explanation stays loaded at part 1, to replay or close. */
   narrationStop(): void {
     this.narrationQueue = []
     this.interrupt('stop')
+  }
+
+  /** Reads the kept explanation again from part 1, with the audio already made. */
+  narrationReplay(): void {
+    if (this.held === null || this.isNarrating) return
+    this.isReplaying = true
+    this.isNarrating = true
+    this.detach(() => this.runNarration())
+  }
+
+  /** Stops reading if it is, and unloads the explanation and its audio. */
+  async narrationClose(): Promise<void> {
+    this.narrationQueue = []
+    if (this.isNarrating) {
+      this.isClosing = true
+      this.interrupt('stop')
+      return
+    }
+    this.release()
+    await this.host.state.narration.update(() => null)
   }
 
   /** The latest control pressed; read through a call because handlers change it while speech is awaited. */
@@ -943,18 +1038,27 @@ export class App {
   private async runNarration(): Promise<void> {
     this.isNarrating = true
     try {
-      while (this.narrationQueue.length > 0) {
-        const card = this.narrationQueue.shift()!
-        // The explanation itself first (the answer, or the change's summary), then each part with its code.
-        const lead: InloopStep = { text: card.summary, ref: { path: '' } }
-        const steps: InloopStep[] = [lead, ...(card.steps ?? [])]
+      while (this.narrationQueue.length > 0 || this.isReplaying) {
+        let card: InloopCard
+        let steps: InloopStep[]
+        let kept: Speaker | null = null
+        if (this.isReplaying && this.held !== null) {
+          ;({ card, steps, speaker: kept } = this.held)
+          this.held = null
+        } else {
+          card = this.narrationQueue.shift()!
+          // The explanation itself first (the answer, or the change's summary), then each part with its code.
+          const lead: InloopStep = { text: card.summary, ref: { path: '' } }
+          steps = [lead, ...(card.steps ?? [])]
+        }
+        this.isReplaying = false
         this.control = 'none'
         this.oneOff?.close()
         // The code is shown as it is discussed: bring the pane back if it went away on its own,
         // but not if the person closed it (the band above the prompt stands in then).
         if (!this.isPaneClosedByPerson) void this.host.openPane().catch(() => undefined)
         await this.host.state.narration.update(() => ({ cardId: card.id, title: card.title, steps, index: 0, isPaused: false, queued: this.narrationQueue.length }))
-        const speaker = await this.speaker(
+        const speaker = kept ?? await this.speaker(
           steps.map((st, i) => speakable(st.text, i === 0 ? 900 : 320)),
           () => this.currentControl() !== 'none',
           isPreparing => this.host.state.narration.update(n => (n === null ? n : { ...n, isPreparing })).then(() => undefined),
@@ -986,16 +1090,24 @@ export class App {
             i = control === 'prev' ? Math.max(0, i - 1) : i + 1
           }
         } finally {
-          speaker.close()
           this.speakerNow = null
         }
-        // A stop emptied the queue; whatever is queued now came after it and is read.
+        // The last one read stays loaded, to replay; one with more waiting behind it goes.
+        // (A stop emptied the queue; whatever is queued now came after it and is read.)
+        if (this.narrationQueue.length > 0 || this.isClosing) speaker.close()
+        else this.held = { card, steps, speaker }
       }
     } finally {
       this.isNarrating = false
       this.control = 'none'
       this.speakerNow = null
-      await this.host.state.narration.update(() => null)
+      if (this.isClosing || this.held === null) {
+        this.isClosing = false
+        this.release()
+        await this.host.state.narration.update(() => null)
+      } else {
+        await this.host.state.narration.update(n => (n === null ? n : { ...n, index: 0, isPaused: false, isPreparing: false, isEnded: true, queued: 0 }))
+      }
     }
   }
 
@@ -1008,6 +1120,8 @@ export class App {
    */
   async speak(text: string): Promise<void> {
     if (this.isNarrating) return
+    // Other audio: the kept explanation goes.
+    if (this.held !== null) await this.narrationClose()
     this.oneOff?.close()
     try {
       const speaker = await this.speaker([speakable(text, 400)], () => false)
@@ -1365,7 +1479,7 @@ export class App {
     }
     if (change.mode === 'paused' || change.mode === 'ask') this.queue.length = 0
     if (change.style === 'written') {
-      this.narrationStop()
+      void this.narrationClose()
       this.oneOff?.close()
       this.oneOff = null
     }

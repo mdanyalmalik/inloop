@@ -128,8 +128,8 @@ export function narrationBand(el: Kit['el'], n: InloopNarration, app: App, colum
   return (
     <Box flexDirection="column" width={columns}>
       <Box flexDirection="row" columnGap={1}>
-        <Text color="suggestion" weight="bold" wrap="truncate-end">{n.isPaused ? '⏸' : n.isPreparing === true ? spin(frame) : '▶'} inloop: {n.title}</Text>
-        <Text dimColor>{n.index < 0 ? '' : `${n.index + 1}/${n.steps.length}`}</Text>
+        <Text color="suggestion" weight="bold" wrap="truncate-end">{n.isEnded === true ? '■' : n.isPaused ? '⏸' : n.isPreparing === true ? spin(frame) : '▶'} inloop: {n.title}</Text>
+        <Text dimColor>{n.isEnded === true ? 'finished' : n.index < 0 ? '' : `${n.index + 1}/${n.steps.length}`}</Text>
         {n.isPreparing === true && !n.isPaused && <Text color="warning">generating audio…</Text>}
       </Box>
       {n.index >= 0 && step !== undefined && <Text wrap="truncate-end">{step.text.replace(/`/g, '')}</Text>}
@@ -137,12 +137,22 @@ export function narrationBand(el: Kit['el'], n: InloopNarration, app: App, colum
         <Code source={keepBlank(lines.join('\n'))} path={step.ref.path} startLine={step.codeStart ?? step.ref.line ?? 1} wrap="truncate-end" />
       )}
       <Box flexDirection="row" columnGap={1}>
-        <Button key="band:prev" label="⏮" plain onPress={() => app.narrationPrev()} />
-        {n.isPaused
-          ? <Button key="band:resume" label="▶ resume" plain onPress={() => app.narrationResume()} />
-          : <Button key="band:pause" label="⏸ pause" plain onPress={() => app.narrationPause()} />}
-        <Button key="band:next" label="⏭" plain onPress={() => app.narrationNext()} />
-        <Button key="band:stop" label="■ stop" plain onPress={() => app.narrationStop()} />
+        {n.isEnded === true ? (
+          <Box flexDirection="row" columnGap={1}>
+            <Button key="band:replay" label="↻ replay" plain onPress={() => app.narrationReplay()} />
+            <Button key="band:close" label="✕ close" plain onPress={() => void app.narrationClose()} />
+          </Box>
+        ) : (
+          <Box flexDirection="row" columnGap={1}>
+            <Button key="band:prev" label="⏮" plain onPress={() => app.narrationPrev()} />
+            {n.isPaused
+              ? <Button key="band:resume" label="▶ resume" plain onPress={() => app.narrationResume()} />
+              : <Button key="band:pause" label="⏸ pause" plain onPress={() => app.narrationPause()} />}
+            <Button key="band:next" label="⏭" plain onPress={() => app.narrationNext()} />
+            <Button key="band:stop" label="■ stop" plain onPress={() => app.narrationStop()} />
+            <Button key="band:close" label="✕" plain onPress={() => void app.narrationClose()} />
+          </Box>
+        )}
         <Text dimColor>{step !== undefined && step.ref.path !== '' ? ` ${step.ref.path}` : ''}</Text>
       </Box>
     </Box>
@@ -159,9 +169,9 @@ function narrationBox(k: Kit): RenderElement | null {
   const lines = step?.code?.split('\n') ?? []
   return (
     <Box flexDirection="column" marginTop={1} borderStyle="round" borderColor="suggestion" paddingX={1}>
-      <Text color="suggestion" weight="bold" wrap="truncate-end">{n.isPaused ? '⏸ ' : n.isPreparing === true ? `${spin(k.s.frame)} ` : '▶ '}{n.title}</Text>
+      <Text color="suggestion" weight="bold" wrap="truncate-end">{n.isEnded === true ? '■ ' : n.isPaused ? '⏸ ' : n.isPreparing === true ? `${spin(k.s.frame)} ` : '▶ '}{n.title}</Text>
       <Text dimColor>
-        {n.index < 0 ? 'starting' : `part ${n.index + 1} of ${n.steps.length}`}
+        {n.isEnded === true ? `finished · back at part 1 of ${n.steps.length}` : n.index < 0 ? 'starting' : `part ${n.index + 1} of ${n.steps.length}`}
         {n.queued > 0 ? ` · ${n.queued} more waiting` : ''}
       </Text>
       {n.isPreparing === true && !n.isPaused && <Text color="warning">{spin(k.s.frame)} generating audio… it plays as soon as it is ready</Text>}
@@ -173,12 +183,22 @@ function narrationBox(k: Kit): RenderElement | null {
         <Code source={keepBlank(lines.slice(0, 18).join('\n'))} path={step!.ref.path} startLine={step!.codeStart ?? step!.ref.line ?? 1} wrap="truncate-end" />
       )}
       <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
-        <Button key="say:prev" label="⏮" onPress={() => app.narrationPrev()} />
-        {n.isPaused
-          ? <Button key="say:resume" label="▶ resume" onPress={() => app.narrationResume()} />
-          : <Button key="say:pause" label="⏸ pause" onPress={() => app.narrationPause()} />}
-        <Button key="say:next" label="⏭" onPress={() => app.narrationNext()} />
-        <Button key="say:stop" label="■ stop" onPress={() => app.narrationStop()} />
+        {n.isEnded === true ? (
+          <Box flexDirection="row" columnGap={1}>
+            <Button key="say:replay" label="↻ replay" onPress={() => app.narrationReplay()} />
+            <Button key="say:close" label="✕ close" onPress={() => void app.narrationClose()} />
+          </Box>
+        ) : (
+          <Box flexDirection="row" columnGap={1}>
+            <Button key="say:prev" label="⏮" onPress={() => app.narrationPrev()} />
+            {n.isPaused
+              ? <Button key="say:resume" label="▶ resume" onPress={() => app.narrationResume()} />
+              : <Button key="say:pause" label="⏸ pause" onPress={() => app.narrationPause()} />}
+            <Button key="say:next" label="⏭" onPress={() => app.narrationNext()} />
+            <Button key="say:stop" label="■ stop" onPress={() => app.narrationStop()} />
+            <Button key="say:close" label="✕" onPress={() => void app.narrationClose()} />
+          </Box>
+        )}
       </Box>
     </Box>
   )

@@ -61,6 +61,7 @@ const COMMANDS: { name: string; description: string; argumentHint?: string }[] =
   { name: 'inloop-style', description: 'Written explanations with code, or spoken ones that show the code as they go', argumentHint: '<written|spoken>' },
   { name: 'inloop-speak', description: 'Same as /inloop-style spoken (on) or written (off)', argumentHint: '<on|off>' },
   { name: 'inloop-brief', description: "Keep the coding agent's own replies short while inloop explains changes", argumentHint: '<on|off>' },
+  { name: 'inloop-reload', description: 'Restart inloop if it seems to miss changes: looks at the project again and explains what it missed' },
   { name: 'inloop-voice', description: 'List voices, choose one, or set up the natural Kokoro voice', argumentHint: '[setup | voice | auto]' },
 ]
 
@@ -269,7 +270,9 @@ export const register: Register = on => {
     // Claude Code gives this hook about 1.5 s and cuts model calls off then, so no
     // explanation is started here: one would only end as a failed card. (A headless
     // run already waited for its explanations when its turn completed.)
-    app?.stop()
+    // After /clear or a resume the process goes on with no session.start, so inloop
+    // starts over rather than staying stopped; at a real exit that costs nothing.
+    app?.restart()
     return next(e)
   })
 
@@ -324,6 +327,8 @@ export const register: Register = on => {
   // The same, as a note beside each prompt the person types (the model never shows it).
   on('prompt.submit', async ($, e, next) => {
     if (app === null || e.command !== undefined || e.isMeta === true) return next(e)
+    // After /clear the conversation's state starts fresh: settings and the feed come back first.
+    await app.ensureState().catch(() => undefined)
     app.markPrompt()
     if (!(await app.isBriefActive())) return next(e)
     return next({ ...e, context: [...(e.context ?? []), BRIEF_REMINDER] })
@@ -615,6 +620,19 @@ export const register: Register = on => {
     await app.setSettings({ style: isOn ? 'spoken' : 'written' })
     if (isOn) app.detach(() => app!.speak('inloop will talk you through each change, showing the code as it goes.'))
     return { text: isOn ? 'Spoken style on.' : 'Written style (speech off).' }
+  }).catch(() => ({ text: 'that command failed; see the inloop pane for details.' }))
+
+  on('command.run', { command: 'inloop-reload' }, async () => {
+    if (app === null) return { text: 'inloop has not started in this session; run /reload-plugins.' }
+    const live = app
+    let said = ''
+    return finish(
+      async () => {
+        said = await live.reload()
+        if (!isHeadless) live.host.toast(said, { timeoutMs: 6000 })
+      },
+      async () => said,
+    )
   }).catch(() => ({ text: 'that command failed; see the inloop pane for details.' }))
 
   on('command.run', { command: 'inloop-brief' }, async ($, e) => {

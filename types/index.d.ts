@@ -179,6 +179,8 @@ export type InloopNarration = {
   queued: number
   /** The voice is still rendering the part to read (Kokoro can take a few seconds). */
   isPreparing?: boolean
+  /** Finished or stopped: kept loaded at part 1, to replay (the audio already made) or close. */
+  isEnded?: boolean
 }
 
 /** One file's net change since the person's last prompt. */
