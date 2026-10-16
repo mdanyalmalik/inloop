@@ -42,6 +42,12 @@ export type World = {
   kokoro: boolean
   /** Kokoro clip paths, to the text each was rendered from. */
   clips: Map<string, string>
+  /** With `kokoro` (uv present): whether its model is downloaded yet. */
+  isKokoroInstalled: boolean
+  /** How many times setup ran; while `isSetupHeld`, it waits for releaseSetup() (a long download). */
+  setupRuns: number
+  isSetupHeld: boolean
+  releaseSetup: () => void
   /** While true, Kokoro renders nothing until releaseRender() (a slow first render). */
   isRenderHeld: boolean
   releaseRender: () => void
@@ -80,6 +86,10 @@ export function world(
     root: ROOT,
     kokoro: false,
     clips: new Map(),
+    isKokoroInstalled: true,
+    setupRuns: 0,
+    isSetupHeld: false,
+    releaseSetup: () => undefined,
     isRenderHeld: false,
     releaseRender: () => undefined,
     pane: 'shown',
@@ -98,6 +108,8 @@ export function world(
     return next(e)
   })
   w.files.set('.env', 'JWT_SECRET=never-read-this-value')
+  // Most tests read explanations: they start written, as a person who chose it would. Spoken is the default.
+  w.stored.set('settings', { style: 'written' })
   for (const [key, value] of Object.entries(store)) w.stored.set(key, value)
   on('store.get', ($, e) => ({ value: structuredClone(w.stored.get(e.key)) }))
   on('store.set', ($, e) => {
@@ -125,7 +137,7 @@ export function world(
     throw new Error('inloop must never write')
   })
   on('fs.list', () => ({ value: [] }))
-  on('process.run', ($, e) => {
+  on('process.run', async ($, e) => {
     const argv = [...e.argv]
     w.gitCalls.push(argv)
     const args = argv.filter(a => a !== '-c' && a !== 'core.quotepath=off' && a !== '--no-pager').slice(1)
@@ -134,8 +146,13 @@ export function world(
     if (argv[0] === 'uv') {
       if (!w.kokoro) return ok('', 127, 'uv: not found')
       if (argv[1] === '--version') return ok('uv 0.8.0\n')
-      if (argv.includes('status')) return ok('{"ready": true}\n')
-      if (argv.includes('setup')) return ok('ready\n')
+      if (argv.includes('status')) return ok(`{"ready": ${w.isKokoroInstalled}}\n`)
+      if (argv.includes('setup')) {
+        w.setupRuns++
+        if (w.isSetupHeld) await new Promise<void>(resolve => { w.releaseSetup = resolve })
+        w.isKokoroInstalled = true
+        return ok('ready\n')
+      }
     }
     if (args[0] === 'rev-parse' && args[1] === '--is-inside-work-tree') return ok('true\n')
     if (args[0] === 'ls-files') return ok([...w.files.keys()].join('\n') + '\n')

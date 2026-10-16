@@ -117,6 +117,8 @@ export type InloopSettings = {
   briefAgent: boolean
   /** System voice to speak with; '' picks the best installed. */
   voice: string
+  /** Download the natural Kokoro voice in the background when a session starts, if it is not there yet. */
+  autoVoiceSetup: boolean
   /** Model for automatic change explanations. */
   autoModel: string
   /** Model for questions, flows and commits. */
@@ -203,6 +205,8 @@ export type InloopStatus = {
   lastError?: string
   /** Speech is being rendered and nothing is playing yet. */
   isPreparingAudio?: boolean
+  /** The natural voice is being downloaded and set up. */
+  isVoiceSettingUp?: boolean
 }
 
 declare module 'claude-code' {

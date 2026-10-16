@@ -65,7 +65,7 @@ export function needsBetterVoice(voices: readonly Voice[]): boolean {
 }
 
 export const VOICE_HELP =
-  'For the most natural voice (free, offline): run `/inloop-voice setup` to install Kokoro (~200 MB, once). Or download a Mac voice marked **Premium**: System Settings → Accessibility → Spoken Content → System voice → Manage Voices…'
+  'For the most natural voice (free, offline), inloop downloads Kokoro by itself (~200 MB, once) when [uv](https://docs.astral.sh/uv/) is installed; `/inloop-voice setup` starts it now. Or download a Mac voice marked **Premium**: System Settings → Accessibility → Spoken Content → System voice → Manage Voices…'
 
 /** Kokoro's voices worth offering (all built into its voice file), best first. */
 export const KOKORO_VOICES: readonly { id: string; label: string }[] = [

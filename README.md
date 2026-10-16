@@ -4,15 +4,19 @@
 
 inloop is a Claude Code plugin that runs beside the coding agent. While the agent edits your project, inloop watches each meaningful step and explains it in a pane next to the transcript. You never have to ask. You can also ask your own questions at any time: what happens when a button is clicked, where a value comes from, how login worked three months ago. inloop finds the code, traces the flow across files, and points at the exact lines.
 
-It only reads. It never edits files, runs your project's code, installs anything, or changes your git state, and its conversation is kept separate from the coding agent's.
+It only reads. It never edits files, runs your project's code, or changes your git state, and its conversation is kept separate from the coding agent's. The one thing it fetches is its natural voice, a one-time download into `~/.cache/inloop/` that you can turn off (see [Two styles](#two-styles-written-and-spoken)).
 
 ```
 ┌ transcript (the coding agent) ───────────────┐┌ inloop ──────────────────────────────┐
-│ ⏺ Update(server/auth/tokens.js)              ││ 1:▸Feed 2:Code 3:Flow 4:Ask …         │
-│   + function isTokenExpiringSoon(claims, s)  ││ ▾ Token expiry-soon check · 45s        │
-│   …                                          ││   concept: token expiration check     │
-│                                              ││   The agent added isTokenExpiring…    │
-│                                              ││   ↗ server/auth/tokens.js:18-22       │
+│ ⏺ Update(server/auth/tokens.js)              ││╭────────────────────────────────────╮│
+│   + function isTokenExpiringSoon(claims, s)  │││ Since your last prompt · 1 file    ││
+│   …                                          │││ server/auth/tokens.js +5 −0  18-22 ││
+│                                              ││╰────────────────────────────────────╯│
+│                                              ││ 1:▸Feed 2:Code 3:Flow 4:Ask …        │
+│                                              ││ ▾ Token expiry-soon check · 45s      │
+│                                              ││   concept: token expiration check    │
+│                                              ││   The agent added isTokenExpiring…   │
+│                                              ││   ↗ server/auth/tokens.js:18-22      │
 └──────────────────────────────────────────────┘└──────────────────────────────────────┘
 ```
 
@@ -35,13 +39,13 @@ Or, at the prompt: `/plugin marketplace add /path/to/inloop`, then `/plugin inst
 claude --plugin-dir /path/to/inloop
 ```
 
-Requirements: Claude Code 2.1.301 or newer (inloop uses the plugin mod API: function hooks, panes and `$.model`), and `git` for history features. Nothing else to install: no Node packages, no server.
+Requirements: Claude Code 2.1.301 or newer (inloop uses the plugin mod API: function hooks, panes and `$.model`), and `git` for history and change tracking. Nothing else to install: no Node packages, no server. The natural voice needs [`uv`](https://docs.astral.sh/uv/). Without it, explanations are spoken with a Mac voice.
 
 ## Run it during development
 
 ```bash
 claude plugin validate .        # manifest + hooks module, as the engine reads them
-claude plugin test .            # 60 tests: logic + engine-level (hooks, pane on terminal/desktop/mobile)
+claude plugin test .            # 62 tests: logic + engine-level (hooks, pane on terminal/desktop/mobile)
 claude --plugin-dir .           # a live session with inloop loaded
 ```
 
@@ -70,7 +74,7 @@ Above the tabs, a small **Since your last prompt** box lists every file changed 
 | **4 Ask** | Your conversation with inloop, separate from the coding agent. Includes the active scope and the revision being studied |
 | **5 History** | Explanations from all sessions, with bookmarks. Clear it, or clear everything except bookmarks |
 | **6 Git** | Search commits, select one, press a changed file for its diff (then **show file** for the whole file at that commit), explain it, compare two commits, or study the code as of a date or sha |
-| **7 Settings** | Mode, focus topic, depth, models, how much is explained, grouping delay, speech, and model usage this session |
+| **7 Settings** | Mode, focus topic, depth, models, how much is explained, grouping delay, style (written or spoken), voice (with **test voice** and *install natural voice*), whether the natural voice downloads automatically, brief agent replies, and model usage this session |
 
 The ask field at the bottom of every tab takes a question at any time, including while the agent is working.
 
@@ -134,14 +138,16 @@ History is read straight from git's object store (`git show <rev>:<path>`, `git 
 
 ### Two styles: written and spoken
 
-Every explanation is a short summary plus a few **parts**, each a sentence or two with the code it's about. The code is captured when the explanation is made, so later edits don't shift it. You choose how they reach you (`/inloop-style written|spoken`, or Settings → *style*):
+Every explanation is a short summary plus a few **parts**, each a sentence or two with the code it's about. The code is captured when the explanation is made, so later edits don't shift it. You choose how they reach you (`/inloop-style written|spoken`, or Settings → *style*). Spoken is the default; a style you chose is kept across sessions.
 
-- **Written** (default): the newest explanation opens by itself in the Feed, with every part's code snippet inline (`↗` opens the full file). An explanation you opened yourself stays open; new ones don't push it closed.
-- **Spoken**: each new explanation is read aloud part by part, and a box pinned at the top of the panel shows the code for the part being read, with **⏮ ⏸ ⏭ ■** controls that take effect immediately, even mid-sentence. Up to three explanations wait their turn. If the panel is hidden behind another panel (such as Claude Code's Diff panel) or you closed it, the same narration and code show in the strip above the prompt. inloop never reopens a panel you closed; `/inloop` brings it back. Any explanation can also be played with **▶ listen**.
+- **Written**: the newest explanation opens by itself in the Feed, with every part's code snippet inline (`↗` opens the full file). An explanation you opened yourself stays open; new ones don't push it closed.
+- **Spoken** (default): each new explanation is read aloud part by part, and a box pinned at the top of the panel shows the code for the part being read, with **⏮ ⏸ ⏭ ■** controls that take effect immediately, even mid-sentence. Up to three explanations wait their turn. If the panel is hidden behind another panel (such as Claude Code's Diff panel) or you closed it, the same narration and code show in the strip above the prompt. inloop never reopens a panel you closed; `/inloop` brings it back. Any explanation can also be played with **▶ listen**.
 
-**The voice is Kokoro** (Kokoro-82M, Apache-2.0), a free neural voice that runs locally and sounds close to a person. Set it up once with `/inloop-voice setup` (or Settings → *install natural voice*). That downloads ~200 MB into `~/.cache/inloop/` and runs through `uv` in an isolated environment, with nothing installed system-wide. After setup it runs offline, and nothing is sent anywhere. Every part of an explanation is rendered ahead in one go, so there is no gap between parts, and each part plays as a clip that stop, pause and skip cut off at once. Without Kokoro (or without `uv`), inloop uses the Mac's best installed voice instead. Kokoro can take several seconds to start, so while a part is still being rendered the narration box shows **⟳ generating audio…**, and so does the status line. Playback starts as soon as the audio is ready.
+You can switch styles at any time, even mid-explanation. Switching to written stops the voice at once, including a confirmation still being said, and leaves the explanation open to read. Switching back to spoken reads the next change aloud from its start.
 
-Each spoken part is one short plain sentence that doesn't read out code names, paths or line numbers, since the code is on screen. Choose a voice in Settings (with **test voice**) or with `/inloop-voice`, which lists the Kokoro and Mac voices; `/inloop-voice heart`, `/inloop-voice george`, or `/inloop-voice auto`. Only one thing speaks at a time: a confirmation never plays over an explanation.
+**The voice is Kokoro** (Kokoro-82M, Apache-2.0), a free neural voice that runs locally and sounds close to a person. It sets itself up: the first time a session starts on a machine with `uv`, inloop downloads it in the background (~200 MB, once) into `~/.cache/inloop/`. It runs through `uv` in an isolated environment, with nothing installed system-wide. While it downloads, the pane says so and the Mac voice speaks; when it's ready, a toast says so and Kokoro takes over. Sessions starting at the same time share one download. To set it up by hand instead, choose Settings → *natural voice: only when I install it*, then use `/inloop-voice setup` or **install natural voice**. inloop doesn't install `uv` itself, since that means running an installer on your machine. After setup Kokoro runs offline, and nothing is sent anywhere. Every part of an explanation is rendered ahead in one go, so there is no gap between parts, and each part plays as a clip that stop, pause and skip cut off at once. Without Kokoro (or without `uv`), inloop uses the Mac's best installed voice instead. Kokoro can take several seconds to start, so while a part is still being rendered the narration box shows **⟳ generating audio…**, and so does the status line. Playback starts as soon as the audio is ready.
+
+Each spoken part is one short plain sentence that doesn't read out code names, paths or line numbers, since the code is on screen. Choose a voice in Settings (with **test voice**) or with `/inloop-voice`, which lists the Kokoro and Mac voices; `/inloop-voice heart`, `/inloop-voice george`, or `/inloop-voice auto`. Only one thing speaks at a time: a confirmation never plays over an explanation. Voice files live in `~/.cache/inloop/` (the model in `kokoro/`, clips in `tts/`, which are deleted after an hour).
 
 Long work started from the panel (questions, follow-ups, narration, commit explanations) runs on inloop's own timer, so a button press answers at once. That keeps Claude Code's 10-second limit on presses from cutting an answer or the voice short.
 
@@ -175,7 +181,7 @@ Mod commands can't contain `:`, so they're named `/inloop-…`. Every one runs i
 | `/inloop-style written\|spoken` | Written explanations with code, or spoken ones that show the code as they go |
 | `/inloop-speak on\|off` | Same as spoken / written |
 | `/inloop-brief on\|off` | Keep the coding agent's replies short while inloop is active |
-| `/inloop-voice [name \| auto]` | List the voices on this machine, or choose one |
+| `/inloop-voice [setup \| name \| auto]` | List the voices on this machine, choose one, or set up the natural Kokoro voice |
 
 Headless use works too, which is handy for scripts:
 
@@ -195,7 +201,10 @@ src/explain.ts                   prompts, change cards, the read-only investigat
 src/repo.ts                      read-only project and git access, per-revision index cache
 src/diff.ts, src/batcher.ts      unified diffs; edit grouping, hashing, LRU caches
 src/security.ts                  path validation, sensitive files, secret masking, safe git arguments
-src/ui.tsx                       the pane (terminal, desktop with SVG flows, mobile fallback)
+src/ui.tsx                       the pane (terminal, desktop with SVG flows, mobile fallback), the changes box, narration
+src/voices.ts                    system voice listing and ranking, Kokoro voices, which engine speaks
+src/host.ts                      the small interface the controller uses to reach Claude Code
+voice/inloop_tts.py              the Kokoro voice: a uv inline script (setup, status, synth)
 types/index.d.ts                 state contract
 tests/                           logic.test.ts, engine.test.tsx (+ a virtual project harness)
 scripts/make-demo-app.sh         the demo app with dated history
@@ -207,23 +216,23 @@ It's a single mod: one hooks module, no MCP server, no extra process, no web ser
 
 ## Security and privacy
 
-- **Read-only by construction.** The module has no file-write call at all (validate lists its calls), and the only processes it runs are `git` with read-only subcommands and `say -v '?'` (to list voices), passed as an argument list with no shell. The model never gets tools. It can only ask for inloop's own read-only lookups.
+- **Read-only by construction.** The module has no file-write call at all (validate lists its calls). The only processes it runs are `git` with read-only subcommands, and for speech `say`, `afplay` and `uv` running inloop's own `voice/inloop_tts.py`. All are passed as an argument list with no shell. The voice script writes only under `~/.cache/inloop/`, and reaches the network only to set the voice up (automatically on first start, or with `/inloop-voice setup`): `uv` fetches the script's Python packages and the script downloads the model from its GitHub release. After that it runs with `--offline`. The model never gets tools. It can only ask for inloop's own read-only lookups.
 - **Never executes repository code** to explain it.
 - **Sensitive files are never read:** `.env*`, keys and certificates, `id_rsa*`, `.npmrc`/`.netrc`/`.git-credentials`, `.aws/`/`.ssh/`, `credentials`/`secrets.*`, service-account JSON, `.git/`. They're also excluded from git greps and patches. Edits to them are noticed but never read.
 - **Secrets are masked** before any text goes to the model: common key formats, private keys, JWT-like strings, and quoted values assigned to names like `password`, `token` or `apiKey`. References like `process.env.X` are kept.
 - **Untrusted content stays data.** Code, comments, commit messages and file names go to the model inside `<repo_data>` tags, with an instruction never to follow instructions found there.
 - **Paths are validated:** anything outside the project root, or escaping it with `..`, is refused. Revisions and dates are checked before they reach git, so nothing option-like and no ranges get through.
-- **Where data goes:** code excerpts go only to the session's own Claude model, through Claude Code's client and credentials. Explanation history and settings stay in Claude Code's local plugin store (`~/.claude/plugins/store/`), outside your project. Clear them from the History tab.
+- **Where data goes:** code excerpts go only to the session's own Claude model, through Claude Code's client and credentials. Explanation history and settings stay in Claude Code's local plugin store (`~/.claude/plugins/store/`), outside your project. Clear them from the History tab. Spoken text is rendered on your machine and never sent anywhere.
 - **Off switch:** `/inloop-mode paused`, or disable the plugin.
 
 **Cost.** In auto mode a card costs one small-model call per meaningful step, and trivial steps cost nothing. A question costs up to five calls to the questions model (Sonnet by default). Settings shows how many calls inloop has made this session and how many tokens they used. Set *automatic explanations: static analysis only* for zero background model use.
 
 ## Testing
 
-`claude plugin test .` runs 60 tests in the engine's own test kit:
+`claude plugin test .` runs 62 tests in the engine's own test kit:
 
-- **Logic** (26): path, sensitive-file, revision and secret rules; symbol, route, React and HTTP-call extraction; significance scoring; focus matching; diffs; batching windows; the demo app's login flow, from the button to the database, with every node checked against its source line and every edge's confidence; callers; natural-language search; the first commit's index (sessions, no JWT); JSON recovery; static cards; voice listing, ranking and choice; spoken-text cleanup.
-- **Engine** (22): the plugin loaded by the engine over a virtual project, with a scripted model:
+- **Logic** (28): path, sensitive-file, revision and secret rules; symbol, route, React and HTTP-call extraction; significance scoring; focus matching; diffs; batching windows; the demo app's login flow, from the button to the database, with every node checked against its source line and every edge's confidence; callers; natural-language search; the first commit's index (sessions, no JWT); JSON recovery; static cards; voice listing, ranking and choice; spoken-text cleanup.
+- **Engine** (34): the plugin loaded by the engine over a virtual project, with a scripted model:
   - an agent `Edit` produces a card with nobody asking, the tool result is untouched, and the prompt is framed as untrusted data and never contains the `.env` secret
   - three edits across files become one card
   - comment-only edits cost nothing
@@ -236,16 +245,22 @@ It's a single mod: one hooks module, no MCP server, no extra process, no web ser
   - the mobile fallback
   - a reload doesn't double-process edits
   - a burst of edits stays bounded
-  - back: explanation → code → followed call → back → back returns to the expanded explanation; back with no history returns to the Feed; scrolling stops once the file's end is on screen
+  - tabs are independent; inside the Code tab, **◀ previous** steps back after following a caller or callee; scrolling stops once the file's end is on screen
+  - each automatic explanation lists its files, lines added and removed and the ranges changed, and opens a file's diff
+  - files changed by a shell command are explained like edits; uncommitted work from before the session is never explained; the end of a turn catches changes no tool reported
+  - a session in the home folder explains nothing there, and says why
+  - a question about the whole repo starts from its big picture
   - written style: the newest explanation opens by itself with each part's code
   - spoken style: each part is read with its code pinned on screen, using the best voice, without paths
   - spoken controls cut speech off: next skips a part, pause and resume repeat it, stop ends
+  - with Kokoro set up, parts are rendered by Kokoro and played as clips that stop at once
   - with the panel hidden, the narration and code show above the prompt
   - the coding agent is asked for brief replies only while inloop is active (panel open or spoken style, auto mode, brief on), never in headless runs
   - the narrow dock (30 columns) uses short tab labels and leaves paths out of the flow tree
   - the **Since your last prompt** box counts edit-tool and shell changes net, opens a file's diff, and starts over with each prompt
   - switching style mid-explanation: written silences at once (a confirmation too), spoken picks up with the next change
   - while Kokoro is still rendering, the pane and status line say audio is being generated
+  - out of the box the style is spoken and the natural voice downloads in the background once (a request meanwhile joins it; the Mac voice speaks until it's ready); with the automatic download turned off, nothing is downloaded
 
 Verified by hand with real Claude Code 2.1.301, the real model and real git, on the demo app:
 
@@ -255,7 +270,9 @@ Verified by hand with real Claude Code 2.1.301, the real model and real git, on 
 - **Flow.** *"What happens when a user logs in"* gave the full traced flow plus an explanation. The coding agent's model took no turns (`num_turns: 0`).
 - **Commits.** Explaining a commit, comparing two revisions about a topic, and *"three months ago"* (picked `930c0a1`, 2026‑07‑16, and read only that revision). HEAD, branch, uncommitted diff, index and stash were byte-identical before and after.
 - **Interactive pane** in a real terminal: the feed card appeared unprompted, cards expand, the flow tree renders, a node click explains the step and highlights lines 5–13 in the viewer, the Git tab lists commits and explains one.
-- **Speech:** `/inloop-voice` listed this Mac's voices without the novelty ones, and choosing *Daniel* made `$.audio.speak` run `say -v "Daniel (English (UK))"`. The audio itself wasn't checked by ear.
+- **Speech:** `/inloop-voice` listed this Mac's voices without the novelty ones, and choosing *Daniel* ran `say -v "Daniel (English (UK))"`. Kokoro set up through `uv` on an M4 Mac and narrated explanations with `afplay`. The first part showed **⟳ generating audio…** for about 8 s, then played.
+- **Shell changes and the changes box:** the agent appended a function to `server/app.js` with one `printf … >>` command and no edit tool. The box showed `server/app.js +5 −0 lines 18-22`, and an explanation with the same changes list followed about 9 s later.
+- **Switching styles live:** switching to written mid-narration stopped `afplay` at once and left the card open. Switching back to spoken started speaking again.
 - **Styles, live:** spoken mode in a real terminal narrated *part 2 of 3* with exactly the lines discussed. With the panel closed, it showed in the strip above the prompt, and **■ stop** killed the running `say` process.
 - **Quieter agent:** the same request got a 115-word reply without the brief instruction and about 60 words with it. The reply still flagged the untested code and the two surprising behaviours.
 - **Settings persist across sessions**, and the marketplace install works (checked in a throwaway config directory).
@@ -267,7 +284,8 @@ Verified by hand with real Claude Code 2.1.301, the real model and real git, on 
 - **No "open in editor" button.** The plugin API offers no call to open a file in the IDE, so code is shown in inloop's own read-only viewer.
 - **Slash commands leave one short line in the transcript.** In interactive sessions, `/inloop-*` commands print a one-line acknowledgement that says it is not a request for the coding agent. Questions typed in the pane's field leave nothing in the transcript.
 - **The flow diagram** is a tree in the terminal (the terminal draws no SVG) and an SVG on desktop. There's no zoom: large flows stop at 22–24 steps with a note, and you can trace further from any step.
-- **Speech input is not part of inloop.** Speech output is optional and uses the Mac's own voices. How good it sounds depends on which voices are installed (see Speech). Other platforms use their own synthesizer, without a voice picker.
+- **Speech input is not part of inloop.** Speech output is optional. The natural Kokoro voice needs `uv` and a one-time ~200 MB download (automatic), and plays through `afplay` (macOS). Without it, inloop uses the Mac's own voices, whose quality depends on which are installed. Other platforms use their own synthesizer, without a voice picker.
+- **The changes box scrolls with the pane.** Claude Code can't stack a second pane above another, so the box sits at the top of inloop's pane and scrolls away if you scroll the whole pane. It counts changes Claude makes, and also any you make yourself in files Claude touched since the prompt.
 - History is capped at 150 explanations (bookmarks first) to stay within the plugin store's 4 MiB.
 
 ## Troubleshooting
@@ -275,7 +293,10 @@ Verified by hand with real Claude Code 2.1.301, the real model and real git, on 
 - **No pane.** Widen the terminal, or use the fullscreen layout, or run `/inloop` (it opens at any width). Commands work without the pane, and so do toasts and the status line (`inloop: auto · 3 explained`).
 - **No cards appear.** Check the mode (`/inloop-settings`). Raise sensitivity in Settings (*explain edits from significance* → 1). Edits to lockfiles, build output, docs-only and comment-only changes are skipped on purpose. In focus mode, only on-topic steps get cards.
 - **A card says "model explanation unavailable".** The model call failed, for example because of rate limits or a model your account can't use. The static card is still shown. Change models in Settings, or choose *static analysis only*.
-- **"not a git repository".** History features need git. Everything else works without it.
+- **"not a git repository".** History features, the changes box for shell-made changes, and catching changes no edit tool reported all need git. Everything else works without it.
+- **Spoken explanations start slowly.** Kokoro loads its model for each explanation, which takes a few seconds (⟳ *generating audio…* shows meanwhile). Parts after the first are rendered ahead, so they play without a gap. For an instant start, choose a Mac voice with `/inloop-voice`.
+- **No sound.** Run `/inloop-voice` to see which voice is in use, and **test voice** in Settings. If Kokoro isn't set up, check that `uv` is installed, then restart the session or run `/inloop-voice setup`.
+- **Prefer reading.** `/inloop-style written` (kept across sessions).
 - **Checking what the plugin did.** `claude --debug-file /tmp/d.log --plugin-dir …` logs every `$` call inloop makes (git runs, model calls with timings, store writes). `claude plugin validate .` lists every call the module can make.
 
 ## Future improvements

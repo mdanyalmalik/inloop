@@ -178,6 +178,7 @@ export const register: Register = on => {
         }
         return { done, stop }
       },
+      hasUv: uv !== undefined,
       kokoroReady: async () => {
         if (uv === undefined) return false
         const checked = await $.process.run([uv, 'run', '--offline', '--quiet', '--script', ttsScript, 'status'], { timeoutMs: 60_000 }).catch(() => undefined)

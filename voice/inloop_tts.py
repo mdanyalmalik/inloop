@@ -18,6 +18,11 @@ import sys
 import time
 import urllib.request
 
+try:
+    import fcntl
+except ImportError:  # Windows: no file locks; a lone session sets up fine without one.
+    fcntl = None
+
 CACHE = os.path.join(os.path.expanduser("~"), ".cache", "inloop")
 MODEL_DIR = os.path.join(CACHE, "kokoro")
 AUDIO_DIR = os.path.join(CACHE, "tts")
@@ -35,6 +40,16 @@ def is_ready():
 
 def setup():
     os.makedirs(MODEL_DIR, exist_ok=True)
+    # Sessions starting together each try to set up: one downloads, the rest wait for it.
+    with open(os.path.join(MODEL_DIR, ".lock"), "w") as lock:
+        if fcntl is not None:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        download()
+    load()
+    print("ready", flush=True)
+
+
+def download():
     for name, least in FILES.items():
         target = os.path.join(MODEL_DIR, name)
         if os.path.exists(target) and os.path.getsize(target) >= least:
@@ -46,8 +61,6 @@ def setup():
         if os.path.getsize(partial) < least:
             raise SystemExit(f"{name}: download incomplete")
         os.replace(partial, target)
-    load()
-    print("ready", flush=True)
 
 
 def load():

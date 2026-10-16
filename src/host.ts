@@ -46,6 +46,8 @@ export type Host = {
   speak: (text: string, voice?: string) => Promise<unknown>
   /** Speaks `text` in a way that can be cut off: `done` settles when it ends or is stopped. */
   say: (text: string, voice?: string) => { done: Promise<void>; stop: () => void }
+  /** Whether `uv` (which runs the Kokoro voice) is on this machine. */
+  hasUv: boolean
   /** Whether the Kokoro voice is set up (checked offline). */
   kokoroReady: () => Promise<boolean>
   /** Downloads and checks Kokoro once; resolves with what the setup printed. */

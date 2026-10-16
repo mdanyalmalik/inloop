@@ -669,6 +669,47 @@ describe('styles', () => {
     await ui.unmount()
   })
 
+  test('out of the box: spoken style, and the natural voice downloads in the background once', { timeoutMs: 20_000 }, async ($, on) => {
+    const w = world(on, STEPPED)
+    w.stored.delete('settings')
+    w.kokoro = true
+    w.isKokoroInstalled = false
+    w.isSetupHeld = true
+    tools(on, w)
+    await start($)
+    await w.clock.advance(1)
+    expect(w.get('settings')?.style).toBe('spoken')
+    expect(w.setupRuns).toBe(1)
+    expect(w.get('status')?.isVoiceSettingUp).toBe(true)
+    const ui = await $.ui.mount({ plugin: 'inloop', surface: 'terminal', component: 'Pane', requestId: 'inloop', props: PANE_PROPS as never })
+    expect(await ui.find({ text: /downloading the natural voice/ })).toBeDefined()
+    // Asking for it meanwhile joins the download under way.
+    await $.command.run({ command: 'inloop-voice', args: 'setup' } as never)
+    await w.clock.advance(1)
+    expect(w.setupRuns).toBe(1)
+    // Until it is ready, a change is read by the Mac voice.
+    await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
+    await w.clock.advance(10_000)
+    expect(w.said.at(-1)?.voice).toBe('Zoe (Premium)')
+    await ui.press({ key: 'say:stop' })
+    w.releaseSetup()
+    await w.clock.advance(1)
+    expect(w.get('status')?.isVoiceSettingUp).toBe(false)
+    expect(w.toasts.some(t => /natural voice \(Kokoro\) is ready/.test(t))).toBe(true)
+    expect(await ui.find({ text: /downloading the natural voice/ })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('a person who turned the automatic download off is never downloaded for', async ($, on) => {
+    const w = world(on, undefined, { settings: { autoVoiceSetup: false } })
+    w.kokoro = true
+    w.isKokoroInstalled = false
+    tools(on, w)
+    await start($)
+    await w.clock.advance(1)
+    expect(w.setupRuns).toBe(0)
+  })
+
   test('while Kokoro is still rendering, the pane and status line say audio is being generated', { timeoutMs: 20_000 }, async ($, on) => {
     const w = world(on, STEPPED)
     w.kokoro = true

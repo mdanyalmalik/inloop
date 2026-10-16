@@ -230,6 +230,9 @@ export async function renderPane(k: Kit): Promise<RenderElement> {
       )}
       {status.busy !== null && tab !== 'ask' && <Text color="suggestion">⟳ {status.busy}</Text>}
       {status.isPreparingAudio === true && k.s.narration === null && <Text color="warning">⟳ generating audio…</Text>}
+      {status.isVoiceSettingUp === true && (
+        <Text dimColor wrap="truncate-end">⟳ downloading the natural voice (one time, ~200 MB); the Mac voice speaks until it is ready</Text>
+      )}
       {status.lastError !== undefined && status.busy === null && (
         <Box flexDirection="row" columnGap={1}>
           <Text color="error" wrap="truncate-end">! {status.lastError}</Text>
@@ -1001,6 +1004,16 @@ async function settingsTab(k: Kit): Promise<RenderElement> {
         onSelect={(v: string) => app.setSettings({ style: v as typeof s.style })}
       />
       <Select
+        key="set:autovoice"
+        label="natural voice "
+        value={s.autoVoiceSetup ? 'auto' : 'manual'}
+        options={[
+          { value: 'auto', label: 'download automatically when missing (~200 MB, once)' },
+          { value: 'manual', label: 'only when I install it' },
+        ]}
+        onSelect={(v: string) => app.setSettings({ autoVoiceSetup: v === 'auto' })}
+      />
+      <Select
         key="set:brief"
         label="coding agent's replies "
         value={s.briefAgent ? 'brief' : 'normal'}
@@ -1022,7 +1035,7 @@ async function settingsTab(k: Kit): Promise<RenderElement> {
       />
       <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
         <Button key="set:testvoice" label="test voice" onPress={fire(k, () => app.speak('Here is how I sound when I explain a change to you.'))} />
-        {!app.isKokoroReady && (
+        {!app.isKokoroReady && k.s.status.isVoiceSettingUp !== true && (
           <Button key="set:kokoro" label="install natural voice (Kokoro)" onPress={fire(k, async () => app.host.toast(await app.setupKokoro()))} />
         )}
         <Button key="set:reloadvoices" label="reload voices" plain onPress={fire(k, () => app.refreshVoices().then(() => app.host.toast(`using ${describePlan(app.voicePlan(s.voice))}`)))} />

@@ -85,7 +85,7 @@ export class App {
     const history = (await this.host.storeGet('history')) as InloopCard[] | undefined
     if (Array.isArray(history)) await this.host.state.history.update(() => history)
     await this.snapshotBaseline().catch(() => undefined)
-    void this.refreshVoices()
+    this.detach(() => this.prepareVoice())
     await this.refreshStatus()
   }
 
@@ -193,6 +193,7 @@ export class App {
     if (status.busy !== null) parts.push(status.busy)
     else if (status.pendingChanges > 0) parts.push('watching edits…')
     if (status.isPreparingAudio === true) parts.push('generating audio…')
+    if (status.isVoiceSettingUp === true) parts.push('setting up the natural voice…')
     this.host.status(parts.join(' · '))
   }
 
@@ -502,17 +503,40 @@ export class App {
     return planVoice(setting, this.isKokoroReady, this.voices)
   }
 
-  /** Installs Kokoro (one download), then makes it the voice. */
-  async setupKokoro(): Promise<string> {
-    await this.setBusy('installing the Kokoro voice (one-time download)…')
-    try {
-      const result = await this.host.kokoroSetup()
-      await this.refreshVoices()
-      if (!this.isKokoroReady) return `Kokoro could not be set up: ${result.text.trim().split('\n').pop() ?? 'unknown error'}`
-      return 'Kokoro is set up and is now the voice.'
-    } finally {
-      await this.setBusy(null)
+  private voiceSetup: Promise<string> | null = null
+
+  /**
+   * At start: finds the voices, and when the natural voice is missing, sets it up
+   * in the background (a one-time download). The Mac's voice speaks meanwhile.
+   */
+  async prepareVoice(): Promise<void> {
+    await this.refreshVoices()
+    const settings = await this.settings()
+    if (this.isKokoroReady || !settings.autoVoiceSetup || this.isHeadless || !this.host.hasUv) return
+    const said = await this.setupKokoro()
+    if (this.isKokoroReady) this.host.toast(`inloop: ${said}`, { timeoutMs: 6000 })
+  }
+
+  /** Installs Kokoro (one download), then makes it the voice. One setup at a time. */
+  setupKokoro(): Promise<string> {
+    if (this.voiceSetup !== null) return this.voiceSetup
+    const run = async (): Promise<string> => {
+      if (!this.host.hasUv) return 'The natural voice needs uv (https://docs.astral.sh/uv/). Until then inloop uses the Mac voice.'
+      await this.host.state.status.update(s => ({ ...s, isVoiceSettingUp: true }))
+      await this.refreshStatus()
+      try {
+        const result = await this.host.kokoroSetup()
+        await this.refreshVoices()
+        if (!this.isKokoroReady) return `The natural voice could not be set up: ${result.text.trim().split('\n').pop() ?? 'unknown error'}`
+        return 'The natural voice (Kokoro) is ready and is now the voice.'
+      } finally {
+        await this.host.state.status.update(s => ({ ...s, isVoiceSettingUp: false }))
+        await this.refreshStatus()
+        this.voiceSetup = null
+      }
     }
+    this.voiceSetup = run()
+    return this.voiceSetup
   }
 
   /**
