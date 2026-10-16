@@ -62,7 +62,7 @@ inloop opens a pane docked beside the transcript when the terminal is wide enoug
 
 | Tab | What it shows |
 | --- | --- |
-| **1 Feed** | Explanations of the agent's work, newest first. Each card has: title, concept, explanation, `↗` code links, bookmark, go deeper, diff, flow, speak |
+| **1 Feed** | Explanations of the agent's work, newest first. Each card has: title, concept, a **changes** list (every file with lines added and removed and the line ranges changed; press one for its diff), the explanation with its code parts, bookmark, go deeper, diff, flow, listen |
 | **2 Code** | Read-only viewer: syntax-highlighted source with line numbers and the relevant lines marked, the revision shown (working tree or a commit), callers and callees with confidence, the functions in the file, and diffs |
 | **3 Flow** | A traced execution flow as a tree. Press a step to see where it is, an explanation of it, **open code**, and **how is it reached?** (the link from the step before). On desktop, also an SVG diagram |
 | **4 Ask** | Your conversation with inloop, separate from the coding agent. Includes the active scope and the revision being studied |
@@ -72,11 +72,11 @@ inloop opens a pane docked beside the transcript when the terminal is wide enoug
 
 The ask field at the bottom of every tab takes a question at any time, including while the agent is working.
 
-**◀ back** (top left, or `b` while the pane has focus) returns to the previous screen: from code to the explanation or flow step you opened it from, from a diff to its commit, and from code to code when you followed a caller or callee. With nothing to go back to, it returns to the Feed. While you're looking at an older commit, the top of the pane says **studying <sha>**, with **use current code** to return.
+The seven tabs are independent: each keeps its own state, so switching away and back finds it as you left it. Inside the Code tab, **◀ previous** steps back after you follow a caller, callee or symbol to another place in the code. While you're looking at an older commit, the top of the pane says **studying <sha>**, with **use current code** to return.
 
 ### Automatic explanations
 
-Every successful `Edit`, `Write`, `MultiEdit` or `NotebookEdit`, by the main agent or a subagent, is recorded after the tool has run. The hook adds about 15–30 ms per edit and never changes the tool's result. Edits are grouped into one **step** until the agent goes quiet (6 s by default), a step has run for 45 s, or the turn ends. Each step is analysed statically: new and changed functions, routes, dependencies, topics such as auth or database, and the callers of new code. Then it gets a significance score. A step that clears the threshold gets a card. Comment-only and whitespace edits, lockfiles, build output and binary files never get one. A step that was already explained (say an undo followed by a redo) is not explained twice.
+Every successful `Edit`, `Write`, `MultiEdit` or `NotebookEdit`, by the main agent or a subagent, is recorded after the tool has run. Changes made any other way are caught too: after each `Bash` command, and at the end of every turn, inloop asks git which files changed since it last saw them, so a script, `sed` or a formatter run by the agent is explained like an edit. Whatever was already uncommitted when the session started is your own work, and is never explained. The hook adds about 15–30 ms per edit and never changes the tool's result. Edits are grouped into one **step** until the agent goes quiet (6 s by default), a step has run for 45 s, or the turn ends. Each step is analysed statically: new and changed functions, routes, dependencies, topics such as auth or database, and the callers of new code. Then it gets a significance score. A step that clears the threshold gets a card. Comment-only and whitespace edits, lockfiles, build output and binary files never get one. A step that was already explained (say an undo followed by a redo) is not explained twice.
 
 Cards are written by a small model (Haiku by default) from the step's diff, the static facts, and the definitions of functions the new code calls. If that model call fails, or you choose **static analysis only**, the card is written from the analysis alone, with no model call.
 
@@ -92,6 +92,11 @@ Cards are written by a small model (Haiku by default) from the step's diff, the 
 Depth (`/inloop-depth beginner|intermediate|advanced`) changes the wording and level of detail, never the facts. Settings persist across sessions.
 
 ### Asking questions
+
+Answers are short by default: the direct answer first, about 120 words at most, written as connected prose rather than a list of facts, then up to three parts that point at the code (each adding a detail, not repeating the answer). A question about the whole project ("explain this repo", "what is this for") starts from its big picture: the README, the project manifest, the folder layout and recent commits. So the answer leads with what the project is for (inferred and said so, when nothing states it) before how it works.
+
+inloop only explains the project the session runs in. Started from your home folder (or any folder with no git repository and no project files), it says so instead of searching unrelated folders. The newest question and answer sit at the top of the Ask tab, with **simpler**, **more detail** and **▶ listen** right under the question. Earlier questions fold below; press one to reopen it. Answers stay out of the Feed, which holds the agent's changes, but are kept in History.
+
 
 Type in the pane's ask field, or use `/inloop <question>`. Examples:
 
@@ -132,13 +137,15 @@ Every explanation is a short summary plus a few **parts**, each a sentence or tw
 - **Written** (default): the newest explanation opens by itself in the Feed, with every part's code snippet inline (`↗` opens the full file). An explanation you opened yourself stays open; new ones don't push it closed.
 - **Spoken**: each new explanation is read aloud part by part, and a box pinned at the top of the panel shows the code for the part being read, with **⏮ ⏸ ⏭ ■** controls that take effect immediately, even mid-sentence. Up to three explanations wait their turn. If the panel is hidden behind another panel (such as Claude Code's Diff panel) or you closed it, the same narration and code show in the strip above the prompt. inloop never reopens a panel you closed; `/inloop` brings it back. Any explanation can also be played with **▶ listen**.
 
-Speech uses the Mac's own voices: free, offline, nothing recorded, nothing sent anywhere. inloop uses the best voice installed. You can also choose one in Settings (with **test voice**) or with `/inloop-voice`, which lists the voices on your machine; `/inloop-voice auto` goes back to the automatic choice. What's read leaves out file paths, line numbers and markdown, since the code is on screen.
+**The voice is Kokoro** (Kokoro-82M, Apache-2.0), a free neural voice that runs locally and sounds close to a person. Set it up once with `/inloop-voice setup` (or Settings → *install natural voice*). That downloads ~200 MB into `~/.cache/inloop/` and runs through `uv` in an isolated environment, with nothing installed system-wide. After setup it runs offline, and nothing is sent anywhere. Every part of an explanation is rendered ahead in one go, so there is no gap between parts, and each part plays as a clip that stop, pause and skip cut off at once. Without Kokoro (or without `uv`), inloop uses the Mac's best installed voice instead.
 
-**For a natural-sounding voice**, download a free Premium voice once: System Settings → Accessibility → Spoken Content → System voice → **Manage Voices…** → English → pick one marked **Premium**, for example *Zoe*, *Ava* or *Jamie*. inloop picks it up automatically. Run `/inloop-voice` or press **reload voices** in Settings if a session is already open.
+Each spoken part is one short plain sentence that doesn't read out code names, paths or line numbers, since the code is on screen. Choose a voice in Settings (with **test voice**) or with `/inloop-voice`, which lists the Kokoro and Mac voices; `/inloop-voice heart`, `/inloop-voice george`, or `/inloop-voice auto`. Only one thing speaks at a time: a confirmation never plays over an explanation.
+
+Long work started from the panel (questions, follow-ups, narration, commit explanations) runs on inloop's own timer, so a button press answers at once. That keeps Claude Code's 10-second limit on presses from cutting an answer or the voice short.
 
 ### A quieter coding agent
 
-While inloop is active, it asks the coding agent to keep its own replies short: a sentence or two on what it did, plus anything you need to act on (errors, failing or skipped tests, questions, decisions, next steps). It skips the walkthrough of the code, since inloop already explains it. "Active" means all of these:
+While inloop is active, it asks the coding agent to keep its own replies to at most two short sentences on what it did, plus anything you need to act on (errors, failing or skipped tests, questions, decisions). No code blocks, change lists or explanations of how the code works, since inloop already shows them, unless you explicitly ask for an explanation. It does this in two places: a section of the system prompt, and a one-line note attached (unseen) to each prompt you type, which the model weighs most. "Active" means all of these:
 - auto mode is on
 - the session is interactive
 - the inloop panel is open (even as a tab behind another panel), or the style is spoken

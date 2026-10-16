@@ -81,3 +81,83 @@ export function changedLines(diff: string): number[] {
   }
   return out
 }
+
+export type FileDiffSummary = {
+  path: string
+  added: number
+  removed: number
+  /** New-side line ranges the change touches, as [first, last]. */
+  ranges: [number, number][]
+  /** This file's hunks alone. */
+  hunks: string
+}
+
+/**
+ * Per file of a combined diff (`--- a/x` / `+++ b/x` headers before each file's
+ * hunks): lines added and removed, and the line ranges changed in the new file.
+ */
+export function summarizeDiff(combined: string): FileDiffSummary[] {
+  const out: FileDiffSummary[] = []
+  let current: FileDiffSummary | null = null
+  let body: string[] = []
+  let line = 0
+  let lastTouched = -2
+  let oldPath = ''
+  const close = () => {
+    if (current !== null) {
+      current.hunks = body.join('\n')
+      out.push(current)
+    }
+  }
+  const touch = (n: number) => {
+    if (current === null) return
+    const last = current.ranges[current.ranges.length - 1]
+    if (last !== undefined && n <= last[1] + 1) last[1] = Math.max(last[1], n)
+    else current.ranges.push([n, n])
+    lastTouched = n
+  }
+  for (const raw of combined.split('\n')) {
+    // Git's per-file preamble belongs to no hunk.
+    if (/^(diff --git |index [0-9a-f]|new file mode|deleted file mode|old mode|new mode|similarity index|rename (from|to) |Binary files )/.test(raw)) continue
+    // File headers only: a removed line that begins "-- " is no header.
+    const oldHeader = /^--- (?:a\/(.+)|\/dev\/null)$/.exec(raw)
+    if (oldHeader !== null) {
+      oldPath = oldHeader[1] ?? ''
+      continue
+    }
+    const newHeader = /^\+\+\+ (?:b\/(.+)|\/dev\/null)$/.exec(raw)
+    if (newHeader !== null) {
+      close()
+      current = { path: newHeader[1] ?? oldPath, added: 0, removed: 0, ranges: [], hunks: '' }
+      body = []
+      lastTouched = -2
+      continue
+    }
+    if (current === null) continue
+    body.push(raw)
+    const h = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(raw)
+    if (h !== null) {
+      line = Number(h[1])
+      continue
+    }
+    if (raw.startsWith('+')) {
+      current.added++
+      touch(line)
+      line++
+    } else if (raw.startsWith('-')) {
+      current.removed++
+      // A removal marks where it happened in the new file, once; right after
+      // added lines it is the other half of the same replacement.
+      if (lastTouched !== line && lastTouched !== line - 1) touch(Math.max(1, line))
+    } else {
+      line++
+    }
+  }
+  close()
+  return out
+}
+
+/** "18-24, 30" */
+export function formatRanges(ranges: readonly [number, number][]): string {
+  return ranges.slice(0, 4).map(([a, b]) => (a === b ? `${a}` : `${a}-${b}`)).join(', ') + (ranges.length > 4 ? ', …' : '')
+}

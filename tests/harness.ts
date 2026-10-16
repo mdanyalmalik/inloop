@@ -23,6 +23,8 @@ export const SAY_LISTING = [
 
 export type World = {
   files: Map<string, string>
+  /** The files as committed at HEAD. */
+  head: Map<string, string>
   prompts: { model: string; prompt: string; system: string }[]
   reads: string[]
   writes: string[]
@@ -32,8 +34,14 @@ export type World = {
   voicesUsed: (string | undefined)[]
   /** Each `say` started: its text and voice, and whether it was cut off. */
   said: { text: string; voice?: string; isCut: boolean }[]
-  /** Ends the piece being spoken, as if `say` reached its end. */
+  /** Ends the piece being spoken, as if `say` or `afplay` reached its end. */
   finishSpeech: () => void
+  /** The folder the session runs in. */
+  root: string
+  /** Whether a fake `uv` with Kokoro set up is on this machine. */
+  kokoro: boolean
+  /** Kokoro clip paths, to the text each was rendered from. */
+  clips: Map<string, string>
   /** The inloop pane: in front, open behind another panel, or closed. */
   pane: 'shown' | 'behind' | 'closed'
   /** Base system prompt sections the engine would compose. */
@@ -56,6 +64,7 @@ export function world(
 ): World {
   const w: World = {
     files: new Map(Object.entries(DEMO_HEAD)),
+    head: new Map(Object.entries(DEMO_HEAD)),
     prompts: [],
     reads: [],
     writes: [],
@@ -65,6 +74,9 @@ export function world(
     voicesUsed: [],
     said: [],
     finishSpeech: () => undefined,
+    root: ROOT,
+    kokoro: false,
+    clips: new Map(),
     pane: 'shown',
     sections: [{ id: 'intro', text: 'You are Claude Code.', scope: 'shared' }],
     gitCalls: [],
@@ -94,7 +106,9 @@ export function world(
   on('store.keys', () => ({ value: [...w.stored.keys()] }))
   const rel = (path: string) => (path.startsWith(ROOT + '/') ? path.slice(ROOT.length + 1) : path)
   on('session.start', ($, e) => ({ cwd: e.cwd }))
-  on('session.root', () => ({ value: ROOT }))
+  on('turn.complete', () => ({ text: '' }) as never)
+  on('env.get', () => ({ value: '/virtual/home' }))
+  on('session.root', () => ({ value: w.root }))
   on('fs.read', ($, e) => {
     w.reads.push(rel(e.path))
     const text = w.files.get(rel(e.path))
@@ -112,8 +126,28 @@ export function world(
     const args = argv.filter(a => a !== '-c' && a !== 'core.quotepath=off' && a !== '--no-pager').slice(1)
     const ok = (stdout: string, exitCode = 0, stderr = '') => ({ value: { exitCode, stdout, stderr, isStdoutTruncated: false, isStderrTruncated: false } })
     if (argv[0] === 'say') return ok(SAY_LISTING)
+    if (argv[0] === 'uv') {
+      if (!w.kokoro) return ok('', 127, 'uv: not found')
+      if (argv[1] === '--version') return ok('uv 0.8.0\n')
+      if (argv.includes('status')) return ok('{"ready": true}\n')
+      if (argv.includes('setup')) return ok('ready\n')
+    }
     if (args[0] === 'rev-parse' && args[1] === '--is-inside-work-tree') return ok('true\n')
     if (args[0] === 'ls-files') return ok([...w.files.keys()].join('\n') + '\n')
+    if (args[0] === 'status') {
+      const lines: string[] = []
+      for (const [path, text] of w.files) {
+        if (path === '.env') continue
+        if (!w.head.has(path)) lines.push(`?? ${path}`)
+        else if (w.head.get(path) !== text) lines.push(` M ${path}`)
+      }
+      for (const path of w.head.keys()) if (!w.files.has(path)) lines.push(` D ${path}`)
+      return ok(lines.join('\n') + (lines.length > 0 ? '\n' : ''))
+    }
+    if (args[0] === 'show' && (args[1] ?? '').startsWith('HEAD:')) {
+      const text = w.head.get((args[1] ?? '').slice(5))
+      return text === undefined ? ok('', 128, 'fatal: path not in HEAD') : ok(text)
+    }
     if (args[0] === 'grep') {
       const q = (args[args.indexOf('-e') + 1] ?? '').toLowerCase()
       const hits: string[] = []
@@ -147,8 +181,22 @@ export function world(
   // `say`: a piece is spoken until the test calls finishSpeech(), or until inloop cuts it off.
   on('process.spawn', async function* ($, e, next) {
     const argv = [...e.argv]
+    if (argv[0] === 'uv' && argv.includes('synth')) {
+      // Kokoro renders every text and prints each clip's path.
+      const texts = JSON.parse(e.input ?? '[]') as string[]
+      const voice = argv[argv.indexOf('synth') + 1]
+      for (const [i, text] of texts.entries()) {
+        const path = `/virtual/tts/${w.clips.size}-${i}.wav`
+        w.clips.set(path, `${voice}|${text}`)
+        yield { stream: 'stdout', text: `${path}\n` }
+      }
+      return { value: { code: 0, signal: null } }
+    }
     const v = argv.indexOf('-v')
-    const entry = { text: e.input ?? '', voice: v >= 0 ? argv[v + 1] : undefined, isCut: false }
+    const clip = argv[0] === 'afplay' ? w.clips.get(argv[1] ?? '') : undefined
+    const entry = clip !== undefined
+      ? { text: clip.split('|')[1] ?? '', voice: `kokoro:${clip.split('|')[0]}`, isCut: false }
+      : { text: e.input ?? '', voice: v >= 0 ? argv[v + 1] : undefined, isCut: false }
     w.said.push(entry)
     await new Promise<void>(resolve => {
       w.finishSpeech = resolve

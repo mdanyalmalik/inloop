@@ -38,7 +38,7 @@ import {
 } from './explain'
 import { enclosingSymbol } from './graph'
 import { Repo, RepoError } from './repo'
-import { parseVoices, pickVoice, type Voice } from './voices'
+import { parseVoices, pickVoice, planVoice, type Voice, type VoicePlan } from './voices'
 import { isNoise, isSensitive, toRelative } from './security'
 import { DEFAULT_SETTINGS } from './state'
 
@@ -48,6 +48,9 @@ const MAX_CARDS = 80
 const MAX_HISTORY = 150
 const MAX_QUEUED_BATCHES = 3
 const RECENT_KEEP_MS = 3 * 60 * 60 * 1000
+
+/** Pieces of speech played in turn; each can be cut off. */
+type Speaker = { play: (i: number) => Promise<void>; stopPiece: () => void; close: () => void }
 
 type RawEdit = { tool: string; rel: string; input: Record<string, unknown>; before: string | null | undefined; at: number }
 type RecentBatch = { at: number; batch: Batch }
@@ -79,8 +82,24 @@ export class App {
     this.batcher = new Batcher({ quietMs: settings.quietSeconds * 1000, maxWaitMs: 45_000, maxFiles: 12 })
     const history = (await this.host.storeGet('history')) as InloopCard[] | undefined
     if (Array.isArray(history)) await this.host.state.history.update(() => history)
+    await this.snapshotBaseline().catch(() => undefined)
     void this.refreshVoices()
     await this.refreshStatus()
+  }
+
+  /** Set at session start: a -p or SDK run, where no one sees the pane. */
+  isHeadless = false
+
+  /**
+   * Whether inloop is explaining changes where the person can see or hear
+   * them right now; only then is the coding agent asked to keep replies short.
+   */
+  async isBriefActive(): Promise<boolean> {
+    const settings = await this.settings()
+    if (!settings.briefAgent || settings.mode !== 'auto' || this.isHeadless) return false
+    if (settings.style === 'spoken') return true
+    const panes = await this.host.panes().catch(() => [])
+    return panes.some(p => p.id === PANE && p.isPlaced)
   }
 
   /** Explains what is batched and waits, at most `ms`, for queued work to finish. */
@@ -199,6 +218,7 @@ export class App {
    */
   private async toChange(edit: RawEdit): Promise<FileChange> {
     const after = await this.repo.read(edit.rel).catch(() => null)
+    if (after !== null) this.baseline.set(edit.rel, after)
     const base = { path: edit.rel, tools: [edit.tool], at: edit.at }
     if (edit.tool === 'Write') return { ...base, before: edit.before ?? null, after, snippets: [] }
     const pairs: { old: string; new: string; all: boolean }[] = []
@@ -221,6 +241,68 @@ export class App {
     return { ...base, before, after, snippets: [] }
   }
 
+  // ---- changes made outside the edit tools ---------------------------------------
+
+  /**
+   * The last text inloop knows of each file that differs from HEAD. A change made
+   * by a shell command or a script is what differs from it; what was already
+   * uncommitted when the session started is the person's, never explained.
+   */
+  private baseline = new Map<string, string>()
+  private isScanning = false
+  private isScanAgain = false
+
+  private async snapshotBaseline(): Promise<void> {
+    for (const path of (await this.repo.dirtyFiles().catch(() => [] as string[])).slice(0, 300)) {
+      const text = await this.repo.readFresh(path)
+      if (text !== null && text.length <= 400_000) this.baseline.set(path, text)
+    }
+  }
+
+  /** A shell command ran: look for files it changed, off the agent's time. Scans in a burst coalesce. */
+  noteShell(): void {
+    if (this.isScanning) {
+      this.isScanAgain = true
+      return
+    }
+    this.detach(() => this.scanWorkingTree())
+  }
+
+  /** Finds files changed since inloop last saw them, by any means, and batches them like edits. */
+  async scanWorkingTree(): Promise<void> {
+    if (!this.repo.isGit || this.repo.notProject !== null) return
+    if (this.isScanning) {
+      this.isScanAgain = true
+      return
+    }
+    this.isScanning = true
+    try {
+      do {
+        this.isScanAgain = false
+        const dirty = await this.repo.dirtyFiles().catch(() => [] as string[])
+        let isFound = false
+        for (const path of new Set([...dirty, ...this.baseline.keys()])) {
+          // An edit tool is already reporting this one.
+          if (this.raw.some(r => r.rel === path)) continue
+          const now = await this.repo.readFresh(path)
+          if (now === null) {
+            this.baseline.delete(path)
+            continue
+          }
+          const known = this.baseline.has(path) ? this.baseline.get(path)! : await this.repo.read(path, 'HEAD').catch(() => null)
+          if (now === known) continue
+          this.baseline.set(path, now)
+          if (now.length > 400_000) continue
+          this.batcher.add({ path, before: known, after: now, snippets: [], tools: ['Bash'], at: Date.now() })
+          isFound = true
+        }
+        if (isFound) await this.schedule()
+      } while (this.isScanAgain)
+    } finally {
+      this.isScanning = false
+    }
+  }
+
   private async schedule(): Promise<void> {
     this.timer?.cancel()
     const due = this.batcher.dueAt()
@@ -231,7 +313,9 @@ export class App {
   }
 
   /** Ends the current batch: the agent paused, finished a turn, or went quiet. */
-  async flush(_reason: string): Promise<void> {
+  async flush(reason: string): Promise<void> {
+    // At the end of a turn, catch what no edit tool or shell command reported (a subagent's script, a formatter).
+    if (reason === 'turn' || reason === 'ending') await this.scanWorkingTree().catch(() => undefined)
     this.timer?.cancel()
     this.timer = null
     if (this.raw.length > 0) await this.drainRaw()
@@ -312,14 +396,16 @@ export class App {
     return card
   }
 
-  async addCard(raw: InloopCard): Promise<void> {
+  async addCard(raw: InloopCard, options: { inFeed?: boolean } = {}): Promise<void> {
     const card = await this.withSteps(raw)
-    await this.host.state.cards.update(list => [card, ...list].slice(0, MAX_CARDS))
-    // The newest explanation opens by itself, unless the person opened another one to read.
-    const open = await this.host.state.expanded.get()
-    if (open === null || open === this.autoOpened) {
-      await this.host.state.expanded.update(() => card.id)
-      this.autoOpened = card.id
+    if (options.inFeed !== false) {
+      await this.host.state.cards.update(list => [card, ...list].slice(0, MAX_CARDS))
+      // The newest explanation opens by itself, unless the person opened another one to read.
+      const open = await this.host.state.expanded.get()
+      if (open === null || open === this.autoOpened) {
+        await this.host.state.expanded.update(() => card.id)
+        this.autoOpened = card.id
+      }
     }
     const slim: InloopCard = { ...card, diff: card.diff === undefined ? undefined : card.diff.slice(0, 6000) }
     const history = await this.host.state.history.update(list => [slim, ...list.filter(c => c.id !== card.id)].slice(0, MAX_HISTORY))
@@ -350,17 +436,43 @@ export class App {
     return panes.some(p => p.id === PANE && p.isPlaced)
   }
 
-  /** The installed voices, read once at start and again on request. */
+  /** The installed system voices, and whether Kokoro is set up; read at start and on request. */
   voices: Voice[] = []
+  isKokoroReady = false
 
   async refreshVoices(): Promise<Voice[]> {
     this.voices = parseVoices(await this.host.listVoices().catch(() => ''))
+    this.isKokoroReady = await this.host.kokoroReady().catch(() => false)
     return this.voices
   }
 
-  /** The voice speech will use for a setting ('' = the best installed). */
-  currentVoice(chosen: string): string | undefined {
-    return pickVoice(this.voices, chosen)
+  /** The engine and voice a setting speaks with ('' = the best available: Kokoro once set up). */
+  voicePlan(setting: string): VoicePlan {
+    return planVoice(setting, this.isKokoroReady, this.voices)
+  }
+
+  /** Installs Kokoro (one download), then makes it the voice. */
+  async setupKokoro(): Promise<string> {
+    await this.setBusy('installing the Kokoro voice (one-time download)…')
+    try {
+      const result = await this.host.kokoroSetup()
+      await this.refreshVoices()
+      if (!this.isKokoroReady) return `Kokoro could not be set up: ${result.text.trim().split('\n').pop() ?? 'unknown error'}`
+      return 'Kokoro is set up and is now the voice.'
+    } finally {
+      await this.setBusy(null)
+    }
+  }
+
+  /**
+   * Runs long work outside the event that asked for it (a button press, a
+   * command), on a timer of the plugin's own: a press or command answers at
+   * once, and no hook's time limit can cut the work, or its speech, short.
+   */
+  detach(work: () => Promise<unknown>): void {
+    this.host.after(0, () => {
+      void work().catch(err => this.host.state.status.update(st => ({ ...st, lastError: String((err as Error).message ?? err) })))
+    })
   }
 
   /** A card's steps; a card that came without them (a commit, a comparison) gets one per reference. */
@@ -378,14 +490,14 @@ export class App {
 
   private narrationQueue: InloopCard[] = []
   private isNarrating = false
-  private voiceHandle: { stop: () => void } | null = null
+  private speakerNow: Speaker | null = null
   private control: 'none' | 'next' | 'prev' | 'pause' | 'stop' | 'skip' = 'none'
   private resume: (() => void) | null = null
   private autoOpened: string | null = null
   /** The person closed the pane themselves; inloop does not reopen it until they ask (/inloop). */
   isPaneClosedByPerson = false
 
-  /** Queues a card to be read aloud, its code shown step by step. At most three wait; the oldest gives way. */
+  /** Queues a card to be read aloud, its code shown part by part. At most three wait; the oldest gives way. */
   async narrate(card: InloopCard, first = false): Promise<void> {
     if (first) {
       this.narrationQueue = [card, ...this.narrationQueue.filter(c => c.id !== card.id)]
@@ -395,12 +507,15 @@ export class App {
       while (this.narrationQueue.length > 3) this.narrationQueue.shift()
     }
     await this.host.state.narration.update(n => (n === null ? n : { ...n, queued: this.narrationQueue.length }))
-    if (!this.isNarrating) void this.runNarration()
+    if (!this.isNarrating) {
+      this.isNarrating = true
+      this.detach(() => this.runNarration())
+    }
   }
 
   private interrupt(control: 'next' | 'prev' | 'pause' | 'stop' | 'skip'): void {
     this.control = control
-    this.voiceHandle?.stop()
+    this.speakerNow?.stopPiece()
     if (control !== 'pause') {
       this.resume?.()
       this.resume = null
@@ -433,18 +548,78 @@ export class App {
     this.interrupt('stop')
   }
 
-  /** Speaks one piece; resolves when it ends or is cut off. */
-  private async sayPiece(text: string): Promise<void> {
-    const settings = await this.settings()
-    const handle = this.host.say(text, this.currentVoice(settings.voice))
-    this.voiceHandle = handle
-    await handle.done.catch(() => undefined)
-    this.voiceHandle = null
-  }
-
   /** The latest control pressed; read through a call because handlers change it while speech is awaited. */
   private currentControl(): typeof this.control {
     return this.control
+  }
+
+  /**
+   * Speaks pieces of text in turn. Kokoro renders every piece ahead in one
+   * process (so there is no gap between them) and each is played as a clip
+   * that can be cut off; the system voice speaks each directly. A piece Kokoro
+   * could not render falls back to the system voice.
+   */
+  private async speaker(texts: readonly string[], isInterrupted: () => boolean): Promise<Speaker> {
+    const plan = this.voicePlan((await this.settings()).voice)
+    const systemName = plan.engine === 'system' ? plan.name : pickVoice(this.voices, '')
+    let current: { stop: () => void } | null = null
+    let cancelWait: (() => void) | null = null
+    const direct = async (text: string): Promise<void> => {
+      const handle = this.host.say(text, systemName)
+      current = handle
+      await handle.done.catch(() => undefined)
+      current = null
+    }
+    if (plan.engine === 'system') {
+      return { play: i => direct(texts[i] ?? ''), stopPiece: () => current?.stop(), close: () => current?.stop() }
+    }
+    const synth = this.host.synthesize(texts, plan.id, 1.0)
+    const ready: (string | null | undefined)[] = texts.map(() => undefined)
+    const waiters = new Map<number, () => void>()
+    void (async () => {
+      let i = 0
+      try {
+        for await (const path of synth.paths) {
+          ready[i] = path
+          waiters.get(i)?.()
+          i++
+        }
+      } catch {
+        // Rendering failed: what is left falls back to the system voice.
+      }
+      for (let j = i; j < texts.length; j++) {
+        ready[j] = null
+        waiters.get(j)?.()
+      }
+    })()
+    return {
+      play: async i => {
+        if (ready[i] === undefined) {
+          await new Promise<void>(resolve => {
+            waiters.set(i, resolve)
+            cancelWait = resolve
+          })
+        }
+        cancelWait = null
+        if (isInterrupted()) return
+        const path = ready[i]
+        if (path === undefined) return
+        if (path === null) return direct(texts[i] ?? '')
+        const handle = this.host.play(path)
+        current = handle
+        await handle.done.catch(() => undefined)
+        current = null
+      },
+      stopPiece: () => {
+        current?.stop()
+        cancelWait?.()
+      },
+      close: () => {
+        current?.stop()
+        cancelWait?.()
+        synth.stop()
+      },
+    }
   }
 
   private async runNarration(): Promise<void> {
@@ -452,53 +627,75 @@ export class App {
     try {
       while (this.narrationQueue.length > 0) {
         const card = this.narrationQueue.shift()!
-        const steps: InloopStep[] = card.steps !== undefined && card.steps.length > 0
-          ? card.steps
-          : [{ text: card.summary, ref: card.refs[0] ?? { path: card.files[0] ?? '' } }]
+        // The explanation itself first (the answer, or the change's summary), then each part with its code.
+        const lead: InloopStep = { text: card.summary, ref: { path: '' } }
+        const steps: InloopStep[] = [lead, ...(card.steps ?? [])]
         this.control = 'none'
+        this.oneOff?.close()
         // The code is shown as it is discussed: bring the pane back if it went away on its own,
         // but not if the person closed it (the band above the prompt stands in then).
         if (!this.isPaneClosedByPerson) void this.host.openPane().catch(() => undefined)
-        await this.host.state.narration.update(() => ({ cardId: card.id, title: card.title, steps, index: -1, isPaused: false, queued: this.narrationQueue.length }))
-        let i = -1
-        while (i < steps.length) {
-          if (this.currentControl() === 'pause') {
-            await new Promise<void>(resolve => { this.resume = resolve })
-            const after = this.currentControl()
-            if (after !== 'none') {
-              if (after === 'next' || after === 'prev') {
-                i = after === 'next' ? i + 1 : Math.max(0, i - 1)
-                this.control = 'none'
-                continue
+        await this.host.state.narration.update(() => ({ cardId: card.id, title: card.title, steps, index: 0, isPaused: false, queued: this.narrationQueue.length }))
+        const speaker = await this.speaker(steps.map((st, i) => speakable(st.text, i === 0 ? 900 : 320)), () => this.currentControl() !== 'none')
+        this.speakerNow = speaker
+        try {
+          let i = 0
+          while (i < steps.length) {
+            if (this.currentControl() === 'pause') {
+              await new Promise<void>(resolve => { this.resume = resolve })
+              const after = this.currentControl()
+              if (after !== 'none') {
+                if (after === 'next' || after === 'prev') {
+                  i = after === 'next' ? i + 1 : Math.max(0, i - 1)
+                  this.control = 'none'
+                  continue
+                }
+                break
               }
-              break
             }
+            await this.host.state.narration.update(n => (n === null ? n : { ...n, index: i, isPaused: false }))
+            await speaker.play(i)
+            const control = this.currentControl()
+            if (control === 'stop' || control === 'skip') break
+            if (control === 'pause') continue
+            this.control = 'none'
+            i = control === 'prev' ? Math.max(0, i - 1) : i + 1
           }
-          await this.host.state.narration.update(n => (n === null ? n : { ...n, index: i, isPaused: false }))
-          const text = i < 0 ? `${card.title}.` : speakable(steps[i]!.text, 600)
-          await this.sayPiece(text)
-          const control = this.currentControl()
-          if (control === 'stop' || control === 'skip') break
-          if (control === 'pause') continue
-          this.control = 'none'
-          i = control === 'prev' ? Math.max(0, i - 1) : i + 1
+        } finally {
+          speaker.close()
+          this.speakerNow = null
         }
         if (this.currentControl() === 'stop') break
       }
     } finally {
       this.isNarrating = false
       this.control = 'none'
-      this.voiceHandle = null
+      this.speakerNow = null
       await this.host.state.narration.update(() => null)
     }
   }
 
+  private oneOff: Speaker | null = null
+
+  /**
+   * Says one short thing (a voice test, a confirmation) with the chosen voice.
+   * One voice at a time: it is skipped while an explanation is being read, and
+   * an explanation starting cuts it off.
+   */
   async speak(text: string): Promise<void> {
+    if (this.isNarrating) return
+    this.oneOff?.close()
     try {
-      const settings = await this.settings()
-      await this.host.speak(text, this.currentVoice(settings.voice))
+      const speaker = await this.speaker([speakable(text, 400)], () => false)
+      this.oneOff = speaker
+      try {
+        await speaker.play(0)
+      } finally {
+        speaker.close()
+        if (this.oneOff === speaker) this.oneOff = null
+      }
     } catch (err) {
-      await this.host.state.status.update(s => ({ ...s, lastError: `speech: ${String((err as Error).message ?? err)}` }))
+      await this.host.state.status.update(st => ({ ...st, lastError: `speech: ${String((err as Error).message ?? err)}` }))
     }
   }
 
@@ -520,15 +717,21 @@ export class App {
   // ---- questions -----------------------------------------------------------------
 
   /** Queues a question; answers land in the conversation, the feed and the viewer. */
-  ask(question: string, kind: AskKind = 'question'): Promise<void> {
+  /**
+   * Queues a question; the answer lands in the Ask tab (and the history), never
+   * in the feed of changes. `label` is what the conversation shows for a
+   * question a button asked.
+   */
+  ask(question: string, kind: AskKind = 'question', label?: string): Promise<void> {
     const run = async (): Promise<void> => {
-      const turn: InloopTurn = { role: 'you', text: question, at: Date.now() }
+      const turn: InloopTurn = { role: 'you', text: question, at: Date.now(), label }
+      await this.host.state.askOpen.update(() => null)
       await this.host.state.convo.update(c => [...c, turn].slice(-40))
       await this.setBusy(kind === 'flow' ? 'tracing the flow…' : 'investigating…')
       try {
         const env = await this.env(t => void this.host.state.status.update(s => ({ ...s, busy: t })))
         const result = await ask(env, question, kind)
-        const reply: InloopTurn = { role: 'inloop', text: result.answer, at: Date.now(), refs: result.refs }
+        const reply: InloopTurn = { role: 'inloop', text: result.answer, at: Date.now(), refs: result.refs, steps: result.steps }
         await this.host.state.convo.update(c => [...c, reply].slice(-40))
         if (result.scope !== undefined) await this.host.state.ctx.update(c => ({ ...c, scope: result.scope === '' ? undefined : result.scope }))
         if (result.rev !== env.ctx.rev) await this.host.state.ctx.update(c => ({ ...c, rev: result.rev, revLabel: result.revLabel }))
@@ -540,7 +743,10 @@ export class App {
         const card: InloopCard = {
           id: this.newId(),
           at: Date.now(),
-          title: question.length > 80 ? question.slice(0, 77) + '…' : question,
+          title: (() => {
+            const title = label ?? question
+            return title.length > 80 ? title.slice(0, 77) + '…' : title
+          })(),
           summary: result.answer,
           files: [...new Set(result.refs.map(r => r.path))],
           symbols: [],
@@ -551,7 +757,7 @@ export class App {
           question,
           flowId,
         }
-        await this.addCard(card)
+        await this.addCard(card, { inFeed: false })
         const first = result.refs[0]
         if (first !== undefined) await this.openRef(first, { switchTab: false })
         if (!(await this.isPaneShown())) this.host.log(`inloop — ${question}\n\n${result.answer}`)
@@ -565,6 +771,33 @@ export class App {
     }
     this.askChain = this.askChain.then(run, run)
     return this.askChain
+  }
+
+  /** Reads an answer aloud, its parts with their code. */
+  async listenTo(q: InloopTurn, a: InloopTurn): Promise<void> {
+    await this.narrate({
+      id: `answer:${a.at}`,
+      at: a.at,
+      title: q.label ?? q.text,
+      summary: a.text,
+      files: [],
+      symbols: [],
+      refs: a.refs ?? [],
+      steps: a.steps,
+      source: 'ask',
+    }, true)
+  }
+
+  /** "Simpler" and "more detail": the previous answer again, titled after the question it answered. */
+  async followUp(kind: 'simpler' | 'detail'): Promise<void> {
+    const convo = await this.host.state.convo.get()
+    const last = [...convo].reverse().find(t => t.role === 'you')
+    if (last === undefined) return
+    const topic = (last.label ?? last.text).replace(/^(simpler|more detail): /, '')
+    const prompt = kind === 'simpler'
+      ? 'Explain your previous answer again, more simply: plain words, at most four short sentences.'
+      : "Explain your previous answer again with the full technical detail. Don't simplify."
+    await this.ask(prompt, 'question', `${kind === 'simpler' ? 'simpler' : 'more detail'}: ${topic}`)
   }
 
   async explainCommit(rev: string): Promise<InloopCard | null> {
@@ -601,9 +834,8 @@ export class App {
 
   // ---- navigation ------------------------------------------------------------
 
-  /** Goes to a tab, remembering the screen left behind so back returns to it. */
+  /** Goes to a tab. Tabs are independent: each keeps its own state, and switching records no history. */
   async setTab(tab: InloopTab): Promise<void> {
-    if ((await this.host.state.tab.get()) !== tab) await this.remember()
     await this.showTab(tab)
   }
 
@@ -644,7 +876,8 @@ export class App {
       return
     }
     const isMove = options.switchTab !== false
-    if (isMove) await this.remember()
+    // Within the Code tab, following code from one place to another can be stepped back.
+    if (isMove && (await this.host.state.tab.get()) === 'code') await this.remember()
     const line = ref.line ?? 1
     const endLine = ref.endLine ?? line
     const viewer: InloopViewer = { path: rel, rev: ref.rev, line, endLine, top: Math.max(1, line - 4), diff: options.diff, note: options.note ?? ref.label }
@@ -671,21 +904,16 @@ export class App {
     }))
   }
 
-  /** Back to the previous screen: an explanation, a code location, a flow, a commit. */
+  /** The Code tab's previous location: where you were before following a caller, callee or symbol. */
   async back(): Promise<void> {
     const stack = await this.host.state.nav.get()
     const prev = stack.at(-1)
-    if (prev === undefined) {
-      if ((await this.host.state.tab.get()) !== 'feed') await this.showTab('feed')
-      return
-    }
+    if (prev === undefined) return
     await this.host.state.nav.update(b => b.slice(0, -1))
     if (prev.viewer !== null) {
       await this.host.state.viewer.update(() => prev.viewer)
       await this.syncContext(prev.viewer)
     }
-    await this.host.state.expanded.update(() => prev.expanded)
-    await this.showTab(prev.tab)
   }
 
   /** Scrolls the code viewer, stopping once the file's last line is in the window of `windowRows`. */

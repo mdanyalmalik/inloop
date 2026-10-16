@@ -26,6 +26,8 @@ export type StateCell<T> = {
 
 export type Host = {
   root: () => Promise<string>
+  /** The person's home folder; '' when unknown. */
+  home: () => Promise<string>
   readFile: (path: string) => Promise<string>
   listDir: (path: string) => Promise<FsEntry[]>
   run: (argv: readonly string[], init?: ProcessRunInit) => Promise<ProcessRunResult>
@@ -44,6 +46,14 @@ export type Host = {
   speak: (text: string, voice?: string) => Promise<unknown>
   /** Speaks `text` in a way that can be cut off: `done` settles when it ends or is stopped. */
   say: (text: string, voice?: string) => { done: Promise<void>; stop: () => void }
+  /** Whether the Kokoro voice is set up (checked offline). */
+  kokoroReady: () => Promise<boolean>
+  /** Downloads and checks Kokoro once; resolves with what the setup printed. */
+  kokoroSetup: () => Promise<{ ok: boolean; text: string }>
+  /** Renders `texts` with Kokoro in one process: each WAV path as it is ready, in order. */
+  synthesize: (texts: readonly string[], voice: string, speed: number) => { paths: AsyncIterable<string>; stop: () => void }
+  /** Plays an audio file; can be cut off. */
+  play: (path: string) => { done: Promise<void>; stop: () => void }
   /** The system's voice listing (`say -v '?'` on macOS); '' where there is none. */
   listVoices: () => Promise<string>
   after: (ms: number, fn: () => void) => Timer

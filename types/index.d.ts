@@ -101,6 +101,10 @@ export type InloopTurn = {
   text: string
   at: number
   refs?: InloopRef[]
+  /** An answer's parts, each with its code. */
+  steps?: InloopStep[]
+  /** What the conversation shows for a question asked by a button ("simpler: …"). */
+  label?: string
 }
 
 export type InloopSettings = {
@@ -190,6 +194,8 @@ declare module 'claude-code' {
       flowSelected: string | null
       flowNote: string | null
       convo: InloopTurn[]
+      /** The earlier question opened in the Ask tab, by its time. */
+      askOpen: number | null
       settings: InloopSettings
       ctx: InloopContext
       git: InloopGitView

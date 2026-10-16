@@ -16,6 +16,30 @@ const MAX_FILE_BYTES = 400_000
 
 export class RepoError extends Error {}
 
+/** Files and folders that mark a folder as a software project. */
+const PROJECT_MARKERS = [
+  'package.json', 'pyproject.toml', 'setup.py', 'requirements.txt', 'Pipfile', 'Cargo.toml', 'go.mod', 'Gemfile',
+  'pom.xml', 'build.gradle', 'build.gradle.kts', 'composer.json', 'mix.exs', 'Package.swift', 'CMakeLists.txt',
+  'Makefile', 'deno.json', 'tsconfig.json', 'src', 'lib', 'app',
+]
+
+/**
+ * Why the session's folder is not a project to explain, or null when it is:
+ * the home folder or the file system root never are; another folder is when
+ * it is a git repository or holds a project file.
+ */
+export async function notAProject(host: Host, root: string, isGit: boolean): Promise<string | null> {
+  const home = (await host.home().catch(() => '')).replace(/\/+$/, '')
+  const here = root.replace(/\/+$/, '')
+  if (here === '' || here === '/' || (home !== '' && here === home)) {
+    return `This Claude Code session is running in ${here === '' ? '/' : here === home ? 'your home folder' : here}, which is not a project, so there is no code here for inloop to explain. Start Claude Code inside a project folder (cd into it first).`
+  }
+  if (isGit) return null
+  const entries = await host.listDir(root).catch(() => [])
+  if (entries.some(e => PROJECT_MARKERS.includes(e.name))) return null
+  return `${here} does not look like a project (no git repository and no project files such as package.json), so inloop has no code here to explain. Start Claude Code inside a project folder.`
+}
+
 export class Repo {
   private files = new Lru<string>(300)
   private indexes = new Lru<CodeIndex>(6)
@@ -26,12 +50,15 @@ export class Repo {
     private readonly host: Host,
     readonly root: string,
     readonly isGit: boolean,
+    /** Null when the session runs in a project; otherwise why it does not. */
+    readonly notProject: string | null,
   ) {}
 
   static async open(host: Host): Promise<Repo> {
     const root = await host.root()
     const probe = await host.run(['git', 'rev-parse', '--is-inside-work-tree'], { cwd: root, timeoutMs: 5000 }).catch(() => undefined)
-    return new Repo(host, root, probe?.exitCode === 0 && probe.stdout.trim() === 'true')
+    const isGit = probe?.exitCode === 0 && probe.stdout.trim() === 'true'
+    return new Repo(host, root, isGit, await notAProject(host, root, isGit))
   }
 
   /** Runs git read-only in the project; rejects with git's message on failure. */
@@ -47,6 +74,28 @@ export class Repo {
     if (rel === null) throw new RepoError(`${path} is outside the project.`)
     if (isSensitive(rel)) throw new RepoError(`${rel} looks like a secrets or credentials file; inloop does not read it.`)
     return rel
+  }
+
+  /**
+   * Files of the working tree that differ from HEAD, untracked ones included
+   * and ignored ones left out: where a change made by any means (a shell
+   * command, a script, a formatter) shows up.
+   */
+  async dirtyFiles(): Promise<string[]> {
+    if (!this.isGit || this.notProject !== null) return []
+    const out = await this.git(['status', '--porcelain', '--no-renames', '-uall'])
+    return out
+      .split('\n')
+      .filter(line => line.length > 3)
+      .map(line => line.slice(3).replace(/^"(.*)"$/, '$1'))
+      .filter(path => !isNoise(path) && !isSensitive(path))
+  }
+
+  /** A working-tree file read afresh (something other than an edit tool may have changed it); null when gone. */
+  async readFresh(path: string): Promise<string | null> {
+    const rel = this.rel(path)
+    this.touch(rel)
+    return this.read(rel).catch(() => null)
   }
 
   /** Marks a working-tree file changed (an edit landed). */
@@ -85,6 +134,9 @@ export class Repo {
   }
 
   async listFiles(rev?: string): Promise<string[]> {
+    // A session in the home folder (or anywhere that is not a project) has no code to explain:
+    // never sweep up unrelated folders and explain those instead.
+    if (this.notProject !== null) return []
     let names: string[]
     if (this.isGit) {
       const out = rev === undefined

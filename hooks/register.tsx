@@ -12,7 +12,7 @@ import { narrationBand, renderPane, type Snapshot } from '../src/ui'
 import { DEFAULT_SETTINGS } from '../src/state'
 import type { InloopCard, InloopDepth, InloopMode, InloopTab } from '../types'
 import { describeFlow } from '../src/explain'
-import { needsBetterVoice, rankVoices, VOICE_HELP } from '../src/voices'
+import { describePlan, KOKORO_VOICES, rankVoices } from '../src/voices'
 
 const cardsAtom = atom({ plugin: 'inloop', key: 'cards' } as const, [])
 const historyAtom = atom({ plugin: 'inloop', key: 'history' } as const, [])
@@ -25,15 +25,21 @@ const flowSelectedAtom = atom({ plugin: 'inloop', key: 'flowSelected' } as const
 const flowNoteAtom = atom({ plugin: 'inloop', key: 'flowNote' } as const, null)
 const convoAtom = atom({ plugin: 'inloop', key: 'convo' } as const, [])
 const settingsAtom = atom({ plugin: 'inloop', key: 'settings' } as const, DEFAULT_SETTINGS)
+const askOpenAtom = atom({ plugin: 'inloop', key: 'askOpen' } as const, null)
 const ctxAtom = atom({ plugin: 'inloop', key: 'ctx' } as const, {})
 const gitAtom = atom({ plugin: 'inloop', key: 'git' } as const, { query: '', commits: [], files: [] })
 const usageAtom = atom({ plugin: 'inloop', key: 'usage' } as const, { calls: 0, inputTokens: 0, outputTokens: 0 })
 const narrationAtom = atom({ plugin: 'inloop', key: 'narration' } as const, null)
 const statusAtom = atom({ plugin: 'inloop', key: 'status' } as const, { busy: null, queued: 0, pendingChanges: 0, recentBatches: 0 })
 
-const BRIEF_REPLIES = `The person has the inloop plugin open beside this conversation. inloop explains every change you make, with the code, in its own panel, so do not repeat that work in your replies.
-After you change code, tell the person in one or two sentences what you did, then only what they need to act on: errors, failing or skipped tests, open questions, decisions to make, next steps. Do not walk through the code you wrote, list each change, or explain how it works, unless the person asks you to.
-This is about your messages to the person. Reports you hand back to another agent stay as complete as that agent needs.`
+const BRIEF_REPLIES = `inloop is open beside this conversation. It explains every code change you make, with the code, in its own panel, so do not duplicate that work.
+When you finish work that changed code, reply in at most two short sentences saying what you did, in plain words. Then add only what the person must act on, if anything: an error, a failing or skipped test, a question you need answered, a decision for them.
+Do not include in these replies: code blocks, lists of changes, file-by-file summaries, explanations of how the code works, design rationale, or edge cases. inloop covers all of that.
+If the person explicitly asks you to explain something, explain it fully.
+This applies only to your messages to the person, not to reports you hand back to another agent.`
+
+/** Rides each prompt while inloop is active, where the model weighs it most. */
+const BRIEF_REMINDER = 'inloop is showing the person explanations of every change. Keep your final reply to at most two short sentences, plus anything they must act on. No code blocks, change lists, or explanations of how the code works, unless they explicitly ask for an explanation.'
 
 const ACK = '(inloop is handling this in its own pane; it is not a request for the coding agent.)'
 
@@ -53,7 +59,7 @@ const COMMANDS: { name: string; description: string; argumentHint?: string }[] =
   { name: 'inloop-style', description: 'Written explanations with code, or spoken ones that show the code as they go', argumentHint: '<written|spoken>' },
   { name: 'inloop-speak', description: 'Same as /inloop-style spoken (on) or written (off)', argumentHint: '<on|off>' },
   { name: 'inloop-brief', description: "Keep the coding agent's own replies short while inloop explains changes", argumentHint: '<on|off>' },
-  { name: 'inloop-voice', description: 'List the voices on this machine, or choose one', argumentHint: '[voice name | auto]' },
+  { name: 'inloop-voice', description: 'List voices, choose one, or set up the natural Kokoro voice', argumentHint: '[setup | voice | auto]' },
 ]
 
 let app: App | null = null
@@ -65,9 +71,13 @@ let isHeadless = false
  * command answers at once. Headless (-p, SDK): no pane, the run would end
  * first, so the command waits and prints the result as its output.
  */
-async function finish(work: Promise<unknown>, result: () => Promise<string>): Promise<{ text: string }> {
-  if (!isHeadless) return { text: ACK }
-  await work
+async function finish(start: () => Promise<unknown>, result: () => Promise<string>): Promise<{ text: string }> {
+  if (!isHeadless) {
+    // Off the command's own time: the work and its speech run on the plugin's timer.
+    app?.detach(start)
+    return { text: ACK }
+  }
+  await start()
   return { text: await result() }
 }
 
@@ -97,8 +107,21 @@ export const register: Register = on => {
     const started = await next(e)
     isHeadless = !e.isInteractive
     app?.stop()
+    // Kokoro runs through uv (an isolated environment, nothing installed system-wide).
+    // Nothing about the voice may keep inloop from starting.
+    const home = (await $.env.get('HOME').catch(() => undefined)) ?? ''
+    let uv: string | undefined
+    for (const candidate of ['uv', `${home}/.local/bin/uv`, '/opt/homebrew/bin/uv', '/usr/local/bin/uv']) {
+      const probe = await $.process.run([candidate, '--version'], { timeoutMs: 4000 }).catch(() => undefined)
+      if (probe?.exitCode === 0) {
+        uv = candidate
+        break
+      }
+    }
+    const ttsScript = `${$.plugin.root}/voice/inloop_tts.py`
     const host: Host = {
       root: () => $.session.root(),
+      home: async () => home,
       readFile: async path => {
         const text = await $.fs.read(path)
         if (typeof text !== 'string') throw new Error(`${path} is not text`)
@@ -121,6 +144,7 @@ export const register: Register = on => {
         flowSelected: { get: () => read($, flowSelectedAtom), update: change => update($, flowSelectedAtom, change) },
         flowNote: { get: () => read($, flowNoteAtom), update: change => update($, flowNoteAtom, change) },
         convo: { get: () => read($, convoAtom), update: change => update($, convoAtom, change) },
+        askOpen: { get: () => read($, askOpenAtom), update: change => update($, askOpenAtom, change) },
         settings: { get: () => read($, settingsAtom), update: change => update($, settingsAtom, change) },
         ctx: { get: () => read($, ctxAtom), update: change => update($, ctxAtom, change) },
         git: { get: () => read($, gitAtom), update: change => update($, gitAtom, change) },
@@ -152,6 +176,43 @@ export const register: Register = on => {
         }
         return { done, stop }
       },
+      kokoroReady: async () => {
+        if (uv === undefined) return false
+        const checked = await $.process.run([uv, 'run', '--offline', '--quiet', '--script', ttsScript, 'status'], { timeoutMs: 60_000 }).catch(() => undefined)
+        return checked?.exitCode === 0 && checked.stdout.includes('"ready": true')
+      },
+      kokoroSetup: async () => {
+        if (uv === undefined) return { ok: false, text: 'uv is not installed (https://docs.astral.sh/uv/).' }
+        const done = await $.process.run([uv, 'run', '--quiet', '--script', ttsScript, 'setup'], { timeoutMs: 600_000 }).catch(err => ({ exitCode: 1, stdout: '', stderr: String(err) }))
+        return { ok: done.exitCode === 0, text: `${done.stdout}${done.stderr}` }
+      },
+      synthesize: (texts, voice, speed) => {
+        if (uv === undefined) return { paths: (async function* () {})(), stop: () => undefined }
+        const stream = $.process.spawn({
+          argv: [uv, 'run', '--offline', '--quiet', '--script', ttsScript, 'synth', voice, String(speed)],
+          input: JSON.stringify(texts),
+        })
+        async function* paths(): AsyncGenerator<string> {
+          let held = ''
+          for await (const piece of stream) {
+            if (piece.stream !== 'stdout') continue
+            held += piece.text
+            for (let cut = held.indexOf('\n'); cut >= 0; cut = held.indexOf('\n')) {
+              const line = held.slice(0, cut).trim()
+              held = held.slice(cut + 1)
+              if (line.endsWith('.wav')) yield line
+            }
+          }
+        }
+        return { paths: paths(), stop: () => void stream.return(undefined as never).catch(() => undefined) }
+      },
+      play: path => {
+        const stream = $.process.spawn({ argv: ['afplay', path] })
+        const done = (async () => {
+          for await (const piece of stream) void piece
+        })()
+        return { done, stop: () => void stream.return(undefined as never).catch(() => undefined) }
+      },
       listVoices: async () => {
         const listed = await $.process.run(['say', '-v', '?'], { timeoutMs: 5000 }).catch(() => undefined)
         return listed?.exitCode === 0 ? listed.stdout : ''
@@ -159,6 +220,7 @@ export const register: Register = on => {
       after: (ms, fn) => $.clock.after(ms, fn),
     }
     app = new App(host)
+    app.isHeadless = isHeadless
     await app.start()
     for (const c of COMMANDS) await $.command.register({ ...c, immediate: true })
     // Seated only where the terminal is wide enough to dock it beside the transcript.
@@ -176,7 +238,14 @@ export const register: Register = on => {
   // Observe edits: let the tool run untouched, then record what it did.
   on('tool.call', async ($, e, next) => {
     const tool = String(e.tool)
-    if (!EDIT_TOOLS.has(tool) || app === null) return next(e)
+    if (app === null) return next(e)
+    if (tool === 'Bash') {
+      // A shell command can change files too (a script, sed, a formatter): look afterwards.
+      const ran = await next(e)
+      app.noteShell()
+      return ran
+    }
+    if (!EDIT_TOOLS.has(tool)) return next(e)
     const input = e as unknown as Record<string, unknown>
     const path = String(input.file_path ?? input.notebook_path ?? '')
     const rel = path === '' ? null : toRelative(app.repo.root, path)
@@ -199,13 +268,15 @@ export const register: Register = on => {
   // the coding agent need not say it all again. Otherwise its replies are left alone.
   on('prompt.compose', async ($, e, next) => {
     const composed = await next(e)
-    const settings = await read($, settingsAtom)
-    if (!settings.briefAgent || settings.mode !== 'auto' || isHeadless) return composed
-    const panes = await $.ui.panes().catch(() => [])
-    const isPaneOpen = panes.some(p => p.id === PANE && p.isPlaced)
-    if (!isPaneOpen && settings.style !== 'spoken') return composed
+    if (app === null || !(await app.isBriefActive())) return composed
     return { sections: [...composed.sections, { id: 'inloop:brief-replies', text: BRIEF_REPLIES, scope: 'session' as const }] }
   })
+
+  // The same, as a note beside each prompt the person types (the model never shows it).
+  on('prompt.submit', async ($, e, next) => {
+    if (app === null || e.command !== undefined || e.isMeta === true || !(await app.isBriefActive())) return next(e)
+    return next({ ...e, context: [...(e.context ?? []), BRIEF_REMINDER] })
+  }).catch(($, e, next) => next(e))
 
   // Spoken style with the pane hidden (behind another panel, or closed): the
   // part being read and its code show above the prompt instead.
@@ -228,7 +299,10 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     if (e.agentId === undefined && app !== null) {
       if (isHeadless) await app.drain(60_000).catch(() => undefined)
-      else void app.flush('turn')
+      else {
+        const live = app
+        live.detach(() => live.flush('turn'))
+      }
     }
     return next(e)
   })
@@ -251,6 +325,7 @@ export const register: Register = on => {
       selected: await read($, flowSelectedAtom),
       note: await read($, flowNoteAtom),
       convo: await read($, convoAtom),
+      askOpen: await read($, askOpenAtom),
       history: await read($, historyAtom),
       git: await read($, gitAtom),
       usage: await read($, usageAtom),
@@ -276,7 +351,7 @@ export const register: Register = on => {
     }
     void showTab('ask', () => $.ui.open({ id: PANE, title: 'inloop', columns: 64 }))
     const isFlow = /what happens when|\bflow\b|trace|follow/i.test(q)
-    return finish(app.ask(q, isFlow ? 'flow' : 'question'), () => lastAnswer(isFlow))
+    return finish(() => app!.ask(q, isFlow ? 'flow' : 'question'), () => lastAnswer(isFlow))
   }).catch(() => ({ text: 'that command failed; see the inloop pane for details.' }))
 
   on('command.run', { command: 'inloop-explain' }, async ($, e) => {
@@ -287,22 +362,22 @@ export const register: Register = on => {
       const ctx = await read($, ctxAtom)
       const selection = await $.ui.selection().catch(() => undefined)
       if (selection !== undefined && selection.text.trim() !== '') {
-        return finish(app.ask(`Explain this code I selected:\n\n${selection.text.slice(0, 4000)}`), () => lastAnswer())
+        return finish(() => app!.ask(`Explain this code I selected:\n\n${selection.text.slice(0, 4000)}`), () => lastAnswer())
       }
       if (ctx.path !== undefined) {
-        return finish(app.ask(`Explain ${ctx.symbol !== undefined ? `${ctx.symbol}() in ` : ''}${ctx.path} lines ${ctx.line ?? 1}-${ctx.endLine ?? ctx.line ?? 1}.`), () => lastAnswer())
+        return finish(() => app!.ask(`Explain ${ctx.symbol !== undefined ? `${ctx.symbol}() in ` : ''}${ctx.path} lines ${ctx.line ?? 1}-${ctx.endLine ?? ctx.line ?? 1}.`), () => lastAnswer())
       }
       const latest = (await read($, cardsAtom))[0]
       if (latest === undefined) return { text: 'Nothing selected yet. Pass a topic, a file or a function: /inloop-explain src/auth.js:12' }
-      return finish(app.ask(`Go deeper on "${latest.title}".`), () => lastAnswer())
+      return finish(() => app!.ask(`Go deeper on "${latest.title}".`), () => lastAnswer())
     }
     const loc = /^([\w./@-]+\.\w+)(?::(\d+)(?:-(\d+))?)?$/.exec(arg)
     if (loc !== null) {
       const line = loc[2] !== undefined ? Number(loc[2]) : undefined
       await app.openRef({ path: loc[1]!, line, endLine: loc[3] !== undefined ? Number(loc[3]) : line }, { switchTab: false })
-      return finish(app.ask(line !== undefined ? `Explain ${loc[1]} around line ${line}: what this code does and how it connects to the rest.` : `Explain the file ${loc[1]}: its purpose, main functions and how it connects to the rest.`), () => lastAnswer())
+      return finish(() => app!.ask(line !== undefined ? `Explain ${loc[1]} around line ${line}: what this code does and how it connects to the rest.` : `Explain the file ${loc[1]}: its purpose, main functions and how it connects to the rest.`), () => lastAnswer())
     }
-    return finish(app.ask(arg), () => lastAnswer())
+    return finish(() => app!.ask(arg), () => lastAnswer())
   }).catch(() => ({ text: 'that command failed; see the inloop pane for details.' }))
 
   on('command.run', { command: 'inloop-flow' }, async ($, e) => {
@@ -312,7 +387,7 @@ export const register: Register = on => {
     const quick = await app.quickFlow(q).catch(() => null)
     if (quick !== null) await app.showFlow(quick)
     void showTab('flow', () => $.ui.open({ id: PANE, title: 'inloop', columns: 64 }))
-    return finish(app.ask(q, 'flow'), () => lastAnswer(true))
+    return finish(() => app!.ask(q, 'flow'), () => lastAnswer(true))
   }).catch(() => ({ text: 'that command failed; see the inloop pane for details.' }))
 
   on('command.run', { command: 'inloop-commit' }, async ($, e) => {
@@ -326,8 +401,9 @@ export const register: Register = on => {
       rev = found[0].sha
     }
     void showTab('feed', () => $.ui.open({ id: PANE, title: 'inloop', columns: 64 }))
-    const card = app.explainCommit(rev)
-    return finish(card, () => cardText(card))
+    const live = app
+    let card: Promise<InloopCard | null> = Promise.resolve(null)
+    return finish(() => (card = live.explainCommit(rev)), () => cardText(card))
   }).catch(() => ({ text: 'that command failed; see the inloop pane for details.' }))
 
   on('command.run', { command: 'inloop-compare' }, async ($, e) => {
@@ -335,19 +411,22 @@ export const register: Register = on => {
     const [from, to, ...topic] = e.args.trim().split(/\s+/)
     if (from === undefined || from === '' || to === undefined) return { text: 'Usage: /inloop-compare <from> <to> [topic]' }
     void showTab('feed', () => $.ui.open({ id: PANE, title: 'inloop', columns: 64 }))
-    const card = app.compare(from, to, topic.join(' '))
-    return finish(card, () => cardText(card))
+    const live = app
+    let card: Promise<InloopCard | null> = Promise.resolve(null)
+    return finish(() => (card = live.compare(from, to, topic.join(' '))), () => cardText(card))
   }).catch(() => ({ text: 'that command failed; see the inloop pane for details.' }))
 
   on('command.run', { command: 'inloop-recent' }, async ($, e) => {
     if (app === null) return { text: 'inloop is not ready yet.' }
     const minutes = Math.max(1, Math.min(600, Number.parseInt(e.args.trim() || '10', 10) || 10))
     void showTab('feed', () => $.ui.open({ id: PANE, title: 'inloop', columns: 64 }))
-    const card = app.explainRecent(minutes).then(c => {
-      if (c === null) $.ui.log(`inloop: no recorded changes in the last ${minutes} minutes.`)
+    const live = app
+    let card: Promise<InloopCard | null> = Promise.resolve(null)
+    const start = () => (card = live.explainRecent(minutes).then(c => {
+      if (c === null) live.host.log(`inloop: no recorded changes in the last ${minutes} minutes.`)
       return c
-    })
-    return finish(card, () => cardText(card))
+    }))
+    return finish(start, () => cardText(card))
   }).catch(() => ({ text: 'that command failed; see the inloop pane for details.' }))
 
   on('command.run', { command: 'inloop-focus' }, async ($, e) => {
@@ -416,23 +495,46 @@ export const register: Register = on => {
 
   on('command.run', { command: 'inloop-voice' }, async ($, e) => {
     if (app === null) return { text: 'inloop is not ready yet.' }
+    const live = app
     const want = e.args.trim()
-    const voices = await app.refreshVoices()
+    if (want === 'setup') {
+      if (!isHeadless) {
+        live.detach(async () => live.host.log(`inloop: ${await live.setupKokoro()}`))
+        return { text: 'Installing the Kokoro voice (one-time download, ~200 MB); inloop says when it is ready.' }
+      }
+      return { text: await live.setupKokoro() }
+    }
+    const voices = await live.refreshVoices()
+    const s = await read($, settingsAtom)
     if (want === '') {
-      const s = await read($, settingsAtom)
-      const list = rankVoices(voices).slice(0, 15).map(v => `  ${v.name}${v.quality === 'premium' || v.quality === 'enhanced' ? ` (${v.quality})` : ''}`)
-      const using = app.currentVoice(s.voice) ?? 'the system default'
-      return { text: [`Speaking with: ${using}${s.voice === '' ? ' (automatic)' : ''}`, list.length > 0 ? `Voices here:\n${list.join('\n')}` : 'No voices found.', needsBetterVoice(voices) ? VOICE_HELP.replace(/\*/g, '') : ''].filter(Boolean).join('\n\n') }
+      const kokoro = live.isKokoroReady ? KOKORO_VOICES.map(v => `  kokoro:${v.id}  ${v.label}`) : []
+      const system = rankVoices(voices).slice(0, 10).map(v => `  ${v.name}${v.quality === 'premium' || v.quality === 'enhanced' ? ` (${v.quality})` : ''}`)
+      return {
+        text: [
+          `Speaking with: ${describePlan(live.voicePlan(s.voice))}${s.voice === '' ? ' (automatic)' : ''}`,
+          kokoro.length > 0 ? `Kokoro voices (natural, local):\n${kokoro.join('\n')}` : 'Kokoro is not set up: /inloop-voice setup installs it (free, local, ~200 MB once).',
+          system.length > 0 ? `Mac voices:\n${system.join('\n')}` : '',
+        ].filter(Boolean).join('\n\n'),
+      }
     }
+    const say = 'This is the voice inloop will use.'
     if (want === 'auto') {
-      await app.setSettings({ voice: '' })
-      void app.speak('This is the voice inloop will use.')
-      return { text: `Voice: automatic (${app.currentVoice('') ?? 'system default'}).` }
+      await live.setSettings({ voice: '' })
+      live.detach(() => live.speak(say))
+      return { text: `Voice: automatic (${describePlan(live.voicePlan(''))}).` }
     }
-    const match = voices.find(v => v.name.toLowerCase() === want.toLowerCase()) ?? voices.find(v => v.name.toLowerCase().startsWith(want.toLowerCase()))
-    if (match === undefined) return { text: `No voice named "${want}" is installed. /inloop-voice lists them.` }
-    await app.setSettings({ voice: match.name })
-    void app.speak('This is the voice inloop will use.')
+    const lower = want.toLowerCase().replace(/^kokoro:/, '')
+    const kokoro = KOKORO_VOICES.find(v => v.id === lower || v.label.toLowerCase().startsWith(lower))
+    if (kokoro !== undefined) {
+      if (!live.isKokoroReady) return { text: 'Kokoro is not set up yet: /inloop-voice setup' }
+      await live.setSettings({ voice: `kokoro:${kokoro.id}` })
+      live.detach(() => live.speak(say))
+      return { text: `Voice: ${kokoro.label} (Kokoro).` }
+    }
+    const match = voices.find(v => v.name.toLowerCase() === lower) ?? voices.find(v => v.name.toLowerCase().startsWith(lower))
+    if (match === undefined) return { text: `No voice named "${want}". /inloop-voice lists them.` }
+    await live.setSettings({ voice: match.name })
+    live.detach(() => live.speak(say))
     return { text: `Voice: ${match.name}.` }
   }).catch(() => ({ text: 'That command failed.' }))
 
@@ -444,7 +546,7 @@ export const register: Register = on => {
       return { text: `Style is ${s.style}. Use /inloop-style written (explanations with code, to read) or /inloop-style spoken (read aloud, the code shown as each part is discussed).` }
     }
     await app.setSettings({ style: want })
-    if (want === 'spoken') void app.speak('inloop will talk you through each change, showing the code as it goes.')
+    if (want === 'spoken') app.detach(() => app!.speak('inloop will talk you through each change, showing the code as it goes.'))
     return { text: want === 'spoken' ? 'Spoken: new explanations are read aloud, with the code for each part shown in the panel.' : 'Written: new explanations appear in the panel with their code.' }
   }).catch(() => ({ text: 'that command failed; see the inloop pane for details.' }))
 
@@ -454,7 +556,7 @@ export const register: Register = on => {
     const s = await read($, settingsAtom)
     const isOn = v === '' ? s.style !== 'spoken' : v === 'on' || v === 'true' || v === 'yes'
     await app.setSettings({ style: isOn ? 'spoken' : 'written' })
-    if (isOn) void app.speak('inloop will talk you through each change, showing the code as it goes.')
+    if (isOn) app.detach(() => app!.speak('inloop will talk you through each change, showing the code as it goes.'))
     return { text: isOn ? 'Spoken style on.' : 'Written style (speech off).' }
   }).catch(() => ({ text: 'that command failed; see the inloop pane for details.' }))
 

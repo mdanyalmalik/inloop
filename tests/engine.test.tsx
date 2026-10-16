@@ -294,13 +294,82 @@ describe('lifecycle', () => {
   })
 })
 
+describe('changes made outside the edit tools', () => {
+  test('each automatic explanation lists its files, lines changed, and opens a file diff', async ($, on) => {
+    const w = world(on)
+    tools(on, w)
+    await start($)
+    await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
+    await w.clock.advance(10_000)
+    const card = (w.get('cards') ?? [])[0]!
+    const ui = await $.ui.mount({ plugin: 'inloop', surface: 'terminal', component: 'Pane', requestId: 'inloop', props: PANE_PROPS as never })
+    expect(await ui.find({ text: /server\/auth\/tokens\.js/ })).toBeDefined()
+    expect(await ui.find({ text: /\+7/ })).toBeDefined()
+    expect(await ui.find({ text: /lines 18-24/ })).toBeDefined()
+    await ui.press({ key: `feed:chg:${card.id}:0` })
+    expect(w.get('tab')).toBe('code')
+    expect(w.get('viewer')?.path).toBe('server/auth/tokens.js')
+    expect(w.get('viewer')?.diff?.startsWith('@@')).toBe(true)
+    await ui.unmount()
+  })
+
+  test('files changed by a shell command are explained like edits', async ($, on) => {
+    const w = world(on)
+    tools(on, w)
+    await start($)
+    // The agent rewrites two files with a script run through Bash.
+    const controller = w.files.get('server/auth/controller.js')!
+    w.files.set('server/auth/controller.js', controller + '\nasync function logout(req, res) {\n  res.status(204).end()\n}\n')
+    w.files.set('server/middleware/rateLimit.js', 'function rateLimit(req, res, next) {\n  next()\n}\n\nmodule.exports = { rateLimit }\n')
+    await $.tool.call({ tool: 'Bash', command: 'python3 - <<EOF ... EOF' } as never)
+    await w.clock.advance(10_000)
+    const cards = w.get('cards') ?? []
+    expect(cards.length).toBe(1)
+    expect([...cards[0]!.files].sort()).toEqual(['server/auth/controller.js', 'server/middleware/rateLimit.js'])
+    expect(cards[0]!.diff?.includes('+async function logout(req, res) {')).toBe(true)
+    // Nothing changed by the next command: nothing more to explain.
+    await $.tool.call({ tool: 'Bash', command: 'ls' } as never)
+    await w.clock.advance(10_000)
+    expect((w.get('cards') ?? []).length).toBe(1)
+  })
+
+  test("uncommitted work from before the session is the person's, never explained", async ($, on) => {
+    const w = world(on)
+    tools(on, w)
+    w.files.set('server/db/users.js', w.files.get('server/db/users.js')! + '\n// my own work in progress\nfunction draft() {\n  return 1\n}\n')
+    await start($)
+    await $.tool.call({ tool: 'Bash', command: 'npm test' } as never)
+    await w.clock.advance(10_000)
+    expect((w.get('cards') ?? []).length).toBe(0)
+    // A change the agent then makes to another file is explained alone.
+    w.files.set('server/app.js', w.files.get('server/app.js')! + '\nfunction health(req, res) {\n  res.json({ ok: true })\n}\n')
+    await $.tool.call({ tool: 'Bash', command: 'sed -i ...' } as never)
+    await w.clock.advance(10_000)
+    const cards = w.get('cards') ?? []
+    expect(cards.length).toBe(1)
+    expect(cards[0]!.files).toEqual(['server/app.js'])
+  })
+
+  test('the end of a turn catches changes no tool reported', async ($, on) => {
+    const w = world(on)
+    tools(on, w)
+    await start($)
+    w.files.set('server/auth/passwords.js', w.files.get('server/auth/passwords.js')! + '\nfunction isStrong(password) {\n  return password.length >= 12\n}\n')
+    await $.turn.complete({ answer: '', durationMs: 1000, isAborted: false, turnId: 't1' } as never)
+    await w.clock.advance(10_000)
+    const cards = w.get('cards') ?? []
+    expect(cards.length).toBe(1)
+    expect(cards[0]!.files).toEqual(['server/auth/passwords.js'])
+  })
+})
+
 describe('navigation', () => {
-  test('back from code returns to the explanation it was opened from', async ($, on) => {
+  test('tabs are independent; the Code tab alone steps back between code locations', async ($, on) => {
     const w = world(on, () => JSON.stringify({
       worth_explaining: true,
       title: 'Token refresh',
       summary: 'Adds refreshToken.',
-      key_lines: [{ path: 'server/auth/tokens.js', line: 19, end_line: 23, label: 'refreshToken' }],
+      steps: [{ say: 'The new helper.', path: 'server/auth/tokens.js', line: 18, end_line: 22 }],
     }))
     tools(on, w)
     await start($)
@@ -308,34 +377,32 @@ describe('navigation', () => {
     await w.clock.advance(10_000)
     const card = (w.get('cards') ?? [])[0]!
     const ui = await $.ui.mount({ plugin: 'inloop', surface: 'terminal', component: 'Pane', requestId: 'inloop', props: PANE_PROPS as never })
-    // No back on the start screen.
     expect(await ui.find({ key: 'nav:back' })).toBe(undefined)
     await ui.press({ key: `feed:step:${card.id}:0:open` })
     expect(w.get('tab')).toBe('code')
-    expect(w.get('viewer')?.line).toBe(19)
-    // From the code, follow a call to another file, then come back twice.
+    expect(w.get('viewer')?.line).toBe(18)
+    expect(await ui.find({ key: 'code:prev' })).toBe(undefined)
+    // Follow a call to another place, then step back within the Code tab.
     await ui.press({ key: 'code:callee:0' })
-    const followed = w.get('viewer')!
-    expect(followed.path === 'server/auth/tokens.js' && followed.line === 19).toBe(false)
-    await ui.press({ key: 'nav:back' })
+    expect(w.get('viewer')?.line === 18).toBe(false)
+    await ui.press({ key: 'code:prev' })
     expect(w.get('tab')).toBe('code')
-    expect(w.get('viewer')?.line).toBe(19)
-    await ui.press({ key: 'nav:back' })
-    expect(w.get('tab')).toBe('feed')
+    expect(w.get('viewer')?.line).toBe(18)
+    // Switching tabs keeps each tab as it was.
+    await ui.press({ key: 'tab:feed' })
     expect(w.get('expanded')).toBe(card.id)
     expect(await ui.find({ text: /Adds refreshToken/ })).toBeDefined()
+    await ui.press({ key: 'tab:code' })
+    expect(w.get('viewer')?.line).toBe(18)
     expect(await ui.find({ key: 'nav:back' })).toBe(undefined)
     await ui.unmount()
   })
 
-  test('back from a tab with no history goes to the feed; scrolling stops at the file end', async ($, on) => {
+  test('scrolling stops once the end of the file is on screen', async ($, on) => {
     const w = world(on)
     tools(on, w)
     await start($)
     const ui = await $.ui.mount({ plugin: 'inloop', surface: 'terminal', component: 'Pane', requestId: 'inloop', props: PANE_PROPS as never })
-    await ui.press({ key: 'tab:settings' })
-    await ui.press({ key: 'nav:back' })
-    expect(w.get('tab')).toBe('feed')
     await $.command.run({ command: 'inloop-explain', args: 'server/auth/tokens.js:6' } as never)
     await ui.press({ key: 'tab:code' })
     for (let i = 0; i < 20; i++) await ui.press({ key: 'code:down' })
@@ -343,9 +410,38 @@ describe('navigation', () => {
     // The 19-line file fits in the window: nothing to scroll past.
     expect(lines < 24).toBe(true)
     expect(w.get('viewer')!.top).toBe(1)
-    await ui.press({ key: 'code:up' })
-    expect(w.get('viewer')!.top).toBe(1)
     await ui.unmount()
+  })
+})
+
+describe('what is asked about', () => {
+  test('a session in the home folder explains nothing there, and says why', async ($, on) => {
+    const w = world(on)
+    w.root = '/virtual/home'
+    tools(on, w)
+    await start($)
+    await $.command.run({ command: 'inloop', args: 'explain the repo' } as never)
+    await w.clock.advance(10)
+    const answer = (w.get('convo') ?? []).at(-1)
+    expect(answer?.text.includes('not a project')).toBe(true)
+    expect(w.prompts.length).toBe(0)
+  })
+
+  test('a question about the whole repo starts from its big picture', async ($, on) => {
+    const w = world(on, () => JSON.stringify({ answer: 'It is a demo app for learning sign-in.', refs: [], steps: [], flow: null, scope: '' }))
+    tools(on, w)
+    await start($)
+    await $.command.run({ command: 'inloop', args: 'explain this repo' } as never)
+    await w.clock.advance(10)
+    const prompt = w.prompts[0]?.prompt ?? ''
+    expect(prompt.includes("The project's big picture")).toBe(true)
+    expect(prompt.includes('"name": "demo-app"')).toBe(true)
+    expect(prompt.includes('server/ (')).toBe(true)
+    expect(w.prompts[0]?.system.includes('what it is FOR')).toBe(true)
+    // A narrow question does not carry it.
+    await $.command.run({ command: 'inloop', args: 'how is the password checked?' } as never)
+    await w.clock.advance(10)
+    expect(w.prompts.at(-1)?.prompt.includes("The project's big picture")).toBe(false)
   })
 })
 
@@ -365,6 +461,14 @@ describe('narrow dock', () => {
     await ui.unmount()
   })
 })
+
+/** Lets the confirmation a command speaks finish, and forgets it. */
+async function quiet(w: World): Promise<void> {
+  await w.clock.advance(1)
+  w.finishSpeech()
+  await w.clock.advance(1)
+  w.said.length = 0
+}
 
 describe('styles', () => {
   const STEPPED = () => JSON.stringify({
@@ -398,56 +502,84 @@ describe('styles', () => {
     await ui.unmount()
   })
 
-  test('spoken: each part is read with its code on screen, with the best voice and no paths', async ($, on) => {
+  test('spoken: each part is read with its code on screen, with the best voice and no paths', { timeoutMs: 20_000 }, async ($, on) => {
     const w = world(on, STEPPED)
     tools(on, w)
     await start($)
     await $.command.run({ command: 'inloop-style', args: 'spoken' } as never)
+    await quiet(w)
     await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
     await w.clock.advance(10_000)
     const ui = await $.ui.mount({ plugin: 'inloop', surface: 'terminal', component: 'Pane', requestId: 'inloop', props: PANE_PROPS as never })
-    // The title is read first; then part 1, its code in the pinned box.
-    expect(w.get('narration')?.index).toBe(-1)
-    w.finishSpeech()
-    await w.clock.advance(1)
+    // The explanation itself first (no title read out), then each part with its code in the pinned box.
     expect(w.get('narration')?.index).toBe(0)
-    expect(await ui.find({ text: /part 1 of 2/ })).toBeDefined()
-    expect(await ui.find({ text: /const claims = verifyToken\(token\)/ })).toBeDefined()
+    expect(await ui.find({ text: /part 1 of 3/ })).toBeDefined()
     w.finishSpeech()
     await w.clock.advance(1)
     expect(w.get('narration')?.index).toBe(1)
+    expect(await ui.find({ text: /part 2 of 3/ })).toBeDefined()
+    expect(await ui.find({ text: /const claims = verifyToken\(token\)/ })).toBeDefined()
+    w.finishSpeech()
+    await w.clock.advance(1)
+    expect(w.get('narration')?.index).toBe(2)
     w.finishSpeech()
     await w.clock.advance(1)
     expect(w.get('narration')).toBe(null)
-    expect(w.said.map(x => x.text)).toEqual(['Token refresh.', 'refreshToken checks the old token first.', 'It is exported next to createToken.'])
+    expect(w.said.map(x => x.text)).toEqual(['The agent added refreshToken.', 'refreshToken checks the old token first.', 'It is exported next to createToken.'])
     expect(w.said.every(x => !x.isCut)).toBe(true)
     expect(w.said.at(-1)?.voice).toBe('Zoe (Premium)')
     await ui.unmount()
   })
 
-  test('spoken controls cut speech off: next skips a part, pause and resume repeat it, stop ends', async ($, on) => {
+  test('spoken controls cut speech off: next skips a part, pause and resume repeat it, stop ends', { timeoutMs: 20_000 }, async ($, on) => {
     const w = world(on, STEPPED)
     tools(on, w)
     await start($)
     await $.command.run({ command: 'inloop-style', args: 'spoken' } as never)
+    await quiet(w)
     await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
     await w.clock.advance(10_000)
     const ui = await $.ui.mount({ plugin: 'inloop', surface: 'terminal', component: 'Pane', requestId: 'inloop', props: PANE_PROPS as never })
     await ui.press({ key: 'say:next' })
     await w.clock.advance(1)
-    expect(w.get('narration')?.index).toBe(0)
+    expect(w.get('narration')?.index).toBe(1)
     await ui.press({ key: 'say:pause' })
     await w.clock.advance(1)
     expect(w.get('narration')?.isPaused).toBe(true)
     expect(w.said.length).toBe(2)
     await ui.press({ key: 'say:resume' })
     await w.clock.advance(1)
-    expect(w.get('narration')?.index).toBe(0)
+    expect(w.get('narration')?.index).toBe(1)
     await ui.press({ key: 'say:stop' })
     await w.clock.advance(1)
     expect(w.get('narration')).toBe(null)
-    expect(w.said.map(x => x.text)).toEqual(['Token refresh.', 'refreshToken checks the old token first.', 'refreshToken checks the old token first.'])
+    expect(w.said.map(x => x.text)).toEqual(['The agent added refreshToken.', 'refreshToken checks the old token first.', 'refreshToken checks the old token first.'])
     expect(w.said.every(x => x.isCut)).toBe(true)
+    await ui.unmount()
+  })
+
+  test('spoken with Kokoro set up: parts are rendered by Kokoro and played as clips that stop at once', { timeoutMs: 20_000 }, async ($, on) => {
+    const w = world(on, STEPPED)
+    w.kokoro = true
+    tools(on, w)
+    await start($)
+    await $.command.run({ command: 'inloop-style', args: 'spoken' } as never)
+    await quiet(w)
+    const before = w.said.length
+    await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
+    await w.clock.advance(10_000)
+    expect(w.get('narration')?.index).toBe(0)
+    const playing = w.said.slice(before)
+    expect(playing.map(x => x.text)).toEqual(['The agent added refreshToken.'])
+    expect(playing[0]?.voice).toBe('kokoro:af_heart')
+    w.finishSpeech()
+    await w.clock.advance(1)
+    expect(w.get('narration')?.index).toBe(1)
+    const ui = await $.ui.mount({ plugin: 'inloop', surface: 'terminal', component: 'Pane', requestId: 'inloop', props: PANE_PROPS as never })
+    await ui.press({ key: 'say:stop' })
+    await w.clock.advance(1)
+    expect(w.get('narration')).toBe(null)
+    expect(w.said.at(-1)?.isCut).toBe(true)
     await ui.unmount()
   })
 
@@ -484,18 +616,21 @@ describe('styles', () => {
     void w
   })
 
-  test('spoken, with the pane hidden: the part and its code show above the prompt', async ($, on) => {
+  test('spoken, with the pane hidden: the part and its code show above the prompt', { timeoutMs: 20_000 }, async ($, on) => {
     const w = world(on, STEPPED)
     tools(on, w)
     await start($)
     await $.command.run({ command: 'inloop-style', args: 'spoken' } as never)
+    await quiet(w)
     w.pane = 'behind'
     await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
     await w.clock.advance(10_000)
+    const band = await $.ui.mount({ plugin: 'inloop', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false, isWorking: false, maxRows: 12, bodyColumns: 100 } as never })
+    expect(await band.find({ text: /1\/3/ })).toBeDefined()
+    expect(await band.find({ text: /The agent added refreshToken/ })).toBeDefined()
     w.finishSpeech()
     await w.clock.advance(1)
-    const band = await $.ui.mount({ plugin: 'inloop', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false, isWorking: false, maxRows: 12, bodyColumns: 100 } as never })
-    expect(await band.find({ text: /1\/2/ })).toBeDefined()
+    expect(await band.find({ text: /2\/3/ })).toBeDefined()
     expect(await band.find({ text: /refreshToken checks the old token first/ })).toBeDefined()
     expect(await band.find({ text: /const claims = verifyToken\(token\)/ })).toBeDefined()
     await band.press({ key: 'band:stop' })

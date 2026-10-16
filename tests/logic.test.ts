@@ -2,7 +2,7 @@ import { describe, expect, test } from 'claude-code/testing'
 
 import { analyzeChange, extractSymbols, findCalls, matchesFocus } from '../src/analysis'
 import { Batcher, hash } from '../src/batcher'
-import { changedLines, unifiedDiff } from '../src/diff'
+import { changedLines, formatRanges, summarizeDiff, unifiedDiff } from '../src/diff'
 import { describeFlow, extractJson, speakable, staticCard, diffBatch } from '../src/explain'
 import { buildIndex, callersOf, findSymbols, lookup, traceFlow, urlMatches } from '../src/graph'
 import { isSafeRev, isSensitive, redact, toRelative } from '../src/security'
@@ -260,5 +260,44 @@ describe('voices', () => {
     const long = 'One sentence here. '.repeat(60)
     expect(speakable(long).length <= 450).toBe(true)
     expect(speakable(long).endsWith('.')).toBe(true)
+  })
+})
+
+describe('diff summaries', () => {
+  test('per file: lines added and removed, and the changed ranges', () => {
+    const combined = [
+      '--- a/server/app.js',
+      '+++ b/server/app.js',
+      '@@ -8,3 +8,5 @@',
+      " app.post('/api/login', login)",
+      "+app.post('/api/logout', logout)",
+      "+app.post('/api/refresh', refresh)",
+      " app.post('/api/register', register)",
+      '-// old note',
+      ' ',
+      '--- a/web/session.js',
+      '+++ b/web/session.js',
+      '@@ -1,3 +1,2 @@',
+      '--- an SQL-style comment line removed',
+      ' export function saveToken(token) {',
+      ' }',
+    ].join('\n')
+    const files = summarizeDiff(combined)
+    expect(files.map(f => f.path)).toEqual(['server/app.js', 'web/session.js'])
+    expect([files[0]!.added, files[0]!.removed]).toEqual([2, 1])
+    // The removal sits after an unchanged line, so it is a range of its own.
+    expect(files[0]!.ranges).toEqual([[9, 10], [12, 12]])
+    expect(formatRanges(files[0]!.ranges)).toBe('9-10, 12')
+    expect([files[1]!.added, files[1]!.removed]).toEqual([0, 1])
+    expect(files[1]!.ranges).toEqual([[1, 1]])
+    expect(files[1]!.hunks.startsWith('@@ -1,3 +1,2 @@')).toBe(true)
+  })
+
+  test("git's own patch preamble is left out of a file's hunks", () => {
+    const patch = ['diff --git a/a.js b/a.js', 'index 1111111..2222222 100644', '--- a/a.js', '+++ b/a.js', '@@ -1 +1 @@', '-x', '+y',
+      'diff --git a/new.js b/new.js', 'new file mode 100644', '--- /dev/null', '+++ b/new.js', '@@ -0,0 +1 @@', '+hello'].join('\n')
+    const files = summarizeDiff(patch)
+    expect(files.map(f => [f.path, f.added, f.removed])).toEqual([['a.js', 1, 1], ['new.js', 1, 0]])
+    expect(files[0]!.hunks.includes('diff --git')).toBe(false)
   })
 })

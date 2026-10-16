@@ -65,4 +65,36 @@ export function needsBetterVoice(voices: readonly Voice[]): boolean {
 }
 
 export const VOICE_HELP =
-  'For a natural voice (free, offline): System Settings → Accessibility → Spoken Content → System voice → Manage Voices… → English → download a voice marked **Premium** (for example *Zoe* or *Ava*). inloop uses it automatically.'
+  'For the most natural voice (free, offline): run `/inloop-voice setup` to install Kokoro (~200 MB, once). Or download a Mac voice marked **Premium**: System Settings → Accessibility → Spoken Content → System voice → Manage Voices…'
+
+/** Kokoro's voices worth offering (all built into its voice file), best first. */
+export const KOKORO_VOICES: readonly { id: string; label: string }[] = [
+  { id: 'af_heart', label: 'Heart (US, warm)' },
+  { id: 'af_bella', label: 'Bella (US)' },
+  { id: 'af_nicole', label: 'Nicole (US, soft)' },
+  { id: 'am_michael', label: 'Michael (US)' },
+  { id: 'am_fenrir', label: 'Fenrir (US)' },
+  { id: 'bf_emma', label: 'Emma (UK)' },
+  { id: 'bm_george', label: 'George (UK)' },
+]
+
+export type VoicePlan = { engine: 'kokoro'; id: string } | { engine: 'system'; name: string | undefined }
+
+/**
+ * Which engine and voice speak, from the setting: `kokoro:<id>`, a system
+ * voice's name, or '' for the best available (Kokoro when it is set up).
+ */
+export function planVoice(setting: string, isKokoroReady: boolean, systemVoices: readonly Voice[]): VoicePlan {
+  if (setting.startsWith('kokoro:')) {
+    const id = setting.slice('kokoro:'.length)
+    if (isKokoroReady && KOKORO_VOICES.some(v => v.id === id)) return { engine: 'kokoro', id }
+    return { engine: 'system', name: pickVoice(systemVoices, '') }
+  }
+  if (setting === '' && isKokoroReady) return { engine: 'kokoro', id: KOKORO_VOICES[0]!.id }
+  return { engine: 'system', name: pickVoice(systemVoices, setting) }
+}
+
+export function describePlan(plan: VoicePlan): string {
+  if (plan.engine === 'kokoro') return `${KOKORO_VOICES.find(v => v.id === plan.id)?.label ?? plan.id} (Kokoro)`
+  return plan.name ?? 'the system voice'
+}
