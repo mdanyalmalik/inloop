@@ -1,6 +1,6 @@
 {
   "name": "inloop",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "A second presence beside the coding agent: it watches the agent's edits, explains what changed, traces code flows, and walks through git history, read-only.",
   "author": {
     "name": "Danyal Malik"

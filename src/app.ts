@@ -909,6 +909,16 @@ export class App {
   }
 
   /**
+   * What a stop or close lets go of: the explanations waiting to be read. While
+   * away, those wait for /inloop-play and are kept; only one asked for goes.
+   */
+  private dropWaiting(): void {
+    if (!this.isAway) return this.clearQueue()
+    for (const e of this.narrationQueue.filter(e => e.isAsked)) void e.speaker?.then(sp => sp.close())
+    this.narrationQueue = this.narrationQueue.filter(e => !e.isAsked)
+  }
+
+  /**
    * Queues a card to be read aloud, its code shown part by part. `first` (a
    * press of listen) reads it now, ahead of the rest, even while away.
    */
@@ -1014,7 +1024,7 @@ export class App {
 
   /** Stops reading; the explanation stays loaded at part 1, to replay or close. */
   narrationStop(): void {
-    this.clearQueue()
+    this.dropWaiting()
     this.interrupt('stop')
   }
 
@@ -1028,7 +1038,7 @@ export class App {
 
   /** Stops reading if it is, and unloads the explanation and its audio. */
   async narrationClose(): Promise<void> {
-    this.clearQueue()
+    this.dropWaiting()
     if (this.isNarrating) {
       this.isClosing = true
       this.interrupt('stop')
@@ -1275,8 +1285,11 @@ export class App {
    */
   async speak(text: string): Promise<void> {
     if (this.isNarrating) return
-    // Other audio: the kept explanation goes.
-    if (this.held !== null) await this.narrationClose()
+    // Other audio: the kept explanation goes (what waits to be read stays).
+    if (this.held !== null) {
+      this.release()
+      await this.host.state.narration.update(() => null)
+    }
     this.oneOff?.close()
     try {
       const speaker = await this.speaker([speakable(text, 400)], () => false)
@@ -1667,6 +1680,8 @@ export class App {
     }
     if (change.style === 'written') {
       void this.narrationClose()
+      // Nothing is read in written style, so nothing waits to be (an away feed marks what was written).
+      this.clearQueue()
       this.oneOff?.close()
       this.oneOff = null
     }

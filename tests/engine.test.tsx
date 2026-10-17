@@ -1639,6 +1639,39 @@ describe('styles', () => {
     expect(w.get('status').waiting).toBe(0)
   })
 
+  test('away: a voice test, or listening to one explanation and closing it, keeps what waits', { timeoutMs: 60_000 }, async ($, on) => {
+    const w = world(on, STEPPED)
+    w.kokoro = true
+    tools(on, w)
+    await start($)
+    await $.command.run({ command: 'inloop-style', args: 'spoken' } as never)
+    await quiet(w)
+    await $.command.run({ command: 'inloop-away', args: '' } as never)
+    await jobs($, w, 2)
+    expect(w.get('status').waiting).toBe(2)
+    const ui = await $.ui.mount({ plugin: 'inloop', surface: 'terminal', component: 'Pane', requestId: 'inloop', props: PANE_PROPS as never })
+    // Listening to one now reads it, even while away (so it no longer waits); closing it leaves the rest waiting.
+    const card = w.get('cards')[1]!
+    await ui.press({ key: `feed:card:${card.id}` })
+    await ui.press({ key: `feed:say:${card.id}` })
+    await w.clock.advance(1)
+    expect(w.get('narration')?.cardId).toBe(card.id)
+    await ui.press({ key: 'say:close' })
+    await w.clock.advance(1)
+    expect(w.get('narration')).toBe(null)
+    expect(w.get('status').waiting).toBe(1)
+    // A voice test is other audio: it plays, and what waits stays.
+    await ui.press({ key: 'tab:settings' })
+    await ui.press({ key: 'set:testvoice' })
+    await w.clock.advance(1)
+    w.finishSpeech()
+    await w.clock.advance(1)
+    expect(w.get('status').waiting).toBe(1)
+    await ui.unmount()
+    const back = await $.command.run({ command: 'inloop-play', args: '' } as never) as { text: string }
+    expect(back.text).toContain('Reading 1 explanation,')
+  })
+
   test('away survives /clear: what waits is still there to play', { timeoutMs: 60_000 }, async ($, on) => {
     const w = world(on, STEPPED)
     w.kokoro = true
