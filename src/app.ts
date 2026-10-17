@@ -54,12 +54,19 @@ const MAX_QUEUED_BATCHES = 3
 export const RECENT_MINUTES = 180
 const RECENT_KEEP_MS = RECENT_MINUTES * 60_000
 const SPIN_MS = 120
+/** Explanations whose audio is kept made at once (waiting, being read, kept to replay); the rest wait as text. */
+const AUDIO_MAX = 5
+/** Explanations waiting to be read; past this a new one is written in the feed only. */
+const NARRATION_MAX = 20
 /** Waits before each retry of a model call that failed in passing: about a minute in all. */
 const RETRY_WAITS_MS = [2000, 5000, 12_000, 30_000]
 const NO_PLAYER = 'The natural voice needs an audio player, and none was found (on Linux: pipewire, pulseaudio-utils, alsa-utils or ffmpeg). Until then inloop uses the system voice.'
 
 /** Pieces of speech played in turn; each can be cut off. */
-type Speaker = { play: (i: number) => Promise<void>; stopPiece: () => void; close: () => void }
+/** Reads one explanation's parts; `rendered` settles once all its audio is made (at once for the system voice). */
+type Speaker = { play: (i: number) => Promise<void>; stopPiece: () => void; close: () => void; rendered: Promise<void> }
+/** An explanation waiting to be read; its speaker is made ahead, for a few at a time. */
+type Queued = { card: InloopCard; steps: InloopStep[]; speaker: Promise<Speaker> | null; isRendered: boolean; isAsked: boolean; isAway: boolean }
 
 type RawEdit = { tool: string; rel: string; input: Record<string, unknown>; before: string | null | undefined; at: number }
 type RecentBatch = { at: number; batch: Batch }
@@ -101,6 +108,7 @@ export class App {
     const settings: InloopSettings = { ...DEFAULT_SETTINGS, ...kept }
     if (kept.style === undefined && oldSpeak === true) settings.style = 'spoken'
     await this.host.state.settings.update(() => settings)
+    this.isAway = isAwayOn(settings)
     const history = (await this.host.storeGet('history').catch(() => undefined)) as InloopCard[] | undefined
     if (Array.isArray(history) && history.length > 0) {
       if ((await this.host.state.history.get()).length === 0) await this.host.state.history.update(() => history)
@@ -165,7 +173,7 @@ export class App {
     this.aborter.abort()
     this.timer?.cancel()
     this.animate(false)
-    this.narrationQueue = []
+    this.clearQueue()
     this.interrupt('stop')
     this.release()
   }
@@ -177,12 +185,17 @@ export class App {
    * watching goes on. Changes already noticed are still explained.
    */
   restart(): void {
+    // What was waiting to be read still is (its audio is made again).
+    const waiting = this.narrationQueue.filter(e => !e.isAsked).map(e => ({ ...e, speaker: null, isRendered: false }))
     this.stop()
     this.aborter = new AbortController()
     this.isClosing = false
     this.startedAt = Date.now()
     this.detach(async () => {
       await this.ensureState().catch(() => undefined)
+      this.narrationQueue = [...waiting, ...this.narrationQueue]
+      this.prerender()
+      this.startNarration()
       await this.schedule()
       if (this.queue.length > 0) void this.work()
     })
@@ -316,11 +329,14 @@ export class App {
       queued: this.queue.length,
       pendingChanges: this.batcher.size,
       recentBatches: this.recent.length,
+      waiting: this.narrationQueue.length,
+      voiced: this.narrationQueue.filter(e => e.isRendered).length,
     }))
     const settings = await this.settings()
     const cards = await this.host.state.cards.get()
     const mode = settings.mode === 'focus' ? `focus: ${settings.focus || '?'}` : settings.mode
     const parts = [mode]
+    if (this.isAway) parts.push(`away · ${this.narrationQueue.length} waiting`)
     if (cards.length > 0) parts.push(`${cards.length} explained`)
     if (status.busy !== null) parts.push(status.busy)
     else if (status.pendingChanges > 0) parts.push('watching edits…')
@@ -851,14 +867,18 @@ export class App {
 
   // ---- narration -----------------------------------------------------------------
 
-  private narrationQueue: InloopCard[] = []
+  private narrationQueue: Queued[] = []
   private isNarrating = false
   private speakerNow: Speaker | null = null
+  /** The explanation being read (its audio counts toward the few kept made). */
+  private playing: Queued | null = null
   private control: 'none' | 'next' | 'prev' | 'pause' | 'stop' | 'skip' = 'none'
   private resume: (() => void) | null = null
   private autoOpened: string | null = null
   /** The person closed the pane themselves; inloop does not reopen it until they ask (/inloop). */
   isPaneClosedByPerson = false
+  /** Away (/inloop-away): explanations are queued, not read, until /inloop-play. */
+  private isAway = false
 
   /**
    * The explanation last read, kept loaded once it ends or is stopped: replay
@@ -871,26 +891,90 @@ export class App {
 
   /** Lets the kept explanation and its audio go. */
   private release(): void {
-    this.held?.speaker.close()
+    if (this.held === null) return
+    this.held.speaker.close()
     this.held = null
+    this.prerender()
   }
 
-  /** Queues a card to be read aloud, its code shown part by part. At most three wait; the oldest gives way. */
+  /** Empties the queue, letting its audio go. */
+  private clearQueue(): void {
+    for (const e of this.narrationQueue) void e.speaker?.then(sp => sp.close())
+    this.narrationQueue = []
+  }
+
+  /**
+   * Queues a card to be read aloud, its code shown part by part. `first` (a
+   * press of listen) reads it now, ahead of the rest, even while away.
+   */
   async narrate(card: InloopCard, first = false): Promise<void> {
-    // Another explanation to read: the one kept loaded goes.
-    this.release()
+    // The explanation itself first (the answer, or the change's summary), then each part with its code.
+    const steps: InloopStep[] = [{ text: card.summary, ref: { path: '' } }, ...(card.steps ?? [])]
     if (first) {
-      this.narrationQueue = [card, ...this.narrationQueue.filter(c => c.id !== card.id)]
+      const had = this.narrationQueue.find(e => e.card.id === card.id)
+      this.narrationQueue = [
+        { card, steps, speaker: had?.speaker ?? null, isRendered: had?.isRendered ?? false, isAsked: true, isAway: false },
+        ...this.narrationQueue.filter(e => e.card.id !== card.id),
+      ]
       if (this.isNarrating) this.interrupt('skip')
     } else {
-      this.narrationQueue.push(card)
-      while (this.narrationQueue.length > 3) this.narrationQueue.shift()
+      if (this.narrationQueue.length >= NARRATION_MAX) return
+      this.narrationQueue.push({ card, steps, speaker: null, isRendered: false, isAsked: false, isAway: this.isAway })
     }
     await this.host.state.narration.update(n => (n === null ? n : { ...n, queued: this.narrationQueue.length }))
-    if (!this.isNarrating) {
-      this.isNarrating = true
-      this.detach(() => this.runNarration())
-    }
+    this.prerender()
+    this.startNarration()
+    await this.refreshStatus()
+  }
+
+  /** The next explanation to read: the first waiting, or while away only one asked for. */
+  private nextToRead(): Queued | undefined {
+    const head = this.narrationQueue[0]
+    return head !== undefined && (!this.isAway || head.isAsked) ? head : undefined
+  }
+
+  private startNarration(): void {
+    if (this.isNarrating || this.nextToRead() === undefined) return
+    this.isNarrating = true
+    this.detach(() => this.runNarration())
+  }
+
+  /** A queued explanation's speaker, made once (by whichever asks first: reading it or rendering ahead). */
+  private speakerOf(entry: Queued): Promise<Speaker> {
+    entry.speaker ??= this.speaker(
+      entry.steps.map((st, i) => speakable(st.text, i === 0 ? 900 : 320)),
+      () => this.currentControl() !== 'none',
+      isPreparing => this.host.state.narration.update(n => (n === null ? n : { ...n, isPreparing })).then(() => undefined),
+    )
+    return entry.speaker
+  }
+
+  private isRendering = false
+
+  /**
+   * Makes the audio of the explanations waiting, in order, one at a time (each
+   * Kokoro render is its own process), so they play without a wait. At most
+   * AUDIO_MAX explanations' audio is kept at once, counting the one being read
+   * and the one kept to replay; the rest wait as text until a place frees up.
+   */
+  private prerender(): void {
+    if (this.isRendering) return
+    this.isRendering = true
+    this.detach(async () => {
+      try {
+        for (;;) {
+          const kept = (this.held !== null ? 1 : 0) + (this.playing !== null ? 1 : 0) + this.narrationQueue.filter(e => e.speaker !== null).length
+          const next = this.narrationQueue.find(e => e.speaker === null)
+          if (next === undefined || kept >= AUDIO_MAX || this.aborter.signal.aborted) break
+          const speaker = await this.speakerOf(next)
+          await speaker.rendered
+          next.isRendered = true
+          await this.refreshStatus()
+        }
+      } finally {
+        this.isRendering = false
+      }
+    })
   }
 
   private interrupt(control: 'next' | 'prev' | 'pause' | 'stop' | 'skip'): void {
@@ -925,7 +1009,7 @@ export class App {
 
   /** Stops reading; the explanation stays loaded at part 1, to replay or close. */
   narrationStop(): void {
-    this.narrationQueue = []
+    this.clearQueue()
     this.interrupt('stop')
   }
 
@@ -939,7 +1023,7 @@ export class App {
 
   /** Stops reading if it is, and unloads the explanation and its audio. */
   async narrationClose(): Promise<void> {
-    this.narrationQueue = []
+    this.clearQueue()
     if (this.isNarrating) {
       this.isClosing = true
       this.interrupt('stop')
@@ -972,11 +1056,13 @@ export class App {
       current = null
     }
     if (plan.engine === 'system') {
-      return { play: i => direct(texts[i] ?? ''), stopPiece: () => current?.stop(), close: () => current?.stop() }
+      return { play: i => direct(texts[i] ?? ''), stopPiece: () => current?.stop(), close: () => current?.stop(), rendered: Promise.resolve() }
     }
     const synth = this.host.synthesize(texts, plan.id, 1.0)
     const ready: (string | null | undefined)[] = texts.map(() => undefined)
     const waiters = new Map<number, () => void>()
+    let isDone: () => void = () => undefined
+    const rendered = new Promise<void>(resolve => { isDone = resolve })
     void (async () => {
       let i = 0
       try {
@@ -992,18 +1078,20 @@ export class App {
         ready[j] = null
         waiters.get(j)?.()
       }
+      isDone()
     })()
     return {
+      rendered,
       play: async i => {
         if (ready[i] === undefined) {
           // Rendering is behind (the first part, while the model loads): say so until it is ready.
-          const rendered = new Promise<void>(resolve => {
+          const done = new Promise<void>(resolve => {
             waiters.set(i, resolve)
             cancelWait = resolve
           })
           await this.preparingAudio(true, onPreparing)
           try {
-            if (ready[i] === undefined) await rendered
+            if (ready[i] === undefined) await done
           } finally {
             await this.preparingAudio(false, onPreparing)
           }
@@ -1028,6 +1116,7 @@ export class App {
         current?.stop()
         cancelWait?.()
         synth.stop()
+        isDone()
       },
     }
   }
@@ -1042,18 +1131,24 @@ export class App {
   private async runNarration(): Promise<void> {
     this.isNarrating = true
     try {
-      while (this.narrationQueue.length > 0 || this.isReplaying) {
+      for (;;) {
         let card: InloopCard
         let steps: InloopStep[]
-        let kept: Speaker | null = null
+        let speaker: Speaker
+        let writtenAt: number | undefined
         if (this.isReplaying && this.held !== null) {
-          ;({ card, steps, speaker: kept } = this.held)
+          ;({ card, steps, speaker } = this.held)
           this.held = null
         } else {
-          card = this.narrationQueue.shift()!
-          // The explanation itself first (the answer, or the change's summary), then each part with its code.
-          const lead: InloopStep = { text: card.summary, ref: { path: '' } }
-          steps = [lead, ...(card.steps ?? [])]
+          const entry = this.nextToRead()
+          if (entry === undefined) break
+          this.narrationQueue.shift()
+          // Another explanation is read: the one kept to replay goes.
+          this.release()
+          this.playing = entry
+          ;({ card, steps } = entry)
+          writtenAt = entry.isAway ? card.at : undefined
+          speaker = await this.speakerOf(entry)
         }
         this.isReplaying = false
         this.control = 'none'
@@ -1061,12 +1156,8 @@ export class App {
         // The code is shown as it is discussed: bring the pane back if it went away on its own,
         // but not if the person closed it (the band above the prompt stands in then).
         if (!this.isPaneClosedByPerson) void this.host.openPane().catch(() => undefined)
-        await this.host.state.narration.update(() => ({ cardId: card.id, title: card.title, steps, index: 0, isPaused: false, queued: this.narrationQueue.length }))
-        const speaker = kept ?? await this.speaker(
-          steps.map((st, i) => speakable(st.text, i === 0 ? 900 : 320)),
-          () => this.currentControl() !== 'none',
-          isPreparing => this.host.state.narration.update(n => (n === null ? n : { ...n, isPreparing })).then(() => undefined),
-        )
+        await this.host.state.narration.update(() => ({ cardId: card.id, title: card.title, steps, index: 0, isPaused: false, queued: this.narrationQueue.length, writtenAt }))
+        await this.refreshStatus()
         this.speakerNow = speaker
         try {
           let i = 0
@@ -1095,16 +1186,19 @@ export class App {
           }
         } finally {
           this.speakerNow = null
+          this.playing = null
         }
-        // The last one read stays loaded, to replay; one with more waiting behind it goes.
+        // The last one read stays loaded, to replay; one with more to read behind it goes.
         // (A stop emptied the queue; whatever is queued now came after it and is read.)
-        if (this.narrationQueue.length > 0 || this.isClosing) speaker.close()
+        if (this.nextToRead() !== undefined || this.isClosing) speaker.close()
         else this.held = { card, steps, speaker }
+        this.prerender()
       }
     } finally {
       this.isNarrating = false
       this.control = 'none'
       this.speakerNow = null
+      this.playing = null
       if (this.isClosing || this.held === null) {
         this.isClosing = false
         this.release()
@@ -1112,7 +1206,59 @@ export class App {
       } else {
         await this.host.state.narration.update(n => (n === null ? n : { ...n, index: 0, isPaused: false, isPreparing: false, isEnded: true, queued: 0 }))
       }
+      await this.refreshStatus()
     }
+  }
+
+  // ---- away ----------------------------------------------------------------------
+
+  /**
+   * /inloop-away: changes go on being explained, but nothing is read aloud;
+   * the explanations wait for /inloop-play, the first few with their audio made.
+   * A paused or ask mode explains changes meanwhile and comes back after.
+   */
+  async goAway(): Promise<string> {
+    const settings = await this.settings()
+    if (isAwayOn(settings)) return `Already away since ${clock(settings.away!.since)}; ${this.narrationQueue.length} waiting. /inloop-play when you are back.`
+    const from = settings.mode === 'paused' || settings.mode === 'ask' ? settings.mode : null
+    await this.setSettings({ away: { since: Date.now(), from }, ...(from !== null ? { mode: 'auto' as const } : {}) })
+    // No one is listening now: what was being read waits with the rest, from part 1.
+    const now = this.playing
+    if (now !== null && !now.isAsked) {
+      this.narrationQueue.unshift({ ...now, speaker: null, isRendered: false, isAway: true })
+      this.isClosing = true
+      this.interrupt('stop')
+    }
+    const style = settings.style === 'spoken' ? 'queued with the audio of the next few made' : 'kept in the feed, marked'
+    return `Away. New changes are explained and ${style}${from !== null ? ` (mode is auto until you are back, then ${from} again)` : ''}. /inloop-play when you are back.`
+  }
+
+  /** /inloop-play: back from away; reads what waits (spoken), or opens the first one written meanwhile. */
+  async comeBack(): Promise<string> {
+    const settings = await this.settings()
+    const away = settings.away
+    if (isAwayOn(settings)) {
+      await this.setSettings({
+        away: { ...away!, until: Date.now() },
+        ...(away!.from !== null && settings.mode === 'auto' ? { mode: away!.from } : {}),
+      })
+    }
+    const back = away !== null && away.from !== null && settings.mode === 'auto' && away.until === undefined ? ` Mode is ${away.from} again.` : ''
+    if (settings.style === 'spoken' && !this.isHeadless) {
+      const count = this.narrationQueue.length
+      if (count === 0) return `Nothing is waiting to be read.${back}`
+      this.startNarration()
+      return `Reading ${count} explanation${count === 1 ? '' : 's'}, oldest first.${back}`
+    }
+    if (away === null) return `Nothing was written while you were away.${back}`
+    const until = away.until ?? Date.now()
+    const written = (await this.host.state.cards.get()).filter(c => c.source === 'auto' && c.at >= away.since && c.at <= until)
+    if (written.length === 0) return `Nothing was written while you were away.${back}`
+    const oldest = written[written.length - 1]!
+    await this.host.state.expanded.update(() => oldest.id)
+    this.autoOpened = null
+    await this.setTab('feed')
+    return `${written.length} explanation${written.length === 1 ? ' was' : 's were'} written while you were away; the oldest is open.${back}`
   }
 
   private oneOff: Speaker | null = null
@@ -1482,6 +1628,14 @@ export class App {
       for (const c of held) this.batcher.add(c)
     }
     if (change.mode === 'paused' || change.mode === 'ask') this.queue.length = 0
+    this.isAway = isAwayOn(next)
+    if (change.voice !== undefined) {
+      // Audio made ahead in the old voice is made again in the new one.
+      const waiting = this.narrationQueue.map(e => ({ ...e, speaker: null, isRendered: false }))
+      this.clearQueue()
+      this.narrationQueue = waiting
+      this.prerender()
+    }
     if (change.style === 'written') {
       void this.narrationClose()
       this.oneOff?.close()
@@ -1574,4 +1728,14 @@ function isPassing(r: { isAnswered: false; reason: string; status?: number | nul
   if (r.reason !== 'api-error') return false
   const status = r.status ?? null
   return status === null || status === 408 || status === 409 || status === 429 || status >= 500
+}
+
+/** Away now: /inloop-away was used and /inloop-play not yet. */
+export function isAwayOn(settings: InloopSettings): boolean {
+  return settings.away !== null && settings.away !== undefined && settings.away.until === undefined
+}
+
+function clock(at: number): string {
+  const d = new Date(at)
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }

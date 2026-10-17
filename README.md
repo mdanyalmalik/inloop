@@ -157,6 +157,8 @@ Every explanation is a short summary plus a few **parts**, each a sentence or tw
 - **Written**: the newest explanation opens by itself in the Feed, with every part's code snippet inline (`↗` opens the full file). An explanation you opened yourself stays open; new ones don't push it closed.
 - **Spoken** (default): each new explanation is read aloud part by part, and a box pinned at the top of the panel shows the code for the part being read, with **⏮ ⏸ ⏭ ■** controls that take effect immediately, even mid-sentence. Up to three explanations wait their turn. If the panel is hidden behind another panel (such as Claude Code's Diff panel) or you closed it, the same narration and code show in the strip above the prompt. inloop never reopens a panel you closed; `/inloop` brings it back. Any explanation can also be played with **▶ listen**.
 
+  Explanations aren't dropped when they come in faster than they're read: they queue (up to 20) and play in order. The audio is made ahead in the background, one explanation at a time, so the next one starts without a wait. To keep that light, at most five explanations have their audio made at once (counting the one playing and the one kept to replay); the rest wait as text, and their audio is made as places free up.
+
 When an explanation finishes, or you press **■ stop**, it stays loaded: the box goes back to part 1 and offers **↻ replay** (from the start, with the audio already made, so no wait) and **✕ close**. It's unloaded only when you close it, when other audio plays (the next explanation, **▶ listen**, a voice test), or when the session ends. **✕** while it plays closes it at once.
 
 You can switch styles at any time, even mid-explanation. Switching to written stops the voice at once, including a confirmation still being said, and leaves the explanation open to read. Switching back to spoken reads the next change aloud from its start.
@@ -175,6 +177,12 @@ How many parts an explanation has depends on the change: a one-line edit is expl
 Each spoken part is one short plain sentence that doesn't read out code names, paths or line numbers, since the code is on screen. Choose a voice in Settings (with **test voice**) or with `/inloop-voice`, which lists the Kokoro and Mac voices; `/inloop-voice heart`, `/inloop-voice george`, or `/inloop-voice auto`. Only one thing speaks at a time: a confirmation never plays over an explanation. Voice files live in `~/.cache/inloop/` (the model in `kokoro/`, clips in `tts/`, which are deleted after an hour).
 
 Long work started from the panel (questions, follow-ups, narration, commit explanations) runs on inloop's own timer, so a button press answers at once. That keeps Claude Code's 10-second limit on presses from cutting an answer or the voice short.
+
+### Stepping away
+
+Run `/inloop-away` before you leave the desk. inloop goes on explaining every change, but reads nothing aloud: each explanation waits in a queue, and the audio for the first five is made ahead, so the first ones play the moment you're back. The pane shows **away since 14:02 · 4 waiting (4 with audio ready)**. A paused or ask mode explains changes while you're away and goes back to how it was when you return.
+
+Back at the desk, run `/inloop-play` (or press **▶ I'm back**). The explanations are read oldest first, each marked with how long ago it was written, and the audio for the rest is made in the background as they play. In the feed, a divider marks what was written while you were away. In written style, `/inloop-play` opens the oldest of those instead. What waits survives `/clear` and `/resume`; it doesn't survive quitting Claude Code, and nothing is explained while the machine sleeps.
 
 ### A quieter coding agent
 
@@ -207,6 +215,8 @@ Mod commands can't contain `:`, so they're named `/inloop-…`. Every one runs i
 | `/inloop-speak on\|off` | Same as spoken / written |
 | `/inloop-brief on\|off` | Keep the coding agent's replies short while inloop is active |
 | `/inloop-voice [setup \| name \| auto]` | List the voices on this machine, choose one, or set up the natural Kokoro voice |
+| `/inloop-away` | Stepping away: keep explaining changes, but hold them (with the audio of the next few made) until you're back |
+| `/inloop-play` | Back: read what was explained while you were away, oldest first |
 | `/inloop-reload` | Restart inloop if it seems to miss changes: it lets go of anything stuck, looks at the project again, and explains what it missed |
 
 Headless use works too, which is handy for scripts:

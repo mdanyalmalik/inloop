@@ -173,6 +173,7 @@ function narrationBox(k: Kit): RenderElement | null {
       <Text dimColor>
         {n.isEnded === true ? `finished · back at part 1 of ${n.steps.length}` : n.index < 0 ? 'starting' : `part ${n.index + 1} of ${n.steps.length}`}
         {n.queued > 0 ? ` · ${n.queued} more waiting` : ''}
+        {n.writtenAt !== undefined ? ` · written ${ago(n.writtenAt)} ago, while you were away` : ''}
       </Text>
       {n.isPreparing === true && !n.isPaused && <Text color="warning">{spin(k.s.frame)} generating audio… it plays as soon as it is ready</Text>}
       {n.index >= 0 && step !== undefined && <Markdown text={step.text} />}
@@ -202,6 +203,17 @@ function narrationBox(k: Kit): RenderElement | null {
       </Box>
     </Box>
   )
+}
+
+/** Written while the person was away (this time or, after they came back, the last time). */
+function wasAway(settings: InloopSettings, card: InloopCard): boolean {
+  const away = settings.away
+  return away !== null && away !== undefined && card.source === 'auto' && card.at >= away.since && card.at <= (away.until ?? Infinity)
+}
+
+function clock(at: number): string {
+  const d = new Date(at)
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }
 
 export function ago(at: number, now = Date.now()): string {
@@ -251,6 +263,15 @@ export async function renderPane(k: Kit): Promise<RenderElement> {
         <Box flexDirection="row" columnGap={1}>
           <Text color="warning" wrap="truncate-end">studying {ctx.rev.slice(0, 7)}</Text>
           <Button key="rev:working" label="use current code" plain onPress={() => app.studyRevision('working')} />
+        </Box>
+      )}
+      {settings.away !== null && settings.away.until === undefined && (
+        <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
+          <Text color="warning" wrap="truncate-end">
+            away since {clock(settings.away.since)}
+            {settings.style === 'spoken' ? ` · ${status.waiting ?? 0} waiting${(status.waiting ?? 0) > 0 ? ` (${status.voiced ?? 0} with audio ready)` : ''}` : ''}
+          </Text>
+          <Button key="away:back" label="▶ I'm back" plain onPress={() => void app.comeBack()} />
         </Box>
       )}
       {status.busy !== null && tab !== 'ask' && <Text color="suggestion">{spin(k.s.frame)} {status.busy}</Text>}
@@ -548,9 +569,12 @@ async function feedTab(k: Kit): Promise<RenderElement> {
       </Box>
       {cards.slice(0, 25).map((card, i, shown) => {
         const isFirstEarlier = card.at < app.startedAt && (i === 0 || shown[i - 1]!.at >= app.startedAt)
+        const isFirstAway = wasAway(settings, card) && (i === 0 || !wasAway(settings, shown[i - 1]!))
+        const awayCount = isFirstAway ? cards.filter(c => wasAway(settings, c)).length : 0
         return (
           <Box key={`feed:wrap:${card.id}`} flexDirection="column">
             {isFirstEarlier && <Text dimColor>── earlier sessions ──</Text>}
+            {isFirstAway && <Text color="warning">── {awayCount} written while you were away ──</Text>}
             {cardView(k, card, card.id === expanded, 'feed')}
           </Box>
         )

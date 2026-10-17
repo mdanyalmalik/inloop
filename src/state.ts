@@ -18,4 +18,5 @@ export const DEFAULT_SETTINGS: InloopSettings = {
   autoEngine: 'model',
   minScore: 3,
   quietSeconds: 6,
+  away: null,
 }

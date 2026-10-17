@@ -62,6 +62,8 @@ const COMMANDS: { name: string; description: string; argumentHint?: string }[] =
   { name: 'inloop-style', description: 'Written explanations with code, or spoken ones that show the code as they go', argumentHint: '<written|spoken>' },
   { name: 'inloop-speak', description: 'Same as /inloop-style spoken (on) or written (off)', argumentHint: '<on|off>' },
   { name: 'inloop-brief', description: "Keep the coding agent's own replies short while inloop explains changes", argumentHint: '<on|off>' },
+  { name: 'inloop-away', description: 'Stepping away: keep explaining changes, but hold them (audio for the next few made) until /inloop-play' },
+  { name: 'inloop-play', description: "Back: read what was explained while you were away, oldest first" },
   { name: 'inloop-reload', description: 'Restart inloop if it seems to miss changes: looks at the project again and explains what it missed' },
   { name: 'inloop-voice', description: 'List voices, choose one, or set up the natural Kokoro voice', argumentHint: '[setup | voice | auto]' },
 ]
@@ -563,6 +565,16 @@ export const register: Register = on => {
     }
     await app.setSettings({ mode })
     return { text: `Mode: ${mode}.` }
+  }).catch(() => ({ text: 'that command failed; see the inloop pane for details.' }))
+
+  on('command.run', { command: 'inloop-away' }, async () => {
+    if (app === null) return { text: 'inloop is not ready yet.' }
+    return { text: await app.goAway() }
+  }).catch(() => ({ text: 'that command failed; see the inloop pane for details.' }))
+
+  on('command.run', { command: 'inloop-play' }, async () => {
+    if (app === null) return { text: 'inloop is not ready yet.' }
+    return { text: await app.comeBack() }
   }).catch(() => ({ text: 'that command failed; see the inloop pane for details.' }))
 
   on('command.run', { command: 'inloop-depth' }, async ($, e) => {

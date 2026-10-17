@@ -74,6 +74,8 @@ export type World = {
   releaseSetup: () => void
   /** While true, Kokoro renders nothing until releaseRender() (a slow first render). */
   isRenderHeld: boolean
+  /** How many Kokoro renders ran (one per explanation read or made ahead). */
+  renders: number
   releaseRender: () => void
   /** The inloop pane: in front, open behind another panel, or closed. */
   pane: 'shown' | 'behind' | 'closed'
@@ -130,6 +132,7 @@ export function world(
     isGit: true,
     kokoro: false,
     clips: new Map(),
+    renders: 0,
     players: ['afplay'],
     hasSay: true,
     playersUsed: [],
@@ -311,6 +314,7 @@ export function world(
       // Kokoro renders every text and prints each clip's path.
       const texts = JSON.parse(e.input ?? '[]') as string[]
       const voice = argv[argv.indexOf('synth') + 1]
+      w.renders++
       if (w.isRenderHeld) await new Promise<void>(resolve => { w.releaseRender = resolve })
       for (const [i, text] of texts.entries()) {
         const path = `/virtual/tts/${w.clips.size}-${i}.wav`

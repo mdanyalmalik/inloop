@@ -139,6 +139,16 @@ export type InloopSettings = {
   minScore: number
   /** Seconds of quiet after the last edit before a batch is explained. */
   quietSeconds: number
+  /** Away: explanations are written and queued, not read aloud, until /inloop-play. Kept after it ends (`until`) to mark what was written meanwhile. */
+  away: InloopAway | null
+}
+
+export type InloopAway = {
+  since: number
+  /** When the person came back; unset while away. */
+  until?: number
+  /** The mode to go back to: away explains changes, so a paused or ask mode becomes auto meanwhile. */
+  from: InloopMode | null
 }
 
 /** What the person is looking at: questions are answered about this. */
@@ -185,6 +195,8 @@ export type InloopNarration = {
   isPreparing?: boolean
   /** Finished or stopped: kept loaded at part 1, to replay (the audio already made) or close. */
   isEnded?: boolean
+  /** When an explanation written while the person was away was written. */
+  writtenAt?: number
 }
 
 /** One file's net change since the person's last prompt. */
@@ -217,6 +229,9 @@ export type InloopStatus = {
   lastError?: string
   /** Speech is being rendered and nothing is playing yet. */
   isPreparingAudio?: boolean
+  /** Explanations waiting to be read aloud, and how many of them have their audio ready. */
+  waiting?: number
+  voiced?: number
   /** The natural voice is being downloaded and set up. */
   isVoiceSettingUp?: boolean
   /** The voices found when last looked for: the pane's voice controls are drawn again when they change. */

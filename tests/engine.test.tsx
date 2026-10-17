@@ -1519,5 +1519,120 @@ describe('styles', () => {
     await band.unmount()
   })
 
-})
+  /** Changes in turn, each made by a script and explained on its own. */
+  async function jobs($: { tool: { call: (e: never) => Promise<unknown> } }, w: World, count: number): Promise<void> {
+    for (let i = 0; i < count; i++) {
+      w.files.set(`server/job${i}.js`, `function job${i}(input) {\n  const scaled = input * ${i + 2}\n  return scaled\n}\n\nmodule.exports = { job${i} }\n`)
+      await $.tool.call({ tool: 'Bash', command: `node make-job.js ${i}` } as never)
+      await w.clock.advance(10_000)
+    }
+  }
 
+  test('away: explanations are written and queued, unread, with audio made for five at most', { timeoutMs: 60_000 }, async ($, on) => {
+    const w = world(on, STEPPED)
+    w.kokoro = true
+    tools(on, w)
+    await start($)
+    await $.command.run({ command: 'inloop-style', args: 'spoken' } as never)
+    await $.command.run({ command: 'inloop-mode', args: 'paused' } as never)
+    await quiet(w)
+    const away = await $.command.run({ command: 'inloop-away', args: '' } as never) as { text: string }
+    expect(away.text).toContain('/inloop-play')
+    // Away explains changes even from a paused mode.
+    expect(w.get('settings').mode).toBe('auto')
+    const renders = w.renders
+    await jobs($, w, 7)
+    expect(w.said.length).toBe(0)
+    expect(w.get('narration')).toBe(null)
+    expect(w.get('status').waiting).toBe(7)
+    expect(w.get('status').voiced).toBe(5)
+    expect(w.renders - renders).toBe(5)
+    const ui = await $.ui.mount({ plugin: 'inloop', surface: 'terminal', component: 'Pane', requestId: 'inloop', props: PANE_PROPS as never })
+    expect(await ui.find({ key: 'away:back' })).toBeDefined()
+    await ui.unmount()
+
+    const back = await $.command.run({ command: 'inloop-play', args: '' } as never) as { text: string }
+    expect(back.text).toContain('Reading 7 explanations')
+    expect(back.text).toContain('paused again')
+    expect(w.get('settings').mode).toBe('paused')
+    await w.clock.advance(1)
+    expect(w.get('narration')?.writtenAt).toBeDefined()
+    expect(w.said.at(-1)?.voice).toBe('kokoro:af_heart')
+    // The first one plays straight away: its audio was made ahead, no new render.
+    expect(w.renders - renders).toBe(5)
+    // Each one read frees a place, and the next waiting one's audio is made, one at a time.
+    const parts = w.get('narration')!.steps.length
+    for (let i = 0; i < parts; i++) {
+      w.finishSpeech()
+      await w.clock.advance(1)
+    }
+    expect(w.renders - renders).toBe(6)
+    expect(w.get('status').waiting).toBe(5)
+    for (let i = 0; i < parts * 6; i++) {
+      w.finishSpeech()
+      await w.clock.advance(1)
+    }
+    expect(w.renders - renders).toBe(7)
+    expect(w.get('status').waiting).toBe(0)
+    expect(w.get('narration')?.isEnded).toBe(true)
+  })
+
+  test('explanations arriving faster than they are read keep five audios made, the rest as text', { timeoutMs: 60_000 }, async ($, on) => {
+    const w = world(on, STEPPED)
+    w.kokoro = true
+    tools(on, w)
+    await start($)
+    await $.command.run({ command: 'inloop-style', args: 'spoken' } as never)
+    await quiet(w)
+    const renders = w.renders
+    // Nothing is finished being read while seven come in.
+    await jobs($, w, 7)
+    expect(w.get('narration')?.index).toBe(0)
+    expect(w.get('status').waiting).toBe(6)
+    expect(w.get('status').voiced).toBe(4)
+    expect(w.renders - renders).toBe(5)
+    for (let i = 0; i < 4 * 7 + 2; i++) {
+      w.finishSpeech()
+      await w.clock.advance(1)
+    }
+    // None was dropped: every one was read, each rendered once.
+    expect(w.renders - renders).toBe(7)
+    expect(w.get('status').waiting).toBe(0)
+  })
+
+  test('away survives /clear: what waits is still there to play', { timeoutMs: 60_000 }, async ($, on) => {
+    const w = world(on, STEPPED)
+    w.kokoro = true
+    tools(on, w)
+    on('session.end', () => ({ sessionId: 's1' }) as never)
+    await start($)
+    await $.command.run({ command: 'inloop-style', args: 'spoken' } as never)
+    await quiet(w)
+    await $.command.run({ command: 'inloop-away', args: '' } as never)
+    await jobs($, w, 3)
+    await $.session.end({ reason: 'clear' } as never)
+    await w.clock.advance(1)
+    expect(w.get('status').waiting).toBe(3)
+    expect(w.get('status').voiced).toBe(3)
+    expect(w.said.length).toBe(0)
+    const back = await $.command.run({ command: 'inloop-play', args: '' } as never) as { text: string }
+    expect(back.text).toContain('Reading 3 explanations')
+  })
+
+  test('away in written style: /inloop-play opens the oldest explanation written meanwhile', { timeoutMs: 60_000 }, async ($, on) => {
+    const w = world(on, STEPPED)
+    tools(on, w)
+    await start($)
+    await $.command.run({ command: 'inloop-style', args: 'written' } as never)
+    await $.command.run({ command: 'inloop-away', args: '' } as never)
+    await jobs($, w, 3)
+    const cards = w.get('cards')
+    const back = await $.command.run({ command: 'inloop-play', args: '' } as never) as { text: string }
+    expect(back.text).toContain('3 explanations were written while you were away')
+    expect(w.get('expanded')).toBe(cards[2]!.id)
+    const ui = await $.ui.mount({ plugin: 'inloop', surface: 'terminal', component: 'Pane', requestId: 'inloop', props: PANE_PROPS as never })
+    expect(await ui.find({ key: 'away:back' })).toBe(undefined)
+    await ui.unmount()
+  })
+
+})
