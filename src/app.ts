@@ -1379,6 +1379,10 @@ export class App {
     if (result.flow !== null) {
       await this.showFlow(result.flow, false)
       flowId = result.flow.id
+    } else if (kind === 'flow') {
+      // Nothing to trace: the first draw from the question's names goes too.
+      const drawn = await this.host.state.flow.get()
+      if (drawn?.isDraft === true && drawn.title === question) await this.host.state.flow.update(() => null)
     }
     const card: InloopCard = {
       id: this.newId(),
@@ -1571,7 +1575,8 @@ export class App {
   /** A flow from static analysis alone (no model), for /inloop-flow when models are off or as a first draw. */
   async quickFlow(query: string): Promise<InloopFlow | null> {
     const ctx = await this.host.state.ctx.get()
-    return staticFlow(this.repo, query, ctx.rev, this.newId(), Date.now())
+    const flow = await staticFlow(this.repo, query, ctx.rev, this.newId(), Date.now())
+    return flow === null ? null : { ...flow, isDraft: true }
   }
 
   async selectNode(nodeId: string): Promise<void> {
@@ -1580,7 +1585,8 @@ export class App {
     const node = flow.nodes.find(n => n.id === nodeId)
     if (node === undefined) return
     await this.host.state.flowSelected.update(() => nodeId)
-    await this.host.state.flowNote.update(() => 'Reading this step…')
+    // What the trace said about the step shows at once; the closer reading replaces it.
+    await this.host.state.flowNote.update(() => (node.note !== undefined ? `${node.note}\n\n*Reading this step…*` : 'Reading this step…'))
     if (node.ref !== undefined) await this.openRef(node.ref, { switchTab: false })
     try {
       const note = await explainStep(await this.env(), flow, nodeId)

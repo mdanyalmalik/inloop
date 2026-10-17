@@ -4,7 +4,7 @@
 // one definition the file can see, `inferred` when it rests on a name or URL
 // match, `runtime` where only running the code would tell.
 
-import type { InloopConfidence, InloopFlow, InloopFlowEdge, InloopFlowNode } from '../types'
+import type { InloopConfidence, InloopFlow, InloopFlowEdge, InloopFlowNode, InloopRef } from '../types'
 import {
   type CallSite,
   type CodeSymbol,
@@ -210,7 +210,7 @@ function words(text: string): string[] {
     .filter(w => w.length > 1)
 }
 
-const STOP = new Set(['the', 'what', 'when', 'how', 'does', 'happens', 'show', 'me', 'explain', 'only', 'is', 'are', 'a', 'an', 'of', 'to', 'in', 'on', 'i', 'my', 'and', 'it', 'this', 'that', 'user', 'click', 'clicks', 'button', 'where', 'from', 'get', 'gets', 'with', 'for'])
+const STOP = new Set(['the', 'what', 'when', 'how', 'does', 'happens', 'show', 'me', 'explain', 'only', 'is', 'are', 'a', 'an', 'of', 'to', 'in', 'on', 'i', 'my', 'and', 'it', 'this', 'that', 'user', 'click', 'clicks', 'button', 'where', 'from', 'get', 'gets', 'with', 'for', 'run', 'runs', 'ran', 'called', 'used', 'do', 'done', 'happen'])
 
 const STEMS: Record<string, string[]> = {
   login: ['login', 'log', 'signin', 'sign', 'authenticate', 'auth'],
@@ -258,6 +258,120 @@ export function lookup(index: CodeIndex, name: string, path?: string): CodeSymbo
  * The flow from `entries`, breadth first, every node a definition in the
  * index or an external endpoint a call names, every edge one `calleesOf` found.
  */
+/** Method names too common to follow when the receiver's type is unknown: `seen.has()` is not the repo's has(). */
+const GENERIC_METHODS = new Set([
+  'has', 'add', 'get', 'set', 'delete', 'clear', 'push', 'pop', 'shift', 'unshift', 'map', 'filter', 'find', 'some', 'every', 'includes',
+  'keys', 'values', 'entries', 'forEach', 'reduce', 'join', 'split', 'slice', 'splice', 'concat', 'sort', 'then', 'catch', 'finally', 'call',
+  'apply', 'bind', 'toString', 'update', 'read', 'write', 'close', 'open', 'start', 'stop', 'run', 'send', 'next', 'emit', 'on', 'off',
+  'once', 'test', 'match', 'replace', 'trim', 'parse', 'stringify', 'resolve', 'reject', 'append', 'remove', 'size', 'length', 'cancel',
+])
+
+/** A call worth drawing: not a common method name matched to some definition by name alone. */
+function isWorthFollowing(edge: Edge): boolean {
+  if ('external' in edge.to || edge.confidence === 'confirmed' || edge.label.startsWith('HTTP')) return true
+  return !GENERIC_METHODS.has(edge.to.name)
+}
+
+/**
+ * A flow along the steps an explanation named, in the order they run. Each
+ * link is checked against the code: a direct call keeps its confidence, a call
+ * through one or two functions in between says which, and steps no call ties
+ * together are linked "by reading the code" (inferred). Each step shows up to
+ * three confirmed calls of its own beside it. Names with no definition are left
+ * out and noted.
+ */
+export function pathFlow(
+  index: CodeIndex,
+  steps: readonly { name: string; does?: string }[],
+  options: { title: string; id: string; at: number; sideCalls?: number; maxNodes?: number },
+): InloopFlow | null {
+  const sideCalls = options.sideCalls ?? 3
+  const maxNodes = options.maxNodes ?? 24
+  const notes: string[] = []
+  const main: { s: CodeSymbol; does?: string }[] = []
+  for (const st of steps) {
+    const name = st.name.trim().replace(/\(\)$/, '')
+    if (name === '') continue
+    const s = lookup(index, name)
+    if (s === undefined) {
+      notes.push(`"${name}" was mentioned but no definition with that name exists in the code; it is left out.`)
+      continue
+    }
+    if (main.some(m => symbolId(m.s) === symbolId(s))) continue
+    main.push({ s, does: st.does })
+  }
+  if (main.length < 2) return null
+  const nodes: InloopFlowNode[] = []
+  const edges: InloopFlowEdge[] = []
+  const ids = new Map<string, string>()
+  const node = (s: CodeSymbol | ExternalTarget, depth: number, ref: InloopRef | undefined, note?: string): string => {
+    const key = 'external' in s ? `ext:${s.kind}:${s.name}` : symbolId(s)
+    const held = ids.get(key)
+    if (held !== undefined) return held
+    const id = `n${nodes.length}`
+    ids.set(key, id)
+    nodes.push({ id, label: 'external' in s ? s.name : nameIn(index, s), kind: s.kind, ref, depth, ...(note !== undefined && note !== '' ? { note } : {}) })
+    return id
+  }
+  const refOf = (s: CodeSymbol): InloopRef => ({ path: s.path, line: s.line, endLine: s.endLine, rev: index.rev, symbol: s.name })
+  const path = main.map((m, i) => node(m.s, i, refOf(m.s), m.does))
+  for (let i = 0; i + 1 < main.length; i++) {
+    edges.push({ from: path[i]!, to: path[i + 1]!, ...link(index, main[i]!.s, main[i + 1]!.s) })
+  }
+  if (edges.some(e => e.label.startsWith('linked by reading'))) {
+    notes.push('Links "by reading the code" join steps the explanation describes that no call in the code ties together directly (for example across an HTTP request or an event).')
+  }
+  // Each step's own confirmed calls, three at most, so the main line stays easy to read.
+  const onPath = new Set(main.map(m => symbolId(m.s)))
+  main.forEach((m, i) => {
+    let added = 0
+    for (const edge of calleesOf(index, m.s)) {
+      if (added >= sideCalls || nodes.length >= maxNodes) break
+      if (edge.confidence !== 'confirmed') continue
+      if ('external' in edge.to ? edge.to.kind === 'library' : onPath.has(symbolId(edge.to))) continue
+      // A utility called from all over (a UI helper, a formatter) says little about this flow.
+      if (!('external' in edge.to) && index.symbols.length < 4000 && callersOf(index, edge.to).length >= 5) continue
+      const to = node(edge.to, i + 1, 'external' in edge.to ? { path: m.s.path, line: edge.line, rev: index.rev } : refOf(edge.to))
+      if (edges.some(e => e.to === to)) continue
+      edges.push({ from: path[i]!, to, label: edge.label, confidence: edge.confidence })
+      added++
+    }
+  })
+  if (edges.some(e => e.confidence === 'runtime')) notes.push('Links marked "runtime" depend on what the program does when it runs and cannot be confirmed by reading the code.')
+  return { id: options.id, title: options.title, rev: index.rev, nodes, edges, notes, at: options.at, path }
+}
+
+/** A function's name, with its file when another definition shares the name. */
+function nameIn(index: CodeIndex, s: CodeSymbol): string {
+  const name = s.kind === 'route' ? s.name : `${s.name}()`
+  return (index.byName.get(s.name)?.length ?? 0) > 1 ? `${name} in ${s.path.split('/').pop()}` : name
+}
+
+/** How one step reaches the next: a direct call, a call through one or two functions in between, or only by reading. */
+function link(index: CodeIndex, from: CodeSymbol, to: CodeSymbol): { label: string; confidence: InloopConfidence } {
+  const direct = calleesOf(index, from).find(e => !('external' in e.to) && symbolId(e.to) === symbolId(to))
+  if (direct !== undefined) return { label: direct.label, confidence: direct.confidence }
+  // Breadth first, two calls deep at most.
+  let frontier: { s: CodeSymbol; via: CodeSymbol[]; isSure: boolean }[] = [{ s: from, via: [], isSure: true }]
+  const seen = new Set([symbolId(from)])
+  for (let depth = 0; depth < 3; depth++) {
+    const next: typeof frontier = []
+    for (const f of frontier) {
+      for (const e of calleesOf(index, f.s)) {
+        if ('external' in e.to || !isWorthFollowing(e) || seen.has(symbolId(e.to))) continue
+        const isSure = f.isSure && e.confidence === 'confirmed'
+        if (symbolId(e.to) === symbolId(to) && f.via.length > 0) {
+          return { label: `calls it through ${f.via.map(v => nameIn(index, v)).join(' → ')}`, confidence: isSure ? 'confirmed' : 'inferred' }
+        }
+        seen.add(symbolId(e.to))
+        next.push({ s: e.to, via: [...f.via, e.to], isSure })
+      }
+    }
+    frontier = next.slice(0, 200)
+  }
+  return { label: 'linked by reading the code; no call found between them', confidence: 'inferred' }
+}
+
 export function traceFlow(
   index: CodeIndex,
   entries: readonly CodeSymbol[],
@@ -293,6 +407,7 @@ export function traceFlow(
     if (depth >= maxDepth) continue
     const fromId = ids.get(symbolId(s))!
     for (const edge of calleesOf(index, s)) {
+      if (!isWorthFollowing(edge)) continue
       if (!('external' in edge.to) && options.exclude?.(edge.to) === true) continue
       if (nodes.length >= maxNodes) { truncated = true; break }
       let toId: string

@@ -14,6 +14,7 @@ import type {
   InloopSettings,
   InloopAnswers,
   InloopExchange,
+  InloopFlowNode,
   InloopStatus,
   InloopStep,
   InloopTab,
@@ -710,25 +711,43 @@ async function jumpTo(app: App, line: number, endLine: number): Promise<void> {
 // ---------------------------------------------------------------------------
 
 function flowSvg(flow: InloopFlow, selected: string | null): string {
-  const byDepth = new Map<number, typeof flow.nodes>()
-  for (const n of flow.nodes) byDepth.set(n.depth, [...(byDepth.get(n.depth) ?? []), n])
   const pos = new Map<string, { x: number; y: number }>()
   const colW = 220
   const rowH = 54
-  let maxRows = 0
-  for (const [d, nodes] of byDepth) {
-    nodes.forEach((n, i) => pos.set(n.id, { x: 20 + d * colW, y: 20 + i * rowH }))
-    maxRows = Math.max(maxRows, nodes.length)
+  let w: number
+  let h: number
+  if (flow.path !== undefined) {
+    // The main steps top to bottom; each step's own calls to its right.
+    const main = flow.path
+    let widest = 1
+    main.forEach((id, i) => {
+      pos.set(id, { x: 20, y: 20 + i * rowH })
+      const sides = flow.edges.filter(e => e.from === id && !main.includes(e.to))
+      sides.forEach((e, j) => pos.set(e.to, { x: 20 + (j + 1) * colW, y: 20 + i * rowH }))
+      widest = Math.max(widest, sides.length + 1)
+    })
+    w = 40 + widest * colW
+    h = 40 + main.length * rowH
+  } else {
+    const byDepth = new Map<number, typeof flow.nodes>()
+    for (const n of flow.nodes) byDepth.set(n.depth, [...(byDepth.get(n.depth) ?? []), n])
+    let maxRows = 0
+    for (const [d, nodes] of byDepth) {
+      nodes.forEach((n, i) => pos.set(n.id, { x: 20 + d * colW, y: 20 + i * rowH }))
+      maxRows = Math.max(maxRows, nodes.length)
+    }
+    w = 40 + (Math.max(...byDepth.keys(), 0) + 1) * colW
+    h = 40 + maxRows * rowH
   }
-  const w = 40 + (Math.max(...byDepth.keys(), 0) + 1) * colW
-  const h = 40 + maxRows * rowH
   const esc = (s: string) => s.replace(/[<>&"]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' })[c] ?? c)
   const edges = flow.edges.map(ed => {
     const a = pos.get(ed.from)
     const b = pos.get(ed.to)
     if (a === undefined || b === undefined) return ''
     const dash = ed.confidence === 'confirmed' ? '' : ed.confidence === 'inferred' ? ' stroke-dasharray="6 4"' : ' stroke-dasharray="2 4"'
-    return `<line x1="${a.x + 180}" y1="${a.y + 16}" x2="${b.x}" y2="${b.y + 16}" stroke="#8a8f98"${dash} marker-end="url(#arr)"><title>${esc(ed.confidence + ': ' + ed.label)}</title></line>`
+    // Down the column from one step to the next; across to a call beside it.
+    const [x1, y1, x2, y2] = a.x === b.x && b.y > a.y ? [a.x + 90, a.y + 32, b.x + 90, b.y] : [a.x + 180, a.y + 16, b.x, b.y + 16]
+    return `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="#8a8f98"${dash} marker-end="url(#arr)"><title>${esc(ed.confidence + ': ' + ed.label)}</title></line>`
   }).join('')
   const nodes = flow.nodes.map(n => {
     const p = pos.get(n.id)!
@@ -765,7 +784,7 @@ async function flowTab(k: Kit): Promise<RenderElement> {
   const explanation = traced !== undefined && (
     <Box flexDirection="column" marginBottom={1}>
       {isUndrawn && <Text color="warning" wrap="wrap">No diagram could be drawn for this from the code; here is the explanation.</Text>}
-      {placedAnswer(k, traced, 'flow', 'flow:answer')}
+      {placedAnswer(k, traced, 'flow', 'flow:answer', true)}
     </Box>
   )
   if (flow === null || isUndrawn) {
@@ -779,20 +798,63 @@ async function flowTab(k: Kit): Promise<RenderElement> {
   }
   const label = new Map(flow.nodes.map(n => [n.id, n.label]))
   const order = flowOrder(flow)
-  const picked = order.find(o => o.node.id === selected)
+  const byId = new Map(flow.nodes.map(n => [n.id, n]))
+  const pickedNode = selected === null ? undefined : byId.get(selected)
+  const picked = pickedNode === undefined ? undefined : { node: pickedNode, via: flow.edges.find(e => e.to === pickedNode.id) }
+  const where = (n: InloopFlowNode) => (n.ref !== undefined && IN_REPO.includes(n.kind) ? `  ${n.ref.path}:${n.ref.line ?? ''}` : `  (${n.kind})`)
+  const main = flow.path
+  // Traced along named steps: numbered, each with what it does, its own calls beside it, and how it leads on.
+  const stepsView = main !== undefined && (
+    <Box flexDirection="column" marginTop={1}>
+      {main.map((id, i) => {
+        const n = byId.get(id)
+        if (n === undefined) return null
+        const sides = flow.edges.filter(e => e.from === id && !main.includes(e.to)).flatMap(e => {
+          const side = byId.get(e.to)
+          return side === undefined ? [] : [{ e, side }]
+        })
+        const next = main[i + 1] === undefined ? undefined : flow.edges.find(e => e.from === id && e.to === main[i + 1])
+        return (
+          <Box key={`flow:step:${id}`} flexDirection="column">
+            <Button key={`node:${id}`} plain onPress={fire(k, () => app.selectNode(id))}>
+              {id === selected ? '● ' : ''}{i + 1}. {n.label}
+              {!isNarrow(k) && <Text dimColor>{where(n)}</Text>}
+            </Button>
+            {n.note !== undefined && <Box paddingLeft={3}><Text dimColor wrap="wrap">{n.note}</Text></Box>}
+            {sides.map(({ e, side }) => (
+              <Button key={`node:${side.id}`} plain onPress={fire(k, () => app.selectNode(side.id))}>
+                {'   '}{side.id === selected ? '● ' : ''}↳ {side.label}
+                {!isNarrow(k) && <Text dimColor>  {e.label}</Text>}
+              </Button>
+            ))}
+            {next !== undefined && (
+              <Text dimColor wrap="truncate-end">{'   '}{CONF_MARK[next.confidence] ?? '─'}↓ {next.confidence}: {next.label}</Text>
+            )}
+          </Box>
+        )
+      })}
+    </Box>
+  )
   return (
     <Box flexDirection="column">
       <Text weight="bold" wrap="truncate-end">{flow.title}</Text>
       <Text dimColor>
         {flow.rev !== undefined ? `at ${flow.rev.slice(0, 10)} · ` : 'working tree · '}
-        {flow.nodes.length} steps · press one to see it
+        {main !== undefined ? `${main.length} steps` : `${flow.nodes.length} steps`} · press one to see it
       </Text>
-      <Text dimColor>━ confirmed  ┅ inferred  ┈ runtime only</Text>
-      {explanation}
-      {Svg !== undefined && flow.nodes.length > 0 && (
-        <Svg source={flowSvg(flow, selected)} alt={`Flow diagram: ${flow.nodes.map(n => n.label).join(' → ')}`} isInteractive />
+      {flow.isDraft === true && (
+        <Text color="warning" wrap="wrap">
+          {k.s.status.busy !== null ? `${spin(k.s.frame)} ` : ''}A first draw from the names in your question{k.s.status.busy !== null ? '; the traced flow replaces it' : ''}.
+        </Text>
       )}
-      <Box flexDirection="column" marginTop={1}>
+      <Text dimColor>━ confirmed  ┅ inferred  ┈ runtime only</Text>
+      {Svg !== undefined && flow.nodes.length > 0 && (
+        <Svg source={flowSvg(flow, selected)} alt={`Flow diagram: ${(main ?? flow.nodes.map(n => n.id)).map(id => byId.get(id)?.label ?? '').join(' → ')}`} isInteractive />
+      )}
+      {stepsView}
+      {main !== undefined && explanation}
+      {main === undefined && explanation}
+      {main === undefined && <Box flexDirection="column" marginTop={1}>
         {order.map(({ node: n, depth, via }) => {
           const mark = via === undefined ? '◆' : CONF_MARK[via.confidence] ?? '─'
           return (
@@ -801,15 +863,11 @@ async function flowTab(k: Kit): Promise<RenderElement> {
               {depth > 0 ? `└${mark} ` : ''}
               {n.id === selected ? '● ' : ''}
               {n.label}
-              {!isNarrow(k) && (
-                <Text dimColor>
-                  {n.ref !== undefined && IN_REPO.includes(n.kind) ? `  ${n.ref.path}:${n.ref.line ?? ''}` : `  (${n.kind})`}
-                </Text>
-              )}
+              {!isNarrow(k) && <Text dimColor>{where(n)}</Text>}
             </Button>
           )
         })}
-      </Box>
+      </Box>}
       {picked !== undefined && (
         <Box flexDirection="column" marginTop={1} borderStyle="round" borderColor="suggestion" paddingX={1}>
           <Text weight="bold" wrap="truncate-end">{picked.node.label}</Text>
@@ -872,8 +930,12 @@ function answerView(k: Kit, ex: Exchange, key: string): RenderElement {
   )
 }
 
-/** An answer shown in the tab (or explanation) that asked for it, with listen and close. */
-function placedAnswer(k: Kit, ex: InloopExchange, place: 'code' | 'flow' | { card: string }, key: string): RenderElement {
+/**
+ * An answer shown in the tab (or explanation) that asked for it, with listen
+ * and close. `isBrief` shows its text and links without each part's code (the
+ * Flow tab, where the diagram is the point).
+ */
+function placedAnswer(k: Kit, ex: InloopExchange, place: 'code' | 'flow' | { card: string }, key: string, isBrief = false): RenderElement {
   const app = k.app
   const { Box, Text, Button } = k.el
   return (
@@ -883,7 +945,26 @@ function placedAnswer(k: Kit, ex: InloopExchange, place: 'code' | 'flow' | { car
         {ex.a !== undefined && <Button key={`${key}:listen`} label="▶ listen" plain onPress={fire(k, () => app.listenTo(ex.q, ex.a!))} />}
         <Button key={`${key}:close`} label="✕" plain onPress={() => app.dismissAnswer(place)} />
       </Box>
-      {answerView(k, ex, key)}
+      {isBrief && ex.a !== undefined ? briefAnswer(k, ex.a, key) : answerView(k, ex, key)}
+    </Box>
+  )
+}
+
+/** An answer's text, then one link per place it points at. */
+function briefAnswer(k: Kit, a: InloopTurn, key: string): RenderElement {
+  const { Box, Button, Markdown } = k.el
+  const places = [...(a.steps ?? []).map(st => st.ref), ...(a.refs ?? [])].filter(r => r.path !== '')
+  const seen = new Set<string>()
+  const links = places.filter(r => {
+    const id = `${r.path}:${r.line ?? ''}`
+    if (seen.has(id)) return false
+    seen.add(id)
+    return true
+  }).slice(0, 5)
+  return (
+    <Box flexDirection="column">
+      <Markdown text={a.text} />
+      {links.map((r, j) => <Button key={`${key}:ref:${j}`} plain onPress={() => k.app.openRef(r)}>↗ {refLabel(r)}</Button>)}
     </Box>
   )
 }

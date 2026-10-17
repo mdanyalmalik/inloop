@@ -419,6 +419,35 @@ describe('questions and flows', () => {
     await ui.unmount()
   })
 
+  test('a traced flow shows its steps in order with what each does; one that finds nothing draws nothing', async ($, on) => {
+    const w = world(on, prompt => {
+      if (prompt.includes('logs out')) return JSON.stringify({ answer: 'There is no logout in this code: nothing ends a session.', refs: [], steps: [], flow: null })
+      return JSON.stringify({
+        answer: 'Pressing **Log in** posts the form; the server checks the password and signs a token.',
+        refs: [],
+        steps: [],
+        flow: { path: [{ name: 'handleLogin', does: 'sends email and password' }, { name: 'POST /api/login', does: 'the login route' }, { name: 'login', does: 'checks the password' }, { name: 'createToken', does: 'signs the token' }] },
+      })
+    })
+    tools(on, w)
+    await start($)
+    const ui = await $.ui.mount({ plugin: 'inloop', surface: 'terminal', component: 'Pane', requestId: 'inloop', props: PANE_PROPS as never })
+    await $.command.run({ command: 'inloop-flow', args: 'what happens when a user logs in' } as never)
+    await w.clock.advance(100)
+    expect(w.get('flow')?.isDraft).not.toBe(true)
+    expect(await ui.find({ text: /1\. handleLogin\(\)/ })).toBeDefined()
+    expect(await ui.find({ text: /sends email and password/ })).toBeDefined()
+    expect(await ui.find({ text: /calls it through loginRequest/ })).toBeDefined()
+    // A feature that is not in the code: the first draw from its words goes, and the tab says no diagram was drawn.
+    await $.command.run({ command: 'inloop-flow', args: 'what happens when a user logs out of the login session' } as never)
+    expect(w.get('flow')?.isDraft).toBe(true)
+    await w.clock.advance(100)
+    expect(w.get('flow') ?? null).toBe(null)
+    expect(await ui.find({ text: /No diagram could be drawn/ })).toBeDefined()
+    expect(await ui.find({ text: /no logout in this code/ })).toBeDefined()
+    await ui.unmount()
+  })
+
   test('each tab answers in place: go deeper inside the explanation, explain these lines in Code', async ($, on) => {
     const w = world(on, prompt => {
       if (prompt.includes('Go deeper')) return JSON.stringify({ answer: 'Deeper: the token is signed with the server secret.', refs: [], steps: [] })

@@ -65,6 +65,8 @@ export type InloopFlowNode = {
   kind: string
   ref?: InloopRef
   depth: number
+  /** What this step does, in a few words (from the explanation that traced it). */
+  note?: string
 }
 
 export type InloopFlowEdge = {
@@ -82,6 +84,10 @@ export type InloopFlow = {
   edges: InloopFlowEdge[]
   notes: string[]
   at: number
+  /** The main steps in the order they run, by node id; the other nodes are calls beside them. Unset for a flow traced from one entry. */
+  path?: string[]
+  /** A first draw from the names in the question, until the traced flow replaces it. */
+  isDraft?: boolean
 }
 
 export type InloopViewer = {

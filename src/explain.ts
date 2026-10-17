@@ -16,7 +16,7 @@ import type {
   InloopTurn,
 } from '../types'
 import { type ChangeAnalysis, type CodeSymbol, type FileChange } from './analysis'
-import { callersOf, calleesOf, type CodeIndex, findSymbols, flowOrder, lookup, symbolId, traceFlow } from './graph'
+import { callersOf, calleesOf, type CodeIndex, findSymbols, flowOrder, lookup, pathFlow, symbolId, traceFlow } from './graph'
 import { type Repo, RepoError } from './repo'
 import { isNoise, redact } from './security'
 import { changedLines, unifiedDiff } from './diff'
@@ -852,10 +852,12 @@ export async function ask(env: Env, question: string, kind: AskKind, extra = '')
   return { answer: 'No answer was produced.', refs: [], steps: [], flow: null, scope: undefined, lookups }
 }
 
+const FLOW_SHAPE = `"flow": {"path": [{"name": "exact function, component or route name", "does": "what this step does, at most 12 words"}, ...]}: the main steps in the order they run, from where it starts to where it ends, 3 to 10 of them. Use only names you saw defined in the code (a route as "POST /api/login"). Leave out small helpers and library calls. inloop checks every link against the code and draws the diagram, so never invent a step`
+
 function flowAskFor(kind: AskKind): string {
   return kind === 'flow'
-    ? `\nThe developer wants to follow an execution flow. In your final answer include "flow": {"entry": "symbol where the flow starts", "path": ["entry", "next symbol", "..."]} using only symbol names you saw in the code. inloop draws the diagram from its own static analysis, so do not invent steps.`
-    : `\nIf a step-by-step flow would help, you may include "flow": {"entry": "...", "path": [...]} as above; otherwise "flow": null.`
+    ? `\nThe developer wants to follow an execution flow. In your final answer include ${FLOW_SHAPE}. If the code has no such flow (the feature does not exist), say so in the answer and give "flow": null.`
+    : `\nIf a step-by-step flow would help, you may include ${FLOW_SHAPE}; otherwise "flow": null.`
 }
 
 const ANSWER_SHAPE = `{"answer": "markdown, short and plain: lead with the direct answer in one or two sentences, then only what is needed to understand it. At most 120 words in total, no headings, at most one short list, unless the developer asked for detail or depth is advanced. If they asked for it briefly, at most 3 sentences. Never a pointer such as 'see above'.", "refs": [{"path": "file", "line": 10, "end_line": 24, "label": "what is there"}], "steps": ${STEPS_SHAPE} (0-3 parts pointing at the code worth looking at, in order; each adds a detail the answer does not already say, never a restatement of it), "flow": null, "scope": "the topic the developer limited the conversation to, '' if none, or 'clear' if they lifted it"}`
@@ -914,9 +916,19 @@ async function askWithReader(env: Env, st: LoopState, question: string, kind: As
 
 /** A flow drawn from the index: the model only names where to start. */
 async function flowFrom(env: Env, st: LoopState, raw: unknown, title: string, fallback: readonly CodeSymbol[]): Promise<InloopFlow | null> {
+  // The explanation found no such flow: no diagram is drawn from loose name matches.
+  if (raw === null) return null
   const index = await indexFor(env, st)
-  const o = raw !== null && typeof raw === 'object' ? (raw as Record<string, unknown>) : {}
-  const pathNames = Array.isArray(o.path) ? o.path.filter((x): x is string => typeof x === 'string').slice(0, 20) : []
+  const o = raw !== undefined && typeof raw === 'object' ? (raw as Record<string, unknown>) : {}
+  // The steps it named, in order: they are the diagram, each link checked against the code.
+  const steps = Array.isArray(o.path)
+    ? o.path.slice(0, 12).map(x => (typeof x === 'string' ? { name: x } : x !== null && typeof x === 'object' ? { name: str((x as Record<string, unknown>).name, 200), does: str((x as Record<string, unknown>).does, 160) } : { name: '' }))
+    : []
+  const entryNamed = str(o.entry, 200)
+  if (entryNamed !== '' && steps[0]?.name !== entryNamed) steps.unshift({ name: entryNamed })
+  const along = pathFlow(index, steps, { title, id: env.newId(), at: env.now })
+  if (along !== null) return along
+  const pathNames = steps.map(s => s.name).filter(n => n !== '')
   const entryName = str(o.entry, 200) || pathNames[0] || ''
   const entry = entryName !== '' ? lookup(index, entryName.replace(/\(\)$/, '')) : fallback[0]
   if (entry === undefined) return null
@@ -957,7 +969,8 @@ export async function staticFlow(repo: Repo, query: string, rev: string | undefi
   if (seeds.length === 0) return null
   // Prefer an entry nothing else calls: the start of the flow.
   const entry = seeds.find(s => callersOf(index, s).length === 0) ?? seeds[0]!
-  return traceFlow(index, [entry], { title: query, id, at })
+  // A first draw only: kept small, the traced flow replaces it.
+  return traceFlow(index, [entry], { title: query, id, at, maxDepth: 3, maxNodes: 12 })
 }
 
 // ---------------------------------------------------------------------------

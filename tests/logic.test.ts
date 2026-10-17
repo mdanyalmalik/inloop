@@ -4,7 +4,7 @@ import { analyzeChange, extractSymbols, findCalls, matchesFocus, topicsOf } from
 import { Batcher, hash } from '../src/batcher'
 import { changedLines, formatRanges, summarizeDiff, unifiedDiff } from '../src/diff'
 import { describeFlow, extractJson, kindOf, parseReply, partsFor, speakable, staticCard, diffBatch } from '../src/explain'
-import { buildIndex, callersOf, findSymbols, lookup, traceFlow, urlMatches } from '../src/graph'
+import { buildIndex, callersOf, findSymbols, lookup, pathFlow, traceFlow, urlMatches } from '../src/graph'
 import { isSafeRev, isSensitive, redact, toRelative } from '../src/security'
 import { DEMO_FIRST, DEMO_HEAD } from './fixtures'
 import { readerHooks } from '../src/reader'
@@ -193,6 +193,59 @@ describe('code index and flows', () => {
     expect(edge('handleLogin()', 'loginRequest()')?.confidence).toBe('confirmed')
     expect(labels.some(l => l.startsWith('jwt.sign'))).toBe(true)
     expect(describeFlow(flow).includes('[inferred]')).toBe(true)
+  })
+
+  test('a flow along named steps keeps their order, checks each link and notes what does not exist', () => {
+    const flow = pathFlow(index, [
+      { name: 'handleLogin', does: 'sends the form' },
+      { name: 'POST /api/login', does: 'the server route' },
+      { name: 'login()', does: 'checks the password' },
+      { name: 'createToken', does: 'signs a token' },
+      { name: 'imaginaryStep' },
+    ], { title: 'login', id: 'p', at: 0 })!
+    const byId = new Map(flow.nodes.map(n => [n.id, n]))
+    expect(flow.path!.map(id => byId.get(id)!.label)).toEqual(['handleLogin()', 'POST /api/login', 'login()', 'createToken()'])
+    expect(byId.get(flow.path![0]!)!.note).toBe('sends the form')
+    const link = (i: number) => flow.edges.find(e => e.from === flow.path![i] && e.to === flow.path![i + 1])!
+    // Through loginRequest's fetch: a URL match, so inferred, and it names the step in between.
+    expect(link(0).label).toBe('calls it through loginRequest()')
+    expect(link(0).confidence).toBe('inferred')
+    expect(link(1).confidence).toBe('confirmed')
+    expect(link(2).confidence).toBe('confirmed')
+    expect(flow.notes.some(n => n.includes('imaginaryStep'))).toBe(true)
+    // Beside login: its own calls, at most three, none of them on the main line.
+    const sides = flow.edges.filter(e => e.from === flow.path![2] && !flow.path!.includes(e.to)).map(e => byId.get(e.to)!.label)
+    expect(sides).toEqual(['findUserByEmail()', 'verifyPassword()'])
+    // Fewer than two real steps make no path.
+    expect(pathFlow(index, [{ name: 'login' }, { name: 'nothingHere' }], { title: 'x', id: 'q', at: 0 })).toBe(null)
+  })
+
+  test('beside a step: its own calls, not a utility used all over', () => {
+    const users = Array.from({ length: 5 }, (_, i) => `function use${i}() {\n  return fmt(${i})\n}\n`).join('')
+    const idx = buildIndex(files({
+      'src/flow.js': `const { fmt } = require('./fmt')\n\nfunction start() {\n  return finish(fmt(1), check(2))\n}\nfunction finish(a, b) {\n  return a + b\n}\nfunction check(x) {\n  return x > 0\n}\nmodule.exports = { start, finish, check }\n`,
+      'src/fmt.js': `function fmt(x) {\n  return String(x)\n}\n${users}module.exports = { fmt }\n`,
+    }))
+    const flow = pathFlow(idx, [{ name: 'start' }, { name: 'finish' }], { title: 's', id: 's', at: 0 })!
+    const labels = flow.nodes.map(n => n.label)
+    expect(labels.includes('check()')).toBe(true)
+    expect(labels.includes('fmt()')).toBe(false)
+    // The same call is drawn when tracing from one entry, where nothing is left out.
+    expect(traceFlow(idx, [lookup(idx, 'start')!], { title: 't', id: 't', at: 0 }).nodes.some(n => n.label === 'fmt()')).toBe(true)
+  })
+
+  test('a common method on an unknown object is not followed to a same-named function', () => {
+    const idx = buildIndex(files({
+      'src/a.js': 'function report(seen, key) {\n  if (seen.has(key)) return true\n  const part = slice(key)\n  return save(part)\n}\nfunction save(key) {\n  return key\n}\nmodule.exports = { report }\n',
+      'src/b.js': 'function slice(x) {\n  return x\n}\nmodule.exports = { slice }\n',
+      'src/set.js': 'function has(x) {\n  return x !== undefined\n}\nmodule.exports = { has }\n',
+    }))
+    const flow = traceFlow(idx, [lookup(idx, 'report')!], { title: 'r', id: 'r', at: 0 })
+    const labels = flow.nodes.map(n => n.label)
+    expect(labels.includes('save()')).toBe(true)
+    expect(labels.includes('has()')).toBe(false)
+    // Not imported, so only a name match: too common a name to follow.
+    expect(labels.includes('slice()')).toBe(false)
   })
 
   test('callers of createToken', () => {

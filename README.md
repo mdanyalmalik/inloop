@@ -130,7 +130,9 @@ Where the reader can't run (a headless `claude -p` run, or if it fails or takes 
 
 ### Flows
 
-`/inloop-flow what happens when a user logs in`, or the Flow tab's field. The diagram comes from inloop's own static index, not from the model. The model only names where the flow starts, so it cannot invent steps. If it names a function that doesn't exist, the flow notes that it was left out. Each link carries its evidence:
+`/inloop-flow what happens when a user logs in`, or the Flow tab's field. The trace names the main steps in the order they run, each with a few words on what it does. The Flow tab lists them numbered, top to bottom, with the explanation underneath (text and links to the code). The model only names the steps; inloop checks every one against its own static index, so it cannot invent any. A name with no definition is left out and noted. Each link between two steps is checked in the code: a direct call, a call through one or two functions in between (named, like *calls it through loginRequest()*), or, when no call ties them, *linked by reading the code*. Beside each step are up to three of its own confirmed calls, leaving out library calls and utilities used all over the project. Common method names that can't be resolved, such as `seen.has()` matched by name to some unrelated `has()`, are not followed.
+
+While the trace runs, the Flow tab shows a small first draw from the names in your question, marked as a draft. If the trace finds no such flow in the code (the feature doesn't exist), the draft goes, and the tab says no diagram could be drawn and shows the explanation instead. Each link carries its evidence:
 
 - **━ confirmed**: the call is written in the code and resolves to exactly one definition the file can see (same file, or imported)
 - **┅ inferred**: resolved by a name or URL match, such as a `fetch('/api/login')` matched to `app.post('/api/login')`, or a method call whose receiver type isn't checked
