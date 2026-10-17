@@ -408,11 +408,47 @@ describe('questions and flows', () => {
     expect(flow!.notes.some(n => n.includes('imaginaryStep'))).toBe(true)
     // The lookup ran and its result went back to the model.
     expect(w.prompts.some(p => p.prompt.includes('Callers: POST /api/login'))).toBe(true)
-    const convo = w.get('convo') ?? []
-    expect(convo.at(-1)?.refs?.map(r => r.path)).toEqual(['server/auth/controller.js'])
+    // The explanation is in the Flow tab, with its diagram; the Ask tab and the Code tab are left alone.
+    expect(w.get('answers').flow?.a?.refs?.map(r => r.path)).toEqual(['server/auth/controller.js'])
+    expect(w.get('convo') ?? []).toEqual([])
+    expect(w.get('viewer') ?? null).toBe(null)
     expect(w.get('ctx')?.scope).toBe('the login flow')
-    // The answer opened the first reference.
-    expect(w.get('viewer')?.path).toBe('server/auth/controller.js')
+    const ui = await $.ui.mount({ plugin: 'inloop', surface: 'terminal', component: 'Pane', requestId: 'inloop', props: PANE_PROPS as never })
+    expect(w.get('tab')).toBe('flow')
+    expect(await ui.find({ text: /runs `?handleLogin/ })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('each tab answers in place: go deeper inside the explanation, explain these lines in Code', async ($, on) => {
+    const w = world(on, prompt => {
+      if (prompt.includes('Go deeper')) return JSON.stringify({ answer: 'Deeper: the token is signed with the server secret.', refs: [], steps: [] })
+      if (prompt.includes('Explain lines')) return JSON.stringify({ answer: 'These lines check the password.', refs: [], steps: [] })
+      return JSON.stringify({ worth_explaining: true, title: 'Token refresh', summary: 'The agent added `refreshToken`.', steps: [{ say: 'The new helper.', path: 'server/auth/tokens.js', line: 18, end_line: 22 }] })
+    })
+    tools(on, w)
+    await start($)
+    await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
+    await w.clock.advance(10_000)
+    const card = w.get('cards')[0]!
+    const ui = await $.ui.mount({ plugin: 'inloop', surface: 'terminal', component: 'Pane', requestId: 'inloop', props: PANE_PROPS as never })
+    await ui.press({ key: `feed:deeper:${card.id}` })
+    await w.clock.advance(100)
+    expect(w.get('tab') ?? 'feed').toBe('feed')
+    expect(w.get('answers').cards[card.id]?.a?.text).toContain('Deeper')
+    expect(await ui.find({ text: /Deeper: the token/ })).toBeDefined()
+    expect(w.get('convo') ?? []).toEqual([])
+    await ui.press({ key: `feed:deeper:${card.id}:close` })
+    expect(w.get('answers').cards[card.id]).toBe(undefined)
+
+    await ui.press({ key: `feed:step:${card.id}:0:open` })
+    expect(w.get('tab')).toBe('code')
+    await ui.press({ key: 'code:ask' })
+    await w.clock.advance(100)
+    expect(w.get('tab')).toBe('code')
+    expect(await ui.find({ text: /These lines check the password/ })).toBeDefined()
+    expect(w.get('viewer')?.line).toBe(18)
+    expect(w.get('convo') ?? []).toEqual([])
+    await ui.unmount()
   })
 })
 

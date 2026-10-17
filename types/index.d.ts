@@ -238,6 +238,19 @@ export type InloopStatus = {
   voicesFound?: string
 }
 
+/** A question and, once ready, its answer. */
+export type InloopExchange = { q: InloopTurn; a?: InloopTurn }
+
+/** Answers kept in the tab that asked for them, away from the Ask tab's conversation. */
+export type InloopAnswers = {
+  /** "explain these lines" in the Code tab. */
+  code?: InloopExchange
+  /** A traced flow's explanation, under its diagram in the Flow tab. */
+  flow?: InloopExchange
+  /** "go deeper" on an explanation, shown inside it, by its id. */
+  cards: Record<string, InloopExchange>
+}
+
 declare module 'claude-code' {
   interface PluginState {
     inloop: {
@@ -251,6 +264,7 @@ declare module 'claude-code' {
       flowSelected: string | null
       flowNote: string | null
       convo: InloopTurn[]
+      answers: InloopAnswers
       /** The earlier question opened in the Ask tab, by its time. */
       askOpen: number | null
       settings: InloopSettings

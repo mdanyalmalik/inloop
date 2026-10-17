@@ -25,6 +25,7 @@ const flowAtom = atom({ plugin: 'inloop', key: 'flow' } as const, null)
 const flowSelectedAtom = atom({ plugin: 'inloop', key: 'flowSelected' } as const, null)
 const flowNoteAtom = atom({ plugin: 'inloop', key: 'flowNote' } as const, null)
 const convoAtom = atom({ plugin: 'inloop', key: 'convo' } as const, [])
+const answersAtom = atom({ plugin: 'inloop', key: 'answers' } as const, { cards: {} })
 const settingsAtom = atom({ plugin: 'inloop', key: 'settings' } as const, DEFAULT_SETTINGS)
 const askOpenAtom = atom({ plugin: 'inloop', key: 'askOpen' } as const, null)
 const ctxAtom = atom({ plugin: 'inloop', key: 'ctx' } as const, {})
@@ -96,7 +97,8 @@ async function finish(start: () => Promise<unknown>, result: () => Promise<strin
 /** The newest answer as plain text, with its references and any flow drawn. */
 async function lastAnswer(withFlow = false): Promise<string> {
   if (app === null) return ''
-  const turn = (await app.host.state.convo.get()).at(-1)
+  // A traced flow answers in the Flow tab; everything else in the Ask tab.
+  const turn = withFlow ? (await app.host.state.answers.get()).flow?.a : (await app.host.state.convo.get()).at(-1)
   if (turn === undefined) return 'No answer.'
   const refs = (turn.refs ?? []).map(r => `  ${r.path}${r.line !== undefined ? ':' + r.line : ''}${r.label !== undefined ? ' — ' + r.label : ''}`)
   const flow = withFlow ? await app.host.state.flow.get() : null
@@ -177,6 +179,7 @@ export const register: Register = on => {
         flowSelected: { get: () => read($, flowSelectedAtom), update: change => update($, flowSelectedAtom, change) },
         flowNote: { get: () => read($, flowNoteAtom), update: change => update($, flowNoteAtom, change) },
         convo: { get: () => read($, convoAtom), update: change => update($, convoAtom, change) },
+        answers: { get: () => read($, answersAtom), update: change => update($, answersAtom, change) },
         askOpen: { get: () => read($, askOpenAtom), update: change => update($, askOpenAtom, change) },
         settings: { get: () => read($, settingsAtom), update: change => update($, settingsAtom, change) },
         ctx: { get: () => read($, ctxAtom), update: change => update($, ctxAtom, change) },
@@ -437,6 +440,7 @@ export const register: Register = on => {
       selected: await read($, flowSelectedAtom),
       note: await read($, flowNoteAtom),
       convo: await read($, convoAtom),
+      answers: await read($, answersAtom),
       askOpen: await read($, askOpenAtom),
       history: await read($, historyAtom),
       git: await read($, gitAtom),
@@ -463,9 +467,9 @@ export const register: Register = on => {
       const placed = await showTab(undefined, () => $.ui.open({ id: PANE, title: 'inloop', columns: 64 }))
       return { text: placed ? 'Pane opened.' : 'The pane opens when the terminal is wide enough (fullscreen, ~110+ columns); commands still work.' }
     }
-    void showTab('ask', () => $.ui.open({ id: PANE, title: 'inloop', columns: 64 }))
     const isFlow = /what happens when|\bflow\b|trace|follow/i.test(q)
-    return finish(() => app!.ask(q, isFlow ? 'flow' : 'question'), () => lastAnswer(isFlow))
+    void showTab(isFlow ? 'flow' : 'ask', () => $.ui.open({ id: PANE, title: 'inloop', columns: 64 }))
+    return finish(() => app!.ask(q, isFlow ? 'flow' : 'question', undefined, isFlow ? 'flow' : 'ask'), () => lastAnswer(isFlow))
   }).catch(() => ({ text: 'that command failed; see the inloop pane for details.' }))
 
   on('command.run', { command: 'inloop-explain' }, async ($, e) => {
@@ -501,7 +505,7 @@ export const register: Register = on => {
     const quick = await app.quickFlow(q).catch(() => null)
     if (quick !== null) await app.showFlow(quick)
     void showTab('flow', () => $.ui.open({ id: PANE, title: 'inloop', columns: 64 }))
-    return finish(() => app!.ask(q, 'flow'), () => lastAnswer(true))
+    return finish(() => app!.ask(q, 'flow', undefined, 'flow'), () => lastAnswer(true))
   }).catch(() => ({ text: 'that command failed; see the inloop pane for details.' }))
 
   on('command.run', { command: 'inloop-commit' }, async ($, e) => {

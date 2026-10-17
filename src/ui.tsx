@@ -12,6 +12,8 @@ import type {
   InloopNav,
   InloopRef,
   InloopSettings,
+  InloopAnswers,
+  InloopExchange,
   InloopStatus,
   InloopStep,
   InloopTab,
@@ -39,6 +41,7 @@ export type Snapshot = {
   selected: string | null
   note: string | null
   convo: InloopTurn[]
+  answers: InloopAnswers
   askOpen: number | null
   history: InloopCard[]
   git: InloopGitView
@@ -491,12 +494,10 @@ function cardView(k: Kit, card: InloopCard, isOpen: boolean, list: 'feed' | 'his
             <Button
               key={`${list}:deeper:${card.id}`}
               label="go deeper"
-              onPress={fire(k, async () => {
-                const first = card.refs[0]
-                if (first !== undefined) await app.openRef(first, { switchTab: false })
-                await app.setTab('ask')
-                await app.ask(`Go deeper on "${card.title}": explain how this works, following the code it touches.${card.rev !== undefined ? ` (This is about revision ${card.rev.slice(0, 10)}.)` : ''}`, 'question', `deeper: ${card.title}`)
-              })}
+              onPress={fire(k, () => app.ask(
+                `Go deeper on "${card.title}": explain how this works, following the code it touches.${card.rev !== undefined ? ` (This is about revision ${card.rev.slice(0, 10)}.)` : ''}`,
+                'question', `deeper: ${card.title}`, { card: card.id },
+              ))}
             />
             {card.diff !== undefined && card.diff !== '' && (
               <Button
@@ -514,12 +515,13 @@ function cardView(k: Kit, card: InloopCard, isOpen: boolean, list: 'feed' | 'his
               onPress={fire(k, async () => {
                 const sym = card.symbols[0]
                 await app.setTab('flow')
-                await app.ask(sym !== undefined ? `Show the flow through ${sym}: what calls it and what it calls.` : `Show the flow behind: ${card.title}`, 'flow', `flow: ${card.title}`)
+                await app.ask(sym !== undefined ? `Show the flow through ${sym}: what calls it and what it calls.` : `Show the flow behind: ${card.title}`, 'flow', `flow: ${card.title}`, 'flow')
               })}
             />
             <Button key={`${list}:say:${card.id}`} label="▶ listen" onPress={fire(k, () => app.narrate(card, true))} />
             {list === 'history' && <Button key={`history:delete:${card.id}`} label="✕ delete" onPress={() => app.deleteExplanation(card.id)} />}
           </Box>
+          {k.s.answers.cards[card.id] !== undefined && placedAnswer(k, k.s.answers.cards[card.id]!, { card: card.id }, `${list}:deeper:${card.id}`)}
         </Box>
       )}
     </Box>
@@ -603,16 +605,14 @@ async function codeTab(k: Kit, width: number): Promise<RenderElement> {
       <Button
         key="code:ask"
         label={viewer.diff !== undefined ? 'explain this change' : 'explain these lines'}
-        onPress={fire(k, async () => {
-          await app.setTab('ask')
-          await app.ask(viewer.diff !== undefined
-            ? `Explain this change to ${viewer.path}${viewer.rev !== undefined ? ` in commit ${viewer.rev.slice(0, 10)}` : ''}: what it does and how the code behaves differently.`
-            : `Explain lines ${viewer.line}-${viewer.endLine} of ${viewer.path}${viewer.rev !== undefined ? ' at this revision' : ''}: what they do and why.`,
-            'question', `${viewer.path.split('/').pop()}, lines ${viewer.line}-${viewer.endLine}`)
-        })}
+        onPress={fire(k, () => app.ask(viewer.diff !== undefined
+          ? `Explain this change to ${viewer.path}${viewer.rev !== undefined ? ` in commit ${viewer.rev.slice(0, 10)}` : ''}: what it does and how the code behaves differently.`
+          : `Explain lines ${viewer.line}-${viewer.endLine} of ${viewer.path}${viewer.rev !== undefined ? ' at this revision' : ''}: what they do and why.`,
+          'question', viewer.diff !== undefined ? `this change to ${viewer.path.split('/').pop()}` : `${viewer.path.split('/').pop()}, lines ${viewer.line}-${viewer.endLine}`, 'code'))}
       />
     </Box>
   )
+  const explained = k.s.answers.code !== undefined ? placedAnswer(k, k.s.answers.code, 'code', 'code:answer') : null
   const head = (
     <Box flexDirection="column">
       <Text weight="bold" wrap="truncate-start">{viewer.path}</Text>
@@ -625,6 +625,7 @@ async function codeTab(k: Kit, width: number): Promise<RenderElement> {
       <Box flexDirection="column">
         {head}
         {nav}
+        {explained}
         <Code source={viewer.diff.split('\n').slice(0, 400).join('\n')} format="diff" path={viewer.path} wrap="truncate-end" />
       </Box>
     )
@@ -658,6 +659,7 @@ async function codeTab(k: Kit, width: number): Promise<RenderElement> {
     <Box flexDirection="column">
       {head}
       {nav}
+      {explained}
       {hlFrom > top && <Code source={slice(top, hlFrom - 1)} path={viewer.path} startLine={top} wrap="truncate-end" />}
       {hlFrom <= hlTo && (
         <Box borderStyle="quote" borderColor="suggestion">
@@ -752,14 +754,25 @@ async function flowTab(k: Kit): Promise<RenderElement> {
       submitLabel="trace"
       onSubmit={(value: string) => {
         const q = value.trim()
-        if (q !== '') app.detach(() => app.ask(q, 'flow'))
+        if (q !== '') app.detach(() => app.ask(q, 'flow', undefined, 'flow'))
       }}
     />
   )
-  if (flow === null) {
+  // The traced feature's explanation sits with its diagram; a trace that drew none says so.
+  const traced = k.s.answers.flow
+  // A flow drawn for a question carries it as its title (the quick first draw and the traced one alike).
+  const isUndrawn = traced?.a !== undefined && (flow === null || flow.title !== traced.q.text)
+  const explanation = traced !== undefined && (
+    <Box flexDirection="column" marginBottom={1}>
+      {isUndrawn && <Text color="warning" wrap="wrap">No diagram could be drawn for this from the code; here is the explanation.</Text>}
+      {placedAnswer(k, traced, 'flow', 'flow:answer')}
+    </Box>
+  )
+  if (flow === null || isUndrawn) {
     return (
       <Box flexDirection="column">
-        <Markdown text="No flow yet. Describe a feature and inloop traces it through the code: every step is a real definition, and every link says how it is known." />
+        {explanation}
+        {traced === undefined && <Markdown text="No flow yet. Describe a feature and inloop traces it through the code: every step is a real definition, and every link says how it is known." />}
         {traceInput}
       </Box>
     )
@@ -775,6 +788,7 @@ async function flowTab(k: Kit): Promise<RenderElement> {
         {flow.nodes.length} steps · press one to see it
       </Text>
       <Text dimColor>━ confirmed  ┅ inferred  ┈ runtime only</Text>
+      {explanation}
       {Svg !== undefined && flow.nodes.length > 0 && (
         <Svg source={flowSvg(flow, selected)} alt={`Flow diagram: ${flow.nodes.map(n => n.label).join(' → ')}`} isInteractive />
       )}
@@ -828,7 +842,7 @@ async function flowTab(k: Kit): Promise<RenderElement> {
 
 // ---------------------------------------------------------------------------
 
-type Exchange = { q: InloopTurn; a?: InloopTurn }
+type Exchange = InloopExchange
 
 /** The conversation as question-and-answer pairs, oldest first. */
 function exchangesOf(convo: readonly InloopTurn[]): Exchange[] {
@@ -854,6 +868,22 @@ function answerView(k: Kit, ex: Exchange, key: string): RenderElement {
       {steps.length === 0 && (ex.a.refs ?? []).slice(0, 4).map((r, j) => (
         <Button key={`${key}:ref:${j}`} plain onPress={() => app.openRef(r)}>↗ {refLabel(r)}</Button>
       ))}
+    </Box>
+  )
+}
+
+/** An answer shown in the tab (or explanation) that asked for it, with listen and close. */
+function placedAnswer(k: Kit, ex: InloopExchange, place: 'code' | 'flow' | { card: string }, key: string): RenderElement {
+  const app = k.app
+  const { Box, Text, Button } = k.el
+  return (
+    <Box flexDirection="column" marginTop={1} borderStyle="round" borderColor="suggestion" paddingX={1}>
+      <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
+        <Text weight="bold" color="suggestion" wrap="truncate-end">{ex.q.label ?? ex.q.text}</Text>
+        {ex.a !== undefined && <Button key={`${key}:listen`} label="▶ listen" plain onPress={fire(k, () => app.listenTo(ex.q, ex.a!))} />}
+        <Button key={`${key}:close`} label="✕" plain onPress={() => app.dismissAnswer(place)} />
+      </Box>
+      {answerView(k, ex, key)}
     </Box>
   )
 }

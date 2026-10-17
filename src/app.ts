@@ -7,6 +7,7 @@ import type { Host } from './host'
 import type {
   InloopCard,
   InloopContext,
+  InloopExchange,
   InloopFlow,
   InloopNav,
   InloopRef,
@@ -67,6 +68,9 @@ const NO_PLAYER = 'The natural voice needs an audio player, and none was found (
 type Speaker = { play: (i: number) => Promise<void>; stopPiece: () => void; close: () => void; rendered: Promise<void> }
 /** An explanation waiting to be read; its speaker is made ahead, for a few at a time. */
 type Queued = { card: InloopCard; steps: InloopStep[]; speaker: Promise<Speaker> | null; isRendered: boolean; isAsked: boolean; isAway: boolean }
+
+/** Where an answer is shown: the Ask tab's conversation, or the tab (or explanation) that asked. */
+export type AskPlace = 'ask' | 'code' | 'flow' | { card: string }
 
 type RawEdit = { tool: string; rel: string; input: Record<string, unknown>; before: string | null | undefined; at: number }
 type RecentBatch = { at: number; batch: Batch }
@@ -271,7 +275,7 @@ export class App {
     }))
   }
 
-  private async env(progress?: (t: string) => void): Promise<Env> {
+  private async env(progress?: (t: string) => void, isInConvo = true): Promise<Env> {
     const settings = await this.settings()
     return {
       repo: this.repo,
@@ -279,7 +283,8 @@ export class App {
       investigate: settings.useReader ? this.host.investigate : undefined,
       settings,
       ctx: await this.host.state.ctx.get(),
-      convo: await this.host.state.convo.get(),
+      // A question asked outside the Ask tab stands alone: the Ask conversation is no context for it.
+      convo: isInConvo ? await this.host.state.convo.get() : [],
       now: Date.now(),
       newId: () => this.newId(),
       signal: this.aborter.signal,
@@ -1304,22 +1309,28 @@ export class App {
 
   // ---- questions -----------------------------------------------------------------
 
-  /** Queues a question; answers land in the conversation, the feed and the viewer. */
   /**
-   * Queues a question; the answer lands in the Ask tab (and the history), never
-   * in the feed of changes. `label` is what the conversation shows for a
-   * question a button asked.
+   * Queues a question; the answer lands where it was asked (the Ask tab's
+   * conversation, or the tab or explanation that asked) and in the history,
+   * never in the feed of changes. `label` is what is shown for a question a
+   * button asked.
    */
-  ask(question: string, kind: AskKind = 'question', label?: string): Promise<void> {
+  ask(question: string, kind: AskKind = 'question', label?: string, place: AskPlace = 'ask'): Promise<void> {
     const run = async (): Promise<void> => {
       const turn: InloopTurn = { role: 'you', text: question, at: Date.now(), label }
-      await this.host.state.askOpen.update(() => null)
-      await this.host.state.convo.update(c => [...c, turn].slice(-40))
+      if (place === 'ask') {
+        await this.host.state.askOpen.update(() => null)
+        await this.host.state.convo.update(c => [...c, turn].slice(-40))
+      } else {
+        await this.putAnswer(place, { q: turn })
+      }
       try {
-        await this.whileBusy(kind === 'flow' ? 'tracing the flow…' : 'investigating…', progress => this.answer(question, kind, label, progress))
+        await this.whileBusy(kind === 'flow' ? 'tracing the flow…' : 'investigating…', progress => this.answer(question, kind, label, place, turn, progress))
       } catch (err) {
         const msg = err instanceof RepoError ? err.message : String((err as Error).message ?? err)
-        await this.host.state.convo.update(c => [...c, { role: 'inloop' as const, text: `Could not answer: ${msg}`, at: Date.now() }])
+        const failed: InloopTurn = { role: 'inloop', text: `Could not answer: ${msg}`, at: Date.now() }
+        if (place === 'ask') await this.host.state.convo.update(c => [...c, failed])
+        else await this.putAnswer(place, { q: turn, a: failed })
         await this.report(msg)
       }
     }
@@ -1327,11 +1338,28 @@ export class App {
     return this.askChain
   }
 
-  private async answer(question: string, kind: AskKind, label: string | undefined, progress: (text: string) => void): Promise<void> {
-    const env = await this.env(progress)
+  /** Shows a question, or its answer, in the tab or explanation that asked. */
+  private async putAnswer(place: Exclude<AskPlace, 'ask'>, ex: InloopExchange): Promise<void> {
+    await this.host.state.answers.update(a => (
+      typeof place === 'object' ? { ...a, cards: { ...a.cards, [place.card]: ex } } : { ...a, [place]: ex }
+    ))
+  }
+
+  /** Lets go of an answer shown in a tab or an explanation. */
+  async dismissAnswer(place: Exclude<AskPlace, 'ask'>): Promise<void> {
+    await this.host.state.answers.update(a => {
+      if (typeof place !== 'object') return { ...a, [place]: undefined }
+      const { [place.card]: _, ...cards } = a.cards
+      return { ...a, cards }
+    })
+  }
+
+  private async answer(question: string, kind: AskKind, label: string | undefined, place: AskPlace, turn: InloopTurn, progress: (text: string) => void): Promise<void> {
+    const env = await this.env(progress, place === 'ask')
     const result = await ask(env, question, kind)
     const reply: InloopTurn = { role: 'inloop', text: result.answer, at: Date.now(), refs: result.refs, steps: result.steps }
-    await this.host.state.convo.update(c => [...c, reply].slice(-40))
+    if (place === 'ask') await this.host.state.convo.update(c => [...c, reply].slice(-40))
+    else await this.putAnswer(place, { q: turn, a: reply })
     if (result.scope !== undefined) await this.host.state.ctx.update(c => ({ ...c, scope: result.scope === '' ? undefined : result.scope }))
     if (result.rev !== env.ctx.rev) await this.host.state.ctx.update(c => ({ ...c, rev: result.rev, revLabel: result.revLabel }))
     let flowId: string | undefined
@@ -1357,8 +1385,9 @@ export class App {
       flowId,
     }
     await this.addCard(card, { inFeed: false })
+    // Asked in the Ask tab, the code it points at is ready in Code; elsewhere each tab keeps what it shows.
     const first = result.refs[0]
-    if (first !== undefined) await this.openRef(first, { switchTab: false })
+    if (first !== undefined && place === 'ask') await this.openRef(first, { switchTab: false })
     if (!(await this.isPaneShown())) this.host.log(`inloop — ${question}\n\n${result.answer}`)
   }
 

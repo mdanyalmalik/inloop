@@ -86,6 +86,8 @@ Above the tabs, a small **Since your last prompt** box lists every file changed 
 
 The Ask tab's question box takes a question at any time, including while the agent is working. It's only on the Ask tab; the Flow tab has its own box for tracing a feature.
 
+The tabs are kept separate: an answer shows in the tab that asked for it and never moves you to another one. **go deeper** answers inside that explanation, **explain these lines** (and **explain this change**) answers in the Code tab above the code, and a traced flow's explanation sits under its diagram in the Flow tab (with a note when no diagram could be drawn). Each has **▶ listen** and **✕** to close it. Only questions asked in the Ask tab join its conversation, so **simpler** and **more detail** follow those alone.
+
 The seven tabs are independent: each keeps its own state, so switching away and back finds it as you left it. Inside the Code tab, **◀ previous** steps back after you follow a caller, callee or symbol to another place in the code. While you're looking at an older commit, the top of the pane says **studying <sha>**, with **use current code** to return.
 
 ### Automatic explanations
