@@ -500,6 +500,9 @@ describe('surfaces without fields', () => {
     tools(on, w)
     await start($)
     const ui = await $.ui.mount({ plugin: 'inloop', surface: 'mobile', component: 'Pane', requestId: 'inloop', props: PANE_PROPS as never })
+    // Questions belong to the Ask tab: the feed has no question box or pointer.
+    expect(await ui.find({ text: /\/inloop <question>/ })).toBe(undefined)
+    await ui.press({ key: 'tab:ask' })
     expect(await ui.find({ text: /\/inloop <question>/ })).toBeDefined()
     await ui.press({ key: 'tab:settings' })
     expect(await ui.find({ text: /inloop-mode/ })).toBeDefined()

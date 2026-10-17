@@ -333,7 +333,8 @@ export async function renderPane(k: Kit): Promise<RenderElement> {
       {statusLine}
       {narrationBox(k)}
       <Box flexDirection="column" marginTop={1}>{body}</Box>
-      <Box flexDirection="column" marginTop={1}>
+      {/* Questions are asked in the Ask tab only; the Flow tab has its own box for tracing. */}
+      {tab === 'ask' && <Box flexDirection="column" marginTop={1}>
         {contextLine}
         {Input !== undefined && (
           <Input
@@ -344,15 +345,12 @@ export async function renderPane(k: Kit): Promise<RenderElement> {
               const q = value.trim()
               if (q === '') return
               const kind = /^(show|trace|follow|walk)\b.*\b(flow|happens|path|goes)\b|what happens when/i.test(q) ? 'flow' : 'question'
-              app.detach(async () => {
-                await app.setTab('ask')
-                await app.ask(q, kind)
-              })
+              app.detach(() => app.ask(q, kind))
             }}
           />
         )}
         {Input === undefined && <Markdown text="Use `/inloop <question>` to ask." dimColor />}
-      </Box>
+      </Box>}
     </Box>
   )
 }
@@ -552,7 +550,7 @@ async function feedTab(k: Kit): Promise<RenderElement> {
           : 'As the coding agent edits files, each meaningful step appears here with a short explanation.'
     return (
       <Box flexDirection="column">
-        <Markdown text={`${how}\n\nAsk anything below — e.g. *"what happens when I click Login?"*, *"only explain how tokens are created"*, or open **Git** to study an older commit.`} />
+        <Markdown text={`${how}\n\nAsk anything in the **Ask** tab — e.g. *"what happens when I click Login?"*, *"only explain how tokens are created"*, or open **Git** to study an older commit.`} />
         {status.recentBatches > 0 && (
           <Button key="feed:recent" label={`explain recent changes (${status.recentBatches} steps)`} onPress={fire(k, () => app.explainRecent(RECENT_MINUTES))} />
         )}

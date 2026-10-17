@@ -84,7 +84,7 @@ Above the tabs, a small **Since your last prompt** box lists every file changed 
 | **6 Git** | Search commits, select one, press a changed file for its diff (then **show file** for the whole file at that commit), explain it, compare two commits, or study the code as of a date or sha |
 | **7 Settings** | Mode, focus topic, depth, models, how much is explained, grouping delay, style (written or spoken), voice (with **test voice** and *install natural voice*), whether the natural voice downloads automatically, brief agent replies, and model usage this session |
 
-The ask field at the bottom of every tab takes a question at any time, including while the agent is working.
+The Ask tab's question box takes a question at any time, including while the agent is working. It's only on the Ask tab; the Flow tab has its own box for tracing a feature.
 
 The seven tabs are independent: each keeps its own state, so switching away and back finds it as you left it. Inside the Code tab, **◀ previous** steps back after you follow a caller, callee or symbol to another place in the code. While you're looking at an older commit, the top of the pane says **studying <sha>**, with **use current code** to return.
 
