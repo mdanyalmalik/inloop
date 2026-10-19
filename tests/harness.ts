@@ -56,6 +56,15 @@ export type World = {
   isGit: boolean
   /** Whether a fake `uv` with Kokoro set up is on this machine. */
   kokoro: boolean
+  /** Whether inloop's own copy of uv is in its cache (unpacked by a fetch). */
+  isUvCached: boolean
+  /** The uv downloads curl ran, by URL; and the SHA-256 the fetched file comes out as. */
+  uvFetches: string[]
+  /** Whether a download can reach GitHub; off by default, so most tests keep the voice they start with. */
+  isOnline: boolean
+  uvSum: string
+  /** The environment the last Kokoro setup ran with. */
+  setupEnv: Record<string, string> | undefined
   /** Kokoro clip paths, to the text each was rendered from. */
   clips: Map<string, string>
   /** The audio players this machine has (macOS: afplay; a Linux box might have paplay). */
@@ -100,6 +109,10 @@ function hashText(text: string): string {
   return (h >>> 0).toString(16)
 }
 
+/** inloop's cache copy of uv, and the published sum of the build this Mac would fetch. */
+const CACHED_UV = '/virtual/home/.cache/inloop/bin/uv'
+const UV_SUM = '50487ae565ccd96e499056b4674d438f4c53170202617b4c759defe0c6a1b544'
+
 const PLAYERS = ['afplay', 'pw-play', 'paplay', 'aplay', 'ffplay', 'powershell']
 
 export function world(
@@ -131,6 +144,11 @@ export function world(
     root: ROOT,
     isGit: true,
     kokoro: false,
+    isUvCached: false,
+    uvFetches: [],
+    isOnline: false,
+    uvSum: UV_SUM,
+    setupEnv: undefined,
     clips: new Map(),
     renders: 0,
     players: ['afplay'],
@@ -210,12 +228,25 @@ export function world(
       if (!w.players.includes(argv[0]!)) throw new Error(`spawn ${argv[0]} ENOENT`)
       return ok('')
     }
-    if (argv[0] === 'uv') {
-      if (!w.kokoro) return ok('', 127, 'uv: not found')
+    // Fetching uv into the cache: the machine kind, the download, its sum, unpacking it.
+    if (argv[0] === 'uname') return ok('Darwin arm64\n')
+    if (argv[0] === 'curl') {
+      w.uvFetches.push(argv.at(-1)!)
+      return w.isOnline ? ok('') : ok('', 6, 'curl: (6) Could not resolve host: github.com')
+    }
+    if (argv[0] === 'shasum') return ok(`${w.uvSum}  ${argv.at(-1)}\n`)
+    if (argv[0] === 'tar') {
+      w.isUvCached = true
+      return ok('')
+    }
+    if (argv[0] === 'rm') return ok('')
+    if (argv[0] === 'uv' || argv[0] === CACHED_UV) {
+      if (argv[0] === 'uv' ? !w.kokoro : !w.isUvCached) return ok('', 127, 'uv: not found')
       if (argv[1] === '--version') return ok('uv 0.8.0\n')
       if (argv.includes('status')) return ok(`{"ready": ${w.isKokoroInstalled}}\n`)
       if (argv.includes('setup')) {
         w.setupRuns++
+        w.setupEnv = e.init?.env as Record<string, string> | undefined
         if (w.isSetupHeld) await new Promise<void>(resolve => { w.releaseSetup = resolve })
         w.isKokoroInstalled = true
         return ok('ready\n')
@@ -310,7 +341,7 @@ export function world(
   // `say`: a piece is spoken until the test calls finishSpeech(), or until inloop cuts it off.
   on('process.spawn', async function* ($, e, next) {
     const argv = [...e.argv]
-    if (argv[0] === 'uv' && argv.includes('synth')) {
+    if ((argv[0] === 'uv' || argv[0] === CACHED_UV) && argv.includes('synth')) {
       // Kokoro renders every text and prints each clip's path.
       const texts = JSON.parse(e.input ?? '[]') as string[]
       const voice = argv[argv.indexOf('synth') + 1]

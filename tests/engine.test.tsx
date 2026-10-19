@@ -1410,6 +1410,59 @@ describe('styles', () => {
     expect(w.setupRuns).toBe(0)
   })
 
+  test('without uv: at start, uv is fetched into the cache, checked, then the voice', { timeoutMs: 20_000 }, async ($, on) => {
+    const w = world(on, STEPPED)
+    w.stored.delete('settings')
+    w.isKokoroInstalled = false
+    w.isOnline = true
+    tools(on, w)
+    await start($)
+    await w.clock.advance(1)
+    expect(w.uvFetches.length).toBe(1)
+    expect(w.uvFetches[0]).toBe('https://github.com/astral-sh/uv/releases/download/0.12.23/uv-aarch64-apple-darwin.tar.gz')
+    expect(w.isUvCached).toBe(true)
+    expect(w.setupRuns).toBe(1)
+    // Its packages and any Python it fetches stay in inloop's cache.
+    expect(w.setupEnv).toEqual({ UV_CACHE_DIR: '/virtual/home/.cache/inloop/uv', UV_PYTHON_INSTALL_DIR: '/virtual/home/.cache/inloop/python' })
+    expect(w.toasts.some(t => /natural voice \(Kokoro\) is ready/.test(t))).toBe(true)
+    // The cached uv speaks from now on.
+    await quiet(w)
+    await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
+    await w.clock.advance(10_000)
+    expect(w.said.at(-1)?.voice).toBe('kokoro:af_heart')
+    await $.command.run({ command: 'inloop-style', args: 'written' } as never)
+    await w.clock.advance(1)
+  })
+
+  test('a uv download that does not match its published checksum is not unpacked or used', async ($, on) => {
+    const w = world(on)
+    w.isKokoroInstalled = false
+    w.isOnline = true
+    w.uvSum = '0'.repeat(64)
+    tools(on, w)
+    await start($)
+    await w.clock.advance(1)
+    expect(w.uvFetches.length).toBe(1)
+    expect(w.isUvCached).toBe(false)
+    expect(w.setupRuns).toBe(0)
+    // Asked again, it tries again and says why it could not.
+    expect((await $.command.run({ command: 'inloop-voice', args: 'setup' } as never)).text).toMatch(/fetching uv/)
+    await w.clock.advance(1)
+    expect(w.uvFetches.length).toBe(2)
+    expect(w.isUvCached).toBe(false)
+    expect(w.logs.some(t => /did not match its published checksum/.test(t))).toBe(true)
+  })
+
+  test('with the automatic download off, uv is not fetched', async ($, on) => {
+    const off = world(on, undefined, { settings: { autoVoiceSetup: false } })
+    off.isOnline = true
+    tools(on, off)
+    await start($)
+    await off.clock.advance(1)
+    expect(off.uvFetches.length).toBe(0)
+    expect(off.isUvCached).toBe(false)
+  })
+
   test('"reload voices" redraws the voice controls with what it found', async ($, on) => {
     const w = world(on, undefined, { settings: { style: 'written', autoVoiceSetup: false } })
     w.kokoro = true

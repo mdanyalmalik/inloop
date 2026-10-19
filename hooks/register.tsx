@@ -116,6 +116,62 @@ async function showTab(tab: InloopTab | undefined, open: () => Promise<{ isPlace
   return (await open()).isPlaced
 }
 
+/**
+ * The uv release inloop fetches when uv is missing, one build per machine kind
+ * (`uname -s -m`, or Windows' PROCESSOR_ARCHITECTURE), each with its SHA-256 as
+ * published by the release. The sums live here, so a changed file is refused.
+ */
+const UV_VERSION = '0.12.23'
+const UV_BUILDS: Record<string, { file: string; sha256: string }> = {
+  'Darwin arm64': { file: 'uv-aarch64-apple-darwin.tar.gz', sha256: '50487ae565ccd96e499056b4674d438f4c53170202617b4c759defe0c6a1b544' },
+  'Darwin x86_64': { file: 'uv-x86_64-apple-darwin.tar.gz', sha256: '960da44cb4b73685206ddd250b19e0a117fa41095710c1038f081f5cb613efb4' },
+  'Linux x86_64': { file: 'uv-x86_64-unknown-linux-musl.tar.gz', sha256: '1cff8783850e794470aadb73f54b749542a511fc57b0ce6468b64bd3852e0ade' },
+  'Linux aarch64': { file: 'uv-aarch64-unknown-linux-musl.tar.gz', sha256: 'b536543cc4d50661986b165c76ee8aa9056e4fa332edcd153ff2e98760f9359b' },
+  'Windows AMD64': { file: 'uv-x86_64-pc-windows-msvc.zip', sha256: '75d05de6762778c31ee183398de7dd15093fad0ed90b1f236d8205ea5ec00c90' },
+  'Windows ARM64': { file: 'uv-aarch64-pc-windows-msvc.zip', sha256: '13294e232ececbe709c06b74e6ced06f2a225ea5591476685362f22be56a50d5' },
+}
+
+type Ran = { exitCode: number | null; stdout: string; stderr: string }
+type Shell = {
+  process: { run: (argv: string[], init?: { timeoutMs?: number }) => Promise<Ran> }
+  env: { get: (name: string) => Promise<string | undefined> }
+}
+
+/**
+ * Fetches uv into `dir` (inloop's cache) for the Kokoro voice: the release's
+ * own build, its checksum checked before it is unpacked. Nothing outside `dir`
+ * is touched: no installer runs, and no PATH or shell profile changes.
+ */
+async function getUv($: Shell, dir: string): Promise<{ path?: string; text: string }> {
+  const run = (argv: string[], timeoutMs = 30_000) => $.process.run(argv, { timeoutMs }).catch(err => ({ exitCode: 1, stdout: '', stderr: String(err) }))
+  const uname = await run(['uname', '-s', '-m'], 5000)
+  const kind = uname.exitCode === 0 ? uname.stdout.trim() : `Windows ${(await $.env.get('PROCESSOR_ARCHITECTURE').catch(() => undefined)) ?? ''}`
+  const build = UV_BUILDS[kind]
+  if (build === undefined) return { text: `there is no uv build for this machine (${kind}); install uv from https://docs.astral.sh/uv/` }
+  const isWindows = kind.startsWith('Windows')
+  // A name of its own: sessions starting together each fetch their own, and none removes another's.
+  const archive = `${dir}/${build.file}.${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  const fetched = await run(['curl', '-fsSL', '--retry', '2', '--create-dirs', '-o', archive, `https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${build.file}`], 300_000)
+  if (fetched.exitCode !== 0) return { text: `uv could not be downloaded: ${fetched.stderr.trim() || `curl exited with ${fetched.exitCode}`}` }
+  try {
+    let sum: string | undefined
+    for (const argv of [['shasum', '-a', '256', archive], ['sha256sum', archive], ['certutil', '-hashfile', archive, 'SHA256']]) {
+      const hashed = await run(argv)
+      sum = hashed.exitCode === 0 ? /\b[0-9a-f]{64}\b/i.exec(hashed.stdout.replace(/ (?=[0-9a-f]{2}\b)/gi, ''))?.[0]?.toLowerCase() : undefined
+      if (sum !== undefined) break
+    }
+    if (sum === undefined) return { text: 'uv was downloaded but could not be checked (no shasum, sha256sum or certutil here)' }
+    if (sum !== build.sha256) return { text: 'the downloaded uv did not match its published checksum, so it was not used' }
+    const unpacked = await run(isWindows ? ['tar', '-xf', archive, '-C', dir] : ['tar', '-xzf', archive, '-C', dir, '--strip-components=1'], 60_000)
+    if (unpacked.exitCode !== 0) return { text: `uv could not be unpacked: ${unpacked.stderr.trim()}` }
+  } finally {
+    await run(isWindows ? ['powershell', '-NoProfile', '-NonInteractive', '-Command', `Remove-Item -LiteralPath '${archive.replace(/'/g, "''")}'`] : ['rm', '-f', archive])
+  }
+  const path = `${dir}/${isWindows ? 'uv.exe' : 'uv'}`
+  const probe = await run([path, '--version'], 10_000)
+  return probe.exitCode === 0 ? { path, text: '' } : { text: `uv was unpacked but does not run: ${probe.stderr.trim()}` }
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
@@ -123,9 +179,11 @@ export const register: Register = on => {
     app?.stop()
     // Kokoro runs through uv (an isolated environment, nothing installed system-wide).
     // Nothing about the voice may keep inloop from starting.
-    const home = (await $.env.get('HOME').catch(() => undefined)) ?? ''
+    const home = (await $.env.get('HOME').catch(() => undefined)) ?? (await $.env.get('USERPROFILE').catch(() => undefined)) ?? ''
+    // inloop's own copy of uv, when it fetched one (see getUv).
+    const uvDir = `${home}/.cache/inloop/bin`
     let uv: string | undefined
-    for (const candidate of ['uv', `${home}/.local/bin/uv`, '/opt/homebrew/bin/uv', '/usr/local/bin/uv']) {
+    for (const candidate of ['uv', `${home}/.local/bin/uv`, '/opt/homebrew/bin/uv', '/usr/local/bin/uv', `${uvDir}/uv`, `${uvDir}/uv.exe`]) {
       const probe = await $.process.run([candidate, '--version'], { timeoutMs: 4000 }).catch(() => undefined)
       if (probe?.exitCode === 0) {
         uv = candidate
@@ -133,6 +191,10 @@ export const register: Register = on => {
       }
     }
     const ttsScript = `${$.plugin.root}/voice/inloop_tts.py`
+    // inloop's own uv keeps its packages and any Python it fetches in inloop's cache too.
+    // The names are short: espeak-ng (in Kokoro) cannot find its data past a 160-character path.
+    const uvEnv = (): Record<string, string> | undefined =>
+      uv?.startsWith(uvDir) === true ? { UV_CACHE_DIR: `${home}/.cache/inloop/uv`, UV_PYTHON_INSTALL_DIR: `${home}/.cache/inloop/python` } : undefined
     // A player for Kokoro's clips, the first this machine has: macOS, then Linux
     // (PipeWire/PulseAudio, ALSA, FFmpeg), then Windows. A probe that cannot start means absent.
     const PLAYERS: { probe: string[]; play: (path: string) => string[] }[] = [
@@ -230,22 +292,31 @@ export const register: Register = on => {
           })
         })
       },
-      hasUv: uv !== undefined,
+      get hasUv() {
+        return uv !== undefined
+      },
+      getUv: async () => {
+        if (uv !== undefined) return { ok: true, text: '' }
+        const got = await getUv($, uvDir)
+        if (got.path !== undefined) uv = got.path
+        return { ok: got.path !== undefined, text: got.text }
+      },
       canPlayClips: player !== undefined,
       kokoroReady: async () => {
         if (uv === undefined) return false
-        const checked = await $.process.run([uv, 'run', '--offline', '--quiet', '--script', ttsScript, 'status'], { timeoutMs: 60_000 }).catch(() => undefined)
+        const checked = await $.process.run([uv, 'run', '--offline', '--quiet', '--script', ttsScript, 'status'], { timeoutMs: 60_000, env: uvEnv() }).catch(() => undefined)
         return checked?.exitCode === 0 && checked.stdout.includes('"ready": true')
       },
       kokoroSetup: async () => {
         if (uv === undefined) return { ok: false, text: 'uv is not installed (https://docs.astral.sh/uv/).' }
-        const done = await $.process.run([uv, 'run', '--quiet', '--script', ttsScript, 'setup'], { timeoutMs: 600_000 }).catch(err => ({ exitCode: 1, stdout: '', stderr: String(err) }))
+        const done = await $.process.run([uv, 'run', '--quiet', '--script', ttsScript, 'setup'], { timeoutMs: 600_000, env: uvEnv() }).catch(err => ({ exitCode: 1, stdout: '', stderr: String(err) }))
         return { ok: done.exitCode === 0, text: `${done.stdout}${done.stderr}` }
       },
       synthesize: (texts, voice, speed) => {
         if (uv === undefined) return { paths: (async function* () {})(), stop: () => undefined }
         const stream = $.process.spawn({
           argv: [uv, 'run', '--offline', '--quiet', '--script', ttsScript, 'synth', voice, String(speed)],
+          env: uvEnv(),
           input: JSON.stringify(texts),
         })
         async function* paths(): AsyncGenerator<string> {
@@ -629,10 +700,11 @@ export const register: Register = on => {
     const want = e.args.trim()
     if (want === 'setup') {
       // What cannot be set up here is said at once, not after a pretend start.
-      if (!live.host.hasUv || !live.host.canPlayClips || live.canUseKokoro) return { text: await live.setupKokoro() }
+      if (!live.host.canPlayClips || live.canUseKokoro) return { text: await live.setupKokoro() }
       if (!isHeadless) {
+        const uvFirst = live.host.hasUv ? '' : ' after fetching uv into ~/.cache/inloop/bin (~20 MB)'
         live.detach(async () => live.host.log(`inloop: ${await live.setupKokoro()}`))
-        return { text: 'Installing the Kokoro voice (one-time download, ~200 MB); inloop says when it is ready.' }
+        return { text: `Installing the Kokoro voice (one-time download, ~200 MB)${uvFirst}; inloop says when it is ready.` }
       }
       return { text: await live.setupKokoro() }
     }

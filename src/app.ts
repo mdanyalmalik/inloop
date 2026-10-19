@@ -811,13 +811,13 @@ export class App {
 
   /**
    * At start: finds the voices, and when the natural voice is missing, sets it up
-   * in the background (a one-time download). The Mac's voice speaks meanwhile.
+   * in the background (a one-time download, uv too when it is missing). The Mac's voice speaks meanwhile.
    */
   async prepareVoice(): Promise<void> {
     await this.refreshVoices()
     const settings = await this.settings()
-    // Nothing to fetch where its audio could not be played.
-    if (this.isKokoroReady || !settings.autoVoiceSetup || this.isHeadless || !this.host.hasUv || !this.host.canPlayClips) return
+    // Nothing to fetch where its audio could not be played. Without uv, setup fetches inloop's own copy first.
+    if (this.isKokoroReady || !settings.autoVoiceSetup || this.isHeadless || !this.host.canPlayClips) return
     const said = await this.setupKokoro()
     if (this.isKokoroReady) this.host.toast(`inloop: ${said}`, { timeoutMs: 6000 })
   }
@@ -826,12 +826,16 @@ export class App {
   setupKokoro(): Promise<string> {
     if (this.voiceSetup !== null) return this.voiceSetup
     const run = async (): Promise<string> => {
-      if (!this.host.hasUv) return 'The natural voice needs uv (https://docs.astral.sh/uv/). Until then inloop uses the system voice.'
       if (!this.host.canPlayClips) return NO_PLAYER
       if (this.canUseKokoro) return 'The natural voice (Kokoro) is already set up.'
       await this.host.state.status.update(s => ({ ...s, isVoiceSettingUp: true }))
       await this.refreshStatus()
       try {
+        // Without uv, inloop fetches its own copy first (into its cache, nothing system-wide).
+        if (!this.host.hasUv) {
+          const got = await this.host.getUv()
+          if (!got.ok) return `The natural voice could not be set up: ${got.text}. Until then inloop uses the system voice.`
+        }
         const result = await this.host.kokoroSetup()
         await this.refreshVoices()
         if (!this.isKokoroReady) return `The natural voice could not be set up: ${result.text.trim().split('\n').pop() ?? 'unknown error'}`

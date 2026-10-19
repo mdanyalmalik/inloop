@@ -52,8 +52,10 @@ export type Host = {
    * agents cannot run (a headless run).
    */
   investigate?: (prompt: string, description: string, model: string) => Promise<string>
-  /** Whether `uv` (which runs the Kokoro voice) is on this machine. */
-  hasUv: boolean
+  /** Whether `uv` (which runs the Kokoro voice) is on this machine, or in inloop's cache. */
+  readonly hasUv: boolean
+  /** Fetches uv's own build into inloop's cache (~/.cache/inloop/bin), its checksum checked; `text` says why when it could not. */
+  getUv: () => Promise<{ ok: boolean; text: string }>
   /** Whether this machine has a player for Kokoro's clips (afplay, pw-play, paplay, aplay, ffplay, or PowerShell). */
   canPlayClips: boolean
   /** Whether the Kokoro voice is set up (checked offline). */
