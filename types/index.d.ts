@@ -140,6 +140,8 @@ export type InloopSettings = {
   turnSummary: boolean
   /** System voice to speak with; '' picks the best installed. */
   voice: string
+  /** How fast explanations are spoken: 1 is normal, from 0.75 to 2. */
+  speechRate: number
   /** Download the natural Kokoro voice in the background when a session starts, if it is not there yet. */
   autoVoiceSetup: boolean
   /** Model for automatic change explanations. */

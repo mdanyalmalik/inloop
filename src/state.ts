@@ -12,6 +12,7 @@ export const DEFAULT_SETTINGS: InloopSettings = {
   briefAgent: true,
   turnSummary: true,
   voice: '',
+  speechRate: 1,
   autoVoiceSetup: true,
   autoModel: 'haiku',
   askModel: 'sonnet',

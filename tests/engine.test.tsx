@@ -1677,6 +1677,73 @@ describe('styles', () => {
     })
   }
 
+  test('speed: /inloop-speed plays Kokoro\'s clips slower or faster from the next part, with no new render', { timeoutMs: 20_000 }, async ($, on) => {
+    const w = world(on, STEPPED)
+    w.kokoro = true
+    tools(on, w)
+    await start($)
+    await $.command.run({ command: 'inloop-style', args: 'spoken' } as never)
+    await quiet(w)
+    await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
+    await w.clock.advance(10_000)
+    expect(w.playerCalls.at(-1)).not.toContain('-r')
+    expect((await $.command.run({ command: 'inloop-speed', args: '' } as never)).text).toMatch(/speaks at 1×/)
+    expect((await $.command.run({ command: 'inloop-speed', args: 'faster' } as never)).text).toMatch(/1\.25×/)
+    expect(w.get('settings')?.speechRate).toBe(1.25)
+    // The clip playing goes on, never started over; the next is played faster.
+    const plays = w.playerCalls.length
+    const renders = w.renders
+    await w.clock.advance(1)
+    expect(w.playerCalls.length).toBe(plays)
+    w.finishSpeech()
+    await w.clock.advance(1)
+    expect(w.get('narration')?.index).toBe(1)
+    expect(w.playerCalls.at(-1)?.slice(0, 5)).toEqual(['afplay', '-r', '1.25', '-q', '1'])
+    expect(w.renders).toBe(renders)
+    // No buttons for it: the command alone sets it.
+    const ui = await $.ui.mount({ plugin: 'inloop', surface: 'terminal', component: 'Pane', requestId: 'inloop', props: PANE_PROPS as never })
+    expect(await ui.find({ key: 'say:faster' })).toBe(undefined)
+    await ui.press({ key: 'tab:settings' })
+    expect(await ui.find({ key: 'set:rate' })).toBe(undefined)
+    await ui.unmount()
+    await $.command.run({ command: 'inloop-speed', args: 'slower' } as never)
+    await $.command.run({ command: 'inloop-speed', args: 'slower' } as never)
+    expect(w.get('settings')?.speechRate).toBe(0.75)
+    expect((await $.command.run({ command: 'inloop-speed', args: '2x' } as never)).text).toMatch(/2×/)
+    expect((await $.command.run({ command: 'inloop-speed', args: '5' } as never)).text).toMatch(/from 0\.75× to 2×/)
+    expect(w.get('settings')?.speechRate).toBe(2)
+    await $.command.run({ command: 'inloop-style', args: 'written' } as never)
+    await w.clock.advance(1)
+  })
+
+  test('speed: a player that cannot change speed gets clips Kokoro rendered at it', { timeoutMs: 20_000 }, async ($, on) => {
+    const w = world(on, STEPPED, { settings: { style: 'spoken', speechRate: 1.5 } })
+    w.kokoro = true
+    w.hasSay = false
+    w.players = ['paplay']
+    tools(on, w)
+    await start($)
+    await quiet(w)
+    await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
+    await w.clock.advance(10_000)
+    expect(w.renderSpeeds.at(-1)).toBe('1.5')
+    expect(w.playerCalls.at(-1)?.[0]).toBe('paplay')
+    await $.command.run({ command: 'inloop-style', args: 'written' } as never)
+    await w.clock.advance(1)
+  })
+
+  test('speed: the Mac\'s system voice speaks at it too', { timeoutMs: 20_000 }, async ($, on) => {
+    const w = world(on, STEPPED, { settings: { style: 'spoken', autoVoiceSetup: false, speechRate: 1.5 } })
+    tools(on, w)
+    await start($)
+    await quiet(w)
+    await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
+    await w.clock.advance(10_000)
+    expect(w.sayCalls.at(-1)?.slice(-2)).toEqual(['-r', '270'])
+    await $.command.run({ command: 'inloop-style', args: 'written' } as never)
+    await w.clock.advance(1)
+  })
+
   test('with no audio player, nothing is downloaded and the platform voice speaks', { timeoutMs: 20_000 }, async ($, on) => {
     const w = world(on, STEPPED)
     w.stored.delete('settings')
@@ -1869,6 +1936,34 @@ describe('styles', () => {
     expect(w.renders - renders).toBe(7)
     expect(w.get('status').waiting).toBe(0)
     expect(w.get('narration')?.isEnded).toBe(true)
+  })
+
+  test('away for an hour or more: audio made ahead is made again before it plays, never left to the system voice', { timeoutMs: 60_000 }, async ($, on) => {
+    const w = world(on, STEPPED)
+    w.kokoro = true
+    tools(on, w)
+    await start($)
+    await $.command.run({ command: 'inloop-style', args: 'spoken' } as never)
+    await quiet(w)
+    await $.command.run({ command: 'inloop-away', args: '' } as never)
+    await jobs($, w, 3)
+    const renders = w.renders
+    expect(w.get('status')?.voiced).toBe(3)
+    // Long enough that the voice script has deleted clips that old.
+    await w.clock.advance(50 * 60_000)
+    await $.command.run({ command: 'inloop-play', args: '' } as never)
+    await w.clock.advance(1)
+    // The first is made again before it plays, and Kokoro reads it; the rest are made again as they come up.
+    expect(w.renders - renders).toBe(1)
+    expect(w.said.at(-1)?.voice).toBe('kokoro:af_heart')
+    for (let i = 0; i < 3 * 6; i++) {
+      w.finishSpeech()
+      await w.clock.advance(1)
+    }
+    expect(w.renders - renders).toBe(3)
+    expect(w.said.every(x => x.voice === 'kokoro:af_heart')).toBe(true)
+    await $.command.run({ command: 'inloop-style', args: 'written' } as never)
+    await w.clock.advance(1)
   })
 
   test('explanations arriving faster than they are read keep five audios made, the rest as text', { timeoutMs: 60_000 }, async ($, on) => {

@@ -43,7 +43,7 @@ import {
 import { enclosingSymbol } from './graph'
 import { summarizeDiff, unifiedDiff } from './diff'
 import { Repo, RepoError } from './repo'
-import { parseVoices, pickVoice, planVoice, type Voice, type VoicePlan } from './voices'
+import { nextRate, parseVoices, pickVoice, planVoice, type Voice, type VoicePlan } from './voices'
 import { isNoise, isSensitive, toRelative } from './security'
 import { DEFAULT_SETTINGS } from './state'
 
@@ -58,6 +58,8 @@ const RECENT_KEEP_MS = RECENT_MINUTES * 60_000
 const SPIN_MS = 120
 /** Explanations whose audio is kept made at once (waiting, being read, kept to replay); the rest wait as text. */
 const AUDIO_MAX = 5
+/** How long audio made ahead is trusted: the voice script deletes clips an hour old, so older audio is made again before it plays. */
+const AUDIO_KEEP_MS = 45 * 60_000
 /** Explanations waiting to be read; past this a new one is written in the feed only. */
 const NARRATION_MAX = 20
 /** Waits before each retry of a model call that failed in passing: about a minute in all. */
@@ -68,7 +70,8 @@ const NO_PLAYER = 'The natural voice needs an audio player, and none was found (
 /** Reads one explanation's parts; `rendered` settles once all its audio is made (at once for the system voice). */
 type Speaker = { play: (i: number) => Promise<void>; stopPiece: () => void; close: () => void; rendered: Promise<void> }
 /** An explanation waiting to be read; its speaker is made ahead, for a few at a time. */
-type Queued = { card: InloopCard; steps: InloopStep[]; speaker: Promise<Speaker> | null; isRendered: boolean; isAsked: boolean; isAway: boolean }
+/** `isStale`: its audio was made long enough ago that its clips may be gone. */
+type Queued = { card: InloopCard; steps: InloopStep[]; speaker: Promise<Speaker> | null; isRendered: boolean; isAsked: boolean; isAway: boolean; isStale?: boolean }
 
 /** Where an answer is shown: the Ask tab's conversation, or the tab (or explanation) that asked. */
 export type AskPlace = 'ask' | 'code' | 'flow' | { card: string }
@@ -993,7 +996,7 @@ export class App {
    * reads it again from part 1 with the audio already made. It is let go only
    * when closed, when other audio plays, or when the session ends.
    */
-  private held: { card: InloopCard; steps: InloopStep[]; speaker: Speaker } | null = null
+  private held: { card: InloopCard; steps: InloopStep[]; speaker: Speaker; stale: { isStale: boolean } } | null = null
   private isReplaying = false
   private isClosing = false
 
@@ -1059,12 +1062,39 @@ export class App {
 
   /** A queued explanation's speaker, made once (by whichever asks first: reading it or rendering ahead). */
   private speakerOf(entry: Queued): Promise<Speaker> {
-    entry.speaker ??= this.speaker(
-      entry.steps.map((st, i) => speakable(st.text, i === 0 ? 900 : 320)),
+    this.dropStale(entry)
+    if (entry.speaker === null) {
+      entry.speaker = this.newSpeaker(entry.steps)
+      entry.isStale = false
+      const made = entry.speaker
+      // Only this speaker's audio ages: one made again later starts fresh.
+      this.host.after(AUDIO_KEEP_MS, () => { if (entry.speaker === made) entry.isStale = true })
+    }
+    return entry.speaker
+  }
+
+  private newSpeaker(steps: readonly InloopStep[]): Promise<Speaker> {
+    return this.speaker(
+      steps.map((st, i) => speakable(st.text, i === 0 ? 900 : 320)),
       () => this.currentControl() !== 'none',
       isPreparing => this.host.state.narration.update(n => (n === null ? n : { ...n, isPreparing })).then(() => undefined),
     )
-    return entry.speaker
+  }
+
+  /** A mark that goes stale once audio made now may have been deleted. */
+  private staleIn(): { isStale: boolean } {
+    const mark = { isStale: false }
+    this.host.after(AUDIO_KEEP_MS, () => { mark.isStale = true })
+    return mark
+  }
+
+  /** Audio made ahead long enough ago that its clips may be gone (after a long time away) is let go, to be made again. */
+  private dropStale(entry: Queued): void {
+    if (entry.speaker === null || entry.isStale !== true) return
+    void entry.speaker.then(s => s.close(), () => undefined)
+    entry.speaker = null
+    entry.isRendered = false
+    entry.isStale = false
   }
 
   private isRendering = false
@@ -1080,6 +1110,7 @@ export class App {
     this.isRendering = true
     this.detach(async () => {
       try {
+        for (const entry of this.narrationQueue) this.dropStale(entry)
         for (;;) {
           const kept = (this.held !== null ? 1 : 0) + (this.playing !== null ? 1 : 0) + this.narrationQueue.filter(e => e.speaker !== null).length
           const next = this.narrationQueue.find(e => e.speaker === null)
@@ -1125,6 +1156,13 @@ export class App {
     this.interrupt('prev')
   }
 
+  /** Speaks faster (1) or slower (-1), from the next part read. */
+  async changeRate(step: 1 | -1): Promise<number> {
+    const rate = nextRate((await this.settings()).speechRate ?? 1, step)
+    await this.setSettings({ speechRate: rate })
+    return rate
+  }
+
   /** Stops reading; the explanation stays loaded at part 1, to replay or close. */
   narrationStop(): void {
     this.dropWaiting()
@@ -1167,8 +1205,10 @@ export class App {
     const systemName = plan.engine === 'system' ? plan.name : pickVoice(this.voices, '')
     let current: { stop: () => void } | null = null
     let cancelWait: (() => void) | null = null
+    // The speed is read as each piece starts, so a change applies from the next one.
+    const rate = async () => (await this.settings()).speechRate ?? 1
     const direct = async (text: string): Promise<void> => {
-      const handle = this.host.say(text, systemName)
+      const handle = this.host.say(text, systemName, await rate())
       current = handle
       await handle.done.catch(() => undefined)
       current = null
@@ -1176,7 +1216,8 @@ export class App {
     if (plan.engine === 'system') {
       return { play: i => direct(texts[i] ?? ''), stopPiece: () => current?.stop(), close: () => current?.stop(), rendered: Promise.resolve() }
     }
-    const synth = this.host.synthesize(texts, plan.id, 1.0)
+    // Where the player cannot change speed, Kokoro renders at it.
+    const synth = this.host.synthesize(texts, plan.id, this.host.playsAtRate ? 1.0 : await rate())
     const ready: (string | null | undefined)[] = texts.map(() => undefined)
     const waiters = new Map<number, () => void>()
     let isDone: () => void = () => undefined
@@ -1219,7 +1260,7 @@ export class App {
         const path = ready[i]
         if (path === undefined) return
         if (path === null) return direct(texts[i] ?? '')
-        const handle = this.host.play(path)
+        const handle = this.host.play(path, this.host.playsAtRate ? await rate() : 1)
         current = handle
         // A clip that could not be played is said by the platform voice instead, never skipped in silence.
         const isPlayed = await handle.done.then(() => true, () => false)
@@ -1254,8 +1295,15 @@ export class App {
         let steps: InloopStep[]
         let speaker: Speaker
         let writtenAt: number | undefined
+        let stale = { isStale: false }
         if (this.isReplaying && this.held !== null) {
-          ;({ card, steps, speaker } = this.held)
+          ;({ card, steps, speaker, stale } = this.held)
+          // Kept to replay for long enough that its clips may be gone: made again.
+          if (stale.isStale) {
+            speaker.close()
+            speaker = await this.newSpeaker(steps)
+            stale = this.staleIn()
+          }
           this.held = null
         } else {
           const entry = this.nextToRead()
@@ -1267,6 +1315,9 @@ export class App {
           ;({ card, steps } = entry)
           writtenAt = entry.isAway ? card.at : undefined
           speaker = await this.speakerOf(entry)
+          // Its clips age from when they were made (the entry's own mark goes stale with them).
+          const made = entry
+          stale = { get isStale() { return made.isStale === true } }
         }
         this.isReplaying = false
         this.control = 'none'
@@ -1309,7 +1360,7 @@ export class App {
         // The last one read stays loaded, to replay; one with more to read behind it goes.
         // (A stop emptied the queue; whatever is queued now came after it and is read.)
         if (this.nextToRead() !== undefined || this.isClosing) speaker.close()
-        else this.held = { card, steps, speaker }
+        else this.held = { card, steps, speaker, stale }
         this.prerender()
       }
     } finally {
@@ -1780,8 +1831,8 @@ export class App {
     }
     if (change.mode === 'paused' || change.mode === 'ask') this.queue.length = 0
     this.isAway = isAwayOn(next)
-    if (change.voice !== undefined) {
-      // Audio made ahead in the old voice is made again in the new one.
+    if (change.voice !== undefined || (change.speechRate !== undefined && !this.host.playsAtRate)) {
+      // Audio made ahead in the old voice (or at a speed the player cannot change) is made again.
       const waiting = this.narrationQueue.map(e => ({ ...e, speaker: null, isRendered: false }))
       this.clearQueue()
       this.narrationQueue = waiting

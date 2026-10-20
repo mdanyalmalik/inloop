@@ -180,7 +180,7 @@ If no player is found, Kokoro isn't downloaded and the system voice speaks. A cl
 
 How many parts an explanation has depends on the change: a one-line edit is explained in its summary alone, a small change gets one or two parts, and a change spread over many functions or files gets up to six.
 
-Each spoken part is one short plain sentence that doesn't read out code names, paths or line numbers, since the code is on screen. Choose a voice in Settings (with **test voice**) or with `/inloop-voice`, which lists the Kokoro and Mac voices; `/inloop-voice heart`, `/inloop-voice george`, or `/inloop-voice auto`. Only one thing speaks at a time: a confirmation never plays over an explanation. Voice files live in `~/.cache/inloop/` (the model in `kokoro/`, clips in `tts/`, which are deleted after an hour).
+Each spoken part is one short plain sentence that doesn't read out code names, paths or line numbers, since the code is on screen. Choose a voice in Settings (with **test voice**) or with `/inloop-voice`, which lists the Kokoro and Mac voices; `/inloop-voice heart`, `/inloop-voice george`, or `/inloop-voice auto`. **Speed:** `/inloop-speed faster`, `slower` or a speed from 0.75× to 2× sets how fast explanations are spoken, from the next part on; the part being read is never started over. Kokoro's clips are played faster on macOS (`afplay`) and with `ffplay`, keeping their pitch, with nothing rendered again. With other players Kokoro renders at that speed, and audio already made ahead is made again. The Mac's system voice follows it too (`say -r`); the platform voice on Linux and Windows keeps its own pace. Only one thing speaks at a time: a confirmation never plays over an explanation. Voice files live in `~/.cache/inloop/` (the model in `kokoro/`, clips in `tts/`, which are deleted after an hour).
 
 Long work started from the panel (questions, follow-ups, narration, commit explanations) runs on inloop's own timer, so a button press answers at once. That keeps Claude Code's 10-second limit on presses from cutting an answer or the voice short.
 
@@ -221,6 +221,7 @@ Mod commands can't contain `:`, so they're named `/inloop-…`. Every one runs i
 | `/inloop-speak on\|off` | Same as spoken / written |
 | `/inloop-brief on\|off` | Keep the coding agent's replies short while inloop is active |
 | `/inloop-voice [setup \| name \| auto]` | List the voices on this machine, choose one, or set up the natural Kokoro voice |
+| `/inloop-speed [faster \| slower \| 1.25]` | How fast explanations are spoken, from 0.75× to 2×, from the next part |
 | `/inloop-away` | Stepping away: keep explaining changes, but hold them (with the audio of the next few made) until you're back |
 | `/inloop-play` | Back: read what was explained while you were away, oldest first |
 | `/inloop-reload` | Restart inloop if it seems to miss changes: it lets go of anything stuck, looks at the project again, and explains what it missed |

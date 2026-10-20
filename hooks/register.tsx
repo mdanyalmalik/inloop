@@ -12,7 +12,7 @@ import { narrationBand, renderPane, type Snapshot } from '../src/ui'
 import { DEFAULT_SETTINGS } from '../src/state'
 import type { InloopCard, InloopDepth, InloopMode, InloopTab } from '../types'
 import { describeFlow } from '../src/explain'
-import { describePlan, KOKORO_VOICES, rankVoices } from '../src/voices'
+import { describePlan, KOKORO_VOICES, rankVoices, rateLabel, SPEECH_RATES } from '../src/voices'
 import { READER_NAME, READER_PROMPT, READER_TYPE, readerHooks } from '../src/reader'
 
 const cardsAtom = atom({ plugin: 'inloop', key: 'cards' } as const, [])
@@ -67,6 +67,7 @@ const COMMANDS: { name: string; description: string; argumentHint?: string }[] =
   { name: 'inloop-play', description: "Back: read what was explained while you were away, oldest first" },
   { name: 'inloop-reload', description: 'Restart inloop if it seems to miss changes: looks at the project again and explains what it missed' },
   { name: 'inloop-voice', description: 'List voices, choose one, or set up the natural Kokoro voice', argumentHint: '[setup | voice | auto]' },
+  { name: 'inloop-speed', description: 'How fast explanations are spoken, from the next part: faster, slower, or 0.75 to 2', argumentHint: '[faster | slower | 1.25]' },
 ]
 
 let app: App | null = null
@@ -209,22 +210,29 @@ export const register: Register = on => {
       uv?.startsWith(uvDir) === true ? { UV_CACHE_DIR: `${home}/.cache/inloop/uv`, UV_PYTHON_INSTALL_DIR: `${home}/.cache/inloop/python` } : undefined
     // A player for Kokoro's clips, the first this machine has: macOS, then Linux
     // (PipeWire/PulseAudio, ALSA, FFmpeg), then Windows. A probe that cannot start means absent.
-    const PLAYERS: { probe: string[]; play: (path: string) => string[] }[] = [
-      { probe: ['afplay', '-h'], play: path => ['afplay', path] },
+    // `atRate` plays a clip faster or slower, keeping its pitch, where the player can.
+    const PLAYERS: { probe: string[]; play: (path: string) => string[]; atRate?: (path: string, rate: number) => string[] }[] = [
+      { probe: ['afplay', '-h'], play: path => ['afplay', path], atRate: (path, rate) => ['afplay', '-r', String(rate), '-q', '1', path] },
       { probe: ['pw-play', '--version'], play: path => ['pw-play', path] },
       { probe: ['paplay', '--version'], play: path => ['paplay', path] },
       { probe: ['aplay', '--version'], play: path => ['aplay', '-q', path] },
-      { probe: ['ffplay', '-version'], play: path => ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet', path] },
+      {
+        probe: ['ffplay', '-version'],
+        play: path => ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet', path],
+        atRate: (path, rate) => ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet', '-af', `atempo=${rate}`, path],
+      },
       {
         probe: ['powershell', '-NoProfile', '-NonInteractive', '-Command', 'exit 0'],
         play: path => ['powershell', '-NoProfile', '-NonInteractive', '-Command', `(New-Object Media.SoundPlayer '${path.replace(/'/g, "''")}').PlaySync()`],
       },
     ]
     let player: ((path: string) => string[]) | undefined
+    let playerAtRate: ((path: string, rate: number) => string[]) | undefined
     for (const candidate of PLAYERS) {
       const probe = await $.process.run(candidate.probe, { timeoutMs: 5000 }).catch(() => undefined)
       if (probe !== undefined) {
         player = candidate.play
+        playerAtRate = candidate.atRate
         break
       }
     }
@@ -270,11 +278,13 @@ export const register: Register = on => {
       panes: () => $.ui.panes(),
       openPane: () => $.ui.open({ id: PANE, title: 'inloop', columns: 64 }),
       speak: (text, voice) => $.audio.speak(text, voice === undefined ? undefined : { voice }),
-      say: (text, voice) => {
+      say: (text, voice, rate = 1) => {
         // A spawned `say` can be cut off (stop, pause, skip); elsewhere the platform voice speaks it whole.
         let isStopped = false
         const voiceArgs = voice === undefined ? [] : ['-v', voice]
-        const stream = $.process.spawn({ argv: ['say', ...voiceArgs], input: text })
+        // `say` counts words a minute, about 180 at its normal pace.
+        const rateArgs = rate === 1 ? [] : ['-r', String(Math.round(180 * rate))]
+        const stream = $.process.spawn({ argv: ['say', ...voiceArgs, ...rateArgs], input: text })
         const done = (async () => {
           try {
             for await (const piece of stream) void piece
@@ -345,9 +355,10 @@ export const register: Register = on => {
         }
         return { paths: paths(), stop: () => void stream.return(undefined as never).catch(() => undefined) }
       },
-      play: path => {
+      playsAtRate: playerAtRate !== undefined,
+      play: (path, rate = 1) => {
         if (player === undefined) return { done: Promise.reject(new Error('no audio player')), stop: () => undefined }
-        const stream = $.process.spawn({ argv: player(path) })
+        const stream = $.process.spawn({ argv: rate !== 1 && playerAtRate !== undefined ? playerAtRate(path, rate) : player(path) })
         let isStopped = false
         const done = (async () => {
           let step = await stream.next()
@@ -759,6 +770,21 @@ export const register: Register = on => {
     live.detach(() => live.speak(say))
     return { text: `Voice: ${match.name}.` }
   }).catch(() => ({ text: 'That command failed.' }))
+
+  on('command.run', { command: 'inloop-speed' }, async ($, e) => {
+    if (app === null) return { text: 'inloop is not ready yet.' }
+    const want = e.args.trim().toLowerCase().replace(/[x×]$/, '')
+    const now = (await read($, settingsAtom)).speechRate ?? 1
+    if (want === '') return { text: `inloop speaks at ${rateLabel(now)}. Use /inloop-speed faster, slower, or a speed from ${rateLabel(SPEECH_RATES[0]!)} to ${rateLabel(SPEECH_RATES.at(-1)!)}.` }
+    if (want === 'faster' || want === '+') return { text: `inloop now speaks at ${rateLabel(await app.changeRate(1))}.` }
+    if (want === 'slower' || want === '-') return { text: `inloop now speaks at ${rateLabel(await app.changeRate(-1))}.` }
+    const rate = Number(want)
+    if (!Number.isFinite(rate) || rate < SPEECH_RATES[0]! || rate > SPEECH_RATES.at(-1)!) {
+      return { text: `Use faster, slower, or a speed from ${rateLabel(SPEECH_RATES[0]!)} to ${rateLabel(SPEECH_RATES.at(-1)!)}.` }
+    }
+    await app.setSettings({ speechRate: rate })
+    return { text: `inloop now speaks at ${rateLabel(rate)}.` }
+  }).catch(() => ({ text: 'that command failed; see the inloop pane for details.' }))
 
   on('command.run', { command: 'inloop-style' }, async ($, e) => {
     if (app === null) return { text: 'inloop is not ready yet.' }

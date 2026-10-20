@@ -71,8 +71,13 @@ export type World = {
   players: string[]
   /** Whether macOS's `say` exists; elsewhere speech goes to the platform synthesizer. */
   hasSay: boolean
-  /** The player each clip was handed to. */
+  /** The player each clip was handed to, and its whole command. */
   playersUsed: string[]
+  playerCalls: string[][]
+  /** Each `say` command run. */
+  sayCalls: string[][]
+  /** The speed each Kokoro render was asked for. */
+  renderSpeeds: string[]
   /** The player starts but cannot play (no sound device): it exits non-zero. */
   isPlayerBroken: boolean
   /** With `kokoro` (uv present): whether its model is downloaded yet. */
@@ -154,6 +159,9 @@ export function world(
     players: ['afplay'],
     hasSay: true,
     playersUsed: [],
+    playerCalls: [],
+    sayCalls: [],
+    renderSpeeds: [],
     isPlayerBroken: false,
     isKokoroInstalled: true,
     setupRuns: 0,
@@ -345,6 +353,7 @@ export function world(
       // Kokoro renders every text and prints each clip's path.
       const texts = JSON.parse(e.input ?? '[]') as string[]
       const voice = argv[argv.indexOf('synth') + 1]
+      w.renderSpeeds.push(argv[argv.indexOf('synth') + 2] ?? '')
       w.renders++
       if (w.isRenderHeld) await new Promise<void>(resolve => { w.releaseRender = resolve })
       for (const [i, text] of texts.entries()) {
@@ -355,10 +364,14 @@ export function world(
       return { value: { code: 0, signal: null } }
     }
     if (argv[0] === 'say' && !w.hasSay) throw new Error('spawn say ENOENT')
+    if (argv[0] === 'say') w.sayCalls.push(argv)
     if (PLAYERS.includes(argv[0] ?? '') && !w.players.includes(argv[0]!)) throw new Error(`spawn ${argv[0]} ENOENT`)
     const v = argv.indexOf('-v')
     const clipPath = PLAYERS.includes(argv[0] ?? '') ? argv.find(a => w.clips.has(a)) ?? argv.map(a => /'(\/virtual\/[^']+)'/.exec(a)?.[1]).find(p => p !== undefined) : undefined
-    if (clipPath !== undefined) w.playersUsed.push(argv[0]!)
+    if (clipPath !== undefined) {
+      w.playersUsed.push(argv[0]!)
+      w.playerCalls.push(argv)
+    }
     if (clipPath !== undefined && w.isPlayerBroken) return { value: { code: 1, signal: null } }
     const clip = clipPath !== undefined ? w.clips.get(clipPath) : undefined
     const entry = clip !== undefined

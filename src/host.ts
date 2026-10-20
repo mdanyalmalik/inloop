@@ -45,7 +45,8 @@ export type Host = {
   openPane: () => Promise<unknown>
   speak: (text: string, voice?: string) => Promise<unknown>
   /** Speaks `text` in a way that can be cut off: `done` settles when it ends or is stopped. */
-  say: (text: string, voice?: string) => { done: Promise<void>; stop: () => void }
+  /** `rate` is how fast, 1 normal; the platform voice where `say` is missing keeps its own pace. */
+  say: (text: string, voice?: string, rate?: number) => { done: Promise<void>; stop: () => void }
   /**
    * Runs inloop's read-only reader agent on a task and resolves with its final
    * message; rejects when it cannot start, fails or takes too long. Absent where
@@ -65,7 +66,9 @@ export type Host = {
   /** Renders `texts` with Kokoro in one process: each WAV path as it is ready, in order. */
   synthesize: (texts: readonly string[], voice: string, speed: number) => { paths: AsyncIterable<string>; stop: () => void }
   /** Plays an audio file with this machine's player; can be cut off. `done` rejects when it could not play. */
-  play: (path: string) => { done: Promise<void>; stop: () => void }
+  play: (path: string, rate?: number) => { done: Promise<void>; stop: () => void }
+  /** Whether this machine's player can play a clip faster or slower (afplay, ffplay); elsewhere Kokoro renders at the speed. */
+  playsAtRate: boolean
   /** The system's voice listing (`say -v '?'` on macOS); '' where there is none. */
   listVoices: () => Promise<string>
   after: (ms: number, fn: () => void) => Timer

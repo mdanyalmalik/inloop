@@ -64,6 +64,20 @@ export function needsBetterVoice(voices: readonly Voice[]): boolean {
   return voices.length > 0 && !voices.some(v => v.locale.startsWith('en') && (v.quality === 'premium' || v.quality === 'enhanced'))
 }
 
+/** The speeds offered, slowest first. */
+export const SPEECH_RATES: readonly number[] = [0.75, 1, 1.25, 1.5, 1.75, 2]
+
+/** The next speed up (`step` 1) or down (-1) from `rate`, held to the offered range. */
+export function nextRate(rate: number, step: 1 | -1): number {
+  const next = step === 1 ? SPEECH_RATES.find(r => r > rate + 0.001) : [...SPEECH_RATES].reverse().find(r => r < rate - 0.001)
+  return next ?? (step === 1 ? SPEECH_RATES.at(-1)! : SPEECH_RATES[0]!)
+}
+
+/** A speed as the controls show it: "1×", "1.25×". */
+export function rateLabel(rate: number): string {
+  return `${Number(rate.toFixed(2))}×`
+}
+
 export const VOICE_HELP =
   'For the most natural voice (free, offline), inloop downloads Kokoro by itself (~200 MB, once) when [uv](https://docs.astral.sh/uv/) is installed; `/inloop-voice setup` or **install natural voice** starts it now, and without uv first fetches inloop\'s own copy into `~/.cache/inloop/bin` (~20 MB, checksum checked). Or download a Mac voice marked **Premium**: System Settings → Accessibility → Spoken Content → System voice → Manage Voices…'
 

@@ -9,7 +9,7 @@ import { isSafeRev, isSensitive, redact, toRelative } from '../src/security'
 import { DEMO_FIRST, DEMO_HEAD } from './fixtures'
 import { readerHooks } from '../src/reader'
 import { SAY_LISTING } from './harness'
-import { needsBetterVoice, parseVoices, pickVoice, rankVoices } from '../src/voices'
+import { needsBetterVoice, nextRate, parseVoices, pickVoice, rankVoices, rateLabel } from '../src/voices'
 
 const files = (set: Record<string, string>) => Object.entries(set).map(([path, text]) => ({ path, text }))
 
@@ -324,6 +324,17 @@ describe('voices', () => {
     expect(needsBetterVoice(compactOnly)).toBe(true)
     expect(needsBetterVoice(voices)).toBe(false)
     expect(pickVoice([], '')).toBe(undefined)
+  })
+
+  test('speeds step through the offered ones and stop at the ends', () => {
+    expect(nextRate(1, 1)).toBe(1.25)
+    expect(nextRate(1, -1)).toBe(0.75)
+    expect(nextRate(0.75, -1)).toBe(0.75)
+    expect(nextRate(2, 1)).toBe(2)
+    // A speed between two offered ones goes to the next in that direction.
+    expect(nextRate(1.1, 1)).toBe(1.25)
+    expect(nextRate(1.1, -1)).toBe(1)
+    expect(rateLabel(1.25)).toBe('1.25×')
   })
 
   test('spoken text leaves out paths, line numbers and markdown', () => {
