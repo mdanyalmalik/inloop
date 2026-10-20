@@ -212,7 +212,7 @@ function narrationBox(k: Kit): RenderElement | null {
 /** Written while the person was away (this time or, after they came back, the last time). */
 function wasAway(settings: InloopSettings, card: InloopCard): boolean {
   const away = settings.away
-  return away !== null && away !== undefined && card.source === 'auto' && card.at >= away.since && card.at <= (away.until ?? Infinity)
+  return away !== null && away !== undefined && (card.source === 'auto' || card.source === 'turn') && card.at >= away.since && card.at <= (away.until ?? Infinity)
 }
 
 function clock(at: number): string {
@@ -408,7 +408,7 @@ function turnChangesView(k: Kit): RenderElement {
 }
 
 function changesView(k: Kit, card: InloopCard, list: string): RenderElement | null {
-  if (!['auto', 'recent', 'commit', 'compare'].includes(card.source)) return null
+  if (!['auto', 'recent', 'commit', 'compare', 'turn'].includes(card.source)) return null
   const read = summarizeDiff(card.diff ?? '')
   // A commit or comparison lists every file it changed, read or not; a file not read opens its own diff.
   const files = card.fileStats !== undefined
@@ -468,7 +468,9 @@ function cardView(k: Kit, card: InloopCard, isOpen: boolean, list: 'feed' | 'his
   if (card.skipped !== undefined || card.failed !== undefined) return unexplainedView(k, card, isOpen, list)
   const app = k.app
   const { Box, Text, Button, Markdown } = k.el
-  const tag = card.source === 'auto' ? '' : `${card.source} · `
+  // In History, a card from another project names its folder.
+  const where = list === 'history' && card.root !== app.repo.root ? `${card.root === undefined ? 'unknown project' : card.root.split('/').slice(-2).join('/')} · ` : ''
+  const tag = where + (card.source === 'auto' ? (card.isBrief === true ? 'small change · ' : '') : card.source === 'turn' ? 'turn summary · ' : `${card.source} · `)
   return (
     <Box key={`${list}:${card.id}`} flexDirection="column" marginBottom={isOpen ? 1 : 0}>
       <Button key={`${list}:card:${card.id}`} plain onPress={() => app.host.state.expanded.update(cur => (cur === card.id ? null : card.id))}>
@@ -536,11 +538,60 @@ function feedCount(cards: readonly InloopCard[]): string {
   return [`${shown} ${shown === 1 ? 'explanation' : 'explanations'}`, skipped > 0 ? `${skipped} not explained` : '', failed > 0 ? `${failed} failed` : ''].filter(Boolean).join(' · ')
 }
 
+/**
+ * One entry of the feed or history: a card at the top level with the cards
+ * indented beneath it. A finished turn sits under its summary (`card`), or,
+ * with none, under a line naming it (`isLine`; `card` is its newest card).
+ */
+export type TurnEntry = { card: InloopCard; members: InloopCard[]; isLine?: boolean }
+
+/** Cards in order, each finished turn's explanations grouped; the turn still running (`current`) is not grouped yet. */
+export function byTurn(cards: readonly InloopCard[], current: string): TurnEntry[] {
+  const summarised = new Set(cards.filter(c => c.source === 'turn' && c.turn !== undefined).map(c => c.turn!))
+  const ofTurn = (turn: string) => cards.filter(c => c.source !== 'turn' && c.turn === turn)
+  const out: TurnEntry[] = []
+  const lined = new Set<string>()
+  for (const card of cards) {
+    if (card.source === 'turn') out.push({ card, members: card.turn === undefined ? [] : ofTurn(card.turn) })
+    else if (card.turn === undefined || card.turn === current) out.push({ card, members: [] })
+    else if (summarised.has(card.turn) || lined.has(card.turn)) continue
+    else {
+      lined.add(card.turn)
+      out.push({ card, members: ofTurn(card.turn), isLine: true })
+    }
+  }
+  return out
+}
+
+/**
+ * A card; or a finished turn in a box of its own: a line naming the turn (its
+ * request's first words), its summary if it has one, and its explanations
+ * indented beneath.
+ */
+function groupView(k: Kit, entry: TurnEntry, list: 'feed' | 'history'): RenderElement {
+  const { Box, Text } = k.el
+  const expanded = k.s.expanded
+  if (entry.members.length === 0 && entry.card.source !== 'turn') return cardView(k, entry.card, entry.card.id === expanded, list)
+  const count = entry.members.length
+  const asked = entry.card.asked ?? ''
+  return (
+    <Box key={`${list}:turn:${entry.card.id}`} flexDirection="column" borderStyle="round" borderDimColor paddingX={1}>
+      <Text color="suggestion" weight="bold" wrap="truncate-end">
+        {asked !== '' ? `“${asked}”` : 'turn'}
+        <Text dimColor weight="regular"> · {count} {count === 1 ? 'explanation' : 'explanations'} · {ago(entry.card.at)}</Text>
+      </Text>
+      {entry.isLine !== true && cardView(k, entry.card, entry.card.id === expanded, list)}
+      <Box flexDirection="column" paddingLeft={2}>
+        {entry.members.map(c => cardView(k, c, c.id === expanded, list))}
+      </Box>
+    </Box>
+  )
+}
+
 async function feedTab(k: Kit): Promise<RenderElement> {
   const app = k.app
   const { Box, Text, Button, Markdown } = k.el
   const cards = k.s.cards
-  const expanded = k.s.expanded
   const settings = k.s.settings
   const status = k.s.status
   if (cards.length === 0) {
@@ -568,15 +619,16 @@ async function feedTab(k: Kit): Promise<RenderElement> {
           <Button key="feed:recent" label="explain recent" plain onPress={fire(k, () => app.explainRecent(RECENT_MINUTES))} />
         )}
       </Box>
-      {cards.slice(0, 25).map((card, i, shown) => {
-        const isFirstEarlier = card.at < app.startedAt && (i === 0 || shown[i - 1]!.at >= app.startedAt)
-        const isFirstAway = wasAway(settings, card) && (i === 0 || !wasAway(settings, shown[i - 1]!))
+      {byTurn(cards, app.currentTurn).slice(0, 25).map((entry, i, shown) => {
+        const card = entry.card
+        const isFirstEarlier = card.at < app.startedAt && (i === 0 || shown[i - 1]!.card.at >= app.startedAt)
+        const isFirstAway = wasAway(settings, card) && (i === 0 || !wasAway(settings, shown[i - 1]!.card))
         const awayCount = isFirstAway ? cards.filter(c => wasAway(settings, c)).length : 0
         return (
           <Box key={`feed:wrap:${card.id}`} flexDirection="column">
             {isFirstEarlier && <Text dimColor>── earlier sessions ──</Text>}
             {isFirstAway && <Text color="warning">── {awayCount} written while you were away ──</Text>}
-            {cardView(k, card, card.id === expanded, 'feed')}
+            {groupView(k, entry, 'feed')}
           </Box>
         )
       })}
@@ -1033,14 +1085,18 @@ async function historyTab(k: Kit): Promise<RenderElement> {
   const history = k.s.history
   const expanded = k.s.expanded
   const marked = history.filter(c => c.bookmarked === true)
-  const rest = history.filter(c => c.bookmarked !== true)
+  // History is kept for every project on this machine: this one's first, the rest marked with their folder.
+  const here = history.filter(c => c.bookmarked !== true && c.root === app.repo.root)
+  const elsewhere = history.filter(c => c.bookmarked !== true && c.root !== app.repo.root)
   return (
     <Box flexDirection="column">
       <Text dimColor>{history.length} saved explanations (kept on this machine, outside your project)</Text>
       {marked.length > 0 && <Text weight="bold">Bookmarks</Text>}
       {marked.map(c => cardView(k, c, c.id === expanded, 'history'))}
-      {rest.length > 0 && <Text weight="bold">Earlier</Text>}
-      {rest.slice(0, 40).map(c => cardView(k, c, c.id === expanded, 'history'))}
+      {here.length > 0 && <Text weight="bold">This project</Text>}
+      {byTurn(here, app.currentTurn).slice(0, 40).map(entry => groupView(k, entry, 'history'))}
+      {elsewhere.length > 0 && <Text weight="bold">Other projects</Text>}
+      {byTurn(elsewhere, app.currentTurn).slice(0, 20).map(entry => groupView(k, entry, 'history'))}
       <Box flexDirection="row" columnGap={1} marginTop={1}>
         <Button key="hist:clear" label="clear (keep bookmarks)" onPress={() => app.clearHistory(true)} />
         <Button key="hist:clearall" label="clear all" onPress={() => app.clearHistory(false)} />
@@ -1174,9 +1230,9 @@ async function settingsTab(k: Kit): Promise<RenderElement> {
       />
       <Select
         key="set:score"
-        label="explain edits from significance "
+        label="full explanations from significance "
         value={String(s.minScore)}
-        options={['1', '2', '3', '4', '5', '6', '8'].map(v => ({ value: v, label: v === '1' ? '1 (almost everything)' : v === '8' ? '8 (only big steps)' : v }))}
+        options={['1', '2', '3', '4', '5', '6', '8'].map(v => ({ value: v, label: v === '1' ? '1 (almost everything)' : v === '8' ? '8 (only big steps; the rest short)' : v }))}
         onSelect={(v: string) => app.setSettings({ minScore: Number(v) })}
       />
       <Select
@@ -1229,6 +1285,16 @@ async function settingsTab(k: Kit): Promise<RenderElement> {
           { value: 'manual', label: 'only when I install it' },
         ]}
         onSelect={(v: string) => app.setSettings({ autoVoiceSetup: v === 'auto' })}
+      />
+      <Select
+        key="set:turnsummary"
+        label="end of each turn "
+        value={s.turnSummary ? 'on' : 'off'}
+        options={[
+          { value: 'on', label: 'summarise what the request did not say (auto mode)' },
+          { value: 'off', label: 'no summary' },
+        ]}
+        onSelect={(v: string) => app.setSettings({ turnSummary: v === 'on' })}
       />
       <Select
         key="set:brief"

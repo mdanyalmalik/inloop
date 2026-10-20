@@ -46,6 +46,13 @@ const editTokens = (): Edit => ({
   new_string: REFRESH.trimStart() + '\nmodule.exports = { createToken, verifyToken, refreshToken }',
 })
 
+/** A small change: one more table in the in-memory store. */
+const editTables = (): Edit => ({
+  file_path: `${ROOT}/server/db/index.js`,
+  old_string: 'const tables = { users: [] }',
+  new_string: 'const tables = { users: [], sessions: [] }',
+})
+
 describe('automatic explanations', () => {
   test('a new function gets a card without anyone asking', async ($, on) => {
     const w = world(on, () => JSON.stringify({
@@ -114,8 +121,33 @@ describe('automatic explanations', () => {
     await $.tool.call({ tool: 'Edit', file_path: `${ROOT}/server/db/index.js`, old_string: 'const tables', new_string: '// in-memory tables\nconst tables' } as never)
     await w.clock.advance(10_000)
     // Not explained, but not hidden either: one line says so.
-    expect((w.get('cards') ?? []).map(c => c.skipped)).toEqual(['a small change'])
+    expect((w.get('cards') ?? []).map(c => c.skipped)).toEqual(['only whitespace or comments changed'])
     expect(w.prompts.length).toBe(0)
+  })
+
+  test('a small change gets a short explanation with one part, not "not explained"', async ($, on) => {
+    const w = world(on, () => JSON.stringify({
+      worth_explaining: true,
+      title: 'Sessions table',
+      summary: 'The in-memory store gains a sessions table.',
+      steps: [
+        { say: 'The new table.', path: 'server/db/index.js', line: 2, end_line: 2 },
+        { say: 'A second part.', path: 'server/db/index.js', line: 4, end_line: 6 },
+      ],
+    }))
+    tools(on, w)
+    await start($)
+    await $.tool.call({ tool: 'Edit', ...editTables() } as never)
+    await w.clock.advance(10_000)
+    const card = (w.get('cards') ?? [])[0]!
+    expect(card.skipped).toBeUndefined()
+    expect(card.isBrief).toBe(true)
+    expect(card.steps?.length).toBe(1)
+    expect(w.prompts.at(-1)!.prompt).toContain('a small change')
+    expect(w.prompts.at(-1)!.prompt).toContain('1-2 sentences')
+    const ui = await $.ui.mount({ plugin: 'inloop', surface: 'terminal', component: 'Pane', requestId: 'inloop', props: PANE_PROPS as never })
+    expect(await ui.find({ text: /Sessions table · small change/ })).toBeDefined()
+    await ui.unmount()
   })
 
   test('focus mode skips changes off the topic', async ($, on) => {
@@ -232,22 +264,24 @@ describe('automatic explanations', () => {
     await ui.unmount()
   })
 
-  test('worth_explaining written as the string "false" still skips', async ($, on) => {
-    const w = world(on, () => '{"worth_explaining": "false", "title": "x", "summary": "y"}')
+  test('in focus mode, worth_explaining written as the string "false" still skips', async ($, on) => {
+    const w = world(on, () => '{"worth_explaining": "false", "title": "x", "summary": "y"}', { settings: { style: 'written', mode: 'focus', focus: 'tokens' } })
     tools(on, w)
     await start($)
     await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
     await w.clock.advance(10_000)
-    expect((w.get('cards') ?? []).map(c => c.skipped)).toEqual(['the model judged it too minor to explain'])
+    expect((w.get('cards') ?? []).map(c => c.skipped)).toEqual(['not about "tokens"'])
   })
 
-  test('the model saying "not worth explaining" shows as not explained, not as nothing', async ($, on) => {
-    const w = world(on, () => JSON.stringify({ worth_explaining: false }))
+  test('the model calling a change minor still explains it: only focus mode leaves one out', async ($, on) => {
+    const w = world(on, () => JSON.stringify({ worth_explaining: false, title: 'Token check', summary: 'Checks the token first.' }))
     tools(on, w)
     await start($)
     await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
     await w.clock.advance(10_000)
-    expect((w.get('cards') ?? []).map(c => c.skipped)).toEqual(['the model judged it too minor to explain'])
+    const cards = w.get('cards') ?? []
+    expect(cards.map(c => c.skipped)).toEqual([undefined])
+    expect(cards[0]!.summary).toBe('Checks the token first.')
   })
 
   test('a failed model call says so plainly, with the changes and "try again"', async ($, on) => {
@@ -770,21 +804,27 @@ describe('changes made outside the edit tools', () => {
 
   test("after a restart the feed starts with this project's earlier explanations", async ($, on) => {
     const mine = { id: 'old1', at: 1000, title: 'Earlier change here', summary: 'S', files: ['server/app.js'], symbols: [], refs: [], source: 'auto', root: ROOT }
+    // Untagged, though its files are here: never guessed in (a copy of another project would pass too).
     const legacy = { id: 'old2', at: 900, title: 'Untagged, files here', summary: 'S', files: ['server/auth/tokens.js'], symbols: [], refs: [], source: 'auto' }
     const other = { id: 'old3', at: 800, title: 'Another project', summary: 'S', files: ['src/x.ts'], symbols: [], refs: [], source: 'auto', root: '/elsewhere' }
     const asked = { id: 'old4', at: 700, title: 'a question', summary: 'S', files: [], symbols: [], refs: [], source: 'ask', root: ROOT }
     const w = world(on, undefined, { history: [mine, legacy, other, asked] })
     tools(on, w)
     await start($)
-    expect((w.get('cards') ?? []).map(c => c.id)).toEqual(['old1', 'old2'])
+    expect((w.get('cards') ?? []).map(c => c.id)).toEqual(['old1'])
     const ui = await $.ui.mount({ plugin: 'inloop', surface: 'terminal', component: 'Pane', requestId: 'inloop', props: PANE_PROPS as never })
     expect(await ui.find({ text: /earlier sessions/ })).toBeDefined()
     // New explanations go above them, and are tagged with this project.
     await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
     await w.clock.advance(10_000)
     const cards = w.get('cards') ?? []
-    expect(cards.map(c => c.id).slice(1)).toEqual(['old1', 'old2'])
+    expect(cards.map(c => c.id).slice(1)).toEqual(['old1'])
     expect(cards[0]!.root).toBe(ROOT)
+    // History keeps every project's: this one's first, the others under their folder.
+    await ui.press({ key: 'tab:history' })
+    expect(await ui.find({ text: /This project/ })).toBeDefined()
+    expect(await ui.find({ text: /Other projects/ })).toBeDefined()
+    expect(await ui.find({ text: /Another project · \/elsewhere · / })).toBeDefined()
     await ui.unmount()
   })
 
@@ -939,6 +979,139 @@ describe('what each change was', () => {
     expect(diff.includes('+  return db.count()')).toBe(true)
     expect(diff.includes('+function countUsers() {')).toBe(false)
   })
+})
+
+describe('the end of a turn', () => {
+  const summaryReply = (prompt: string) => prompt.includes('finished a turn')
+    ? JSON.stringify({ title: 'Token refresh', changes: 'Tokens can now be refreshed, and sessions get their own table.', decisions: ['Sessions are kept in memory, so they are lost on restart.'] })
+    : JSON.stringify({ worth_explaining: true, title: 'Step', summary: 'A step.', steps: [] })
+
+  test('a turn of several steps ends with a summary of what the request did not say', async ($, on) => {
+    const w = world(on, summaryReply)
+    tools(on, w)
+    await start($)
+    await $.prompt.submit({ text: 'add token refresh', wait: false } as never)
+    await w.clock.advance(100)
+    await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
+    await w.clock.advance(10_000)
+    await $.tool.call({ tool: 'Edit', ...editTables() } as never)
+    await w.clock.advance(10_000)
+    await $.turn.complete({ answer: 'Added refreshToken.', durationMs: 1000, isAborted: false, turnId: 't1' } as never)
+    await w.clock.advance(1000)
+    const card = (w.get('cards') ?? [])[0]!
+    expect(card.source).toBe('turn')
+    expect(card.title).toBe('Token refresh')
+    expect(card.summary).toContain('**Decided along the way:**\n- Sessions are kept in memory')
+    expect([...card.files].sort()).toEqual(['server/auth/tokens.js', 'server/db/index.js'])
+    const asked = w.prompts.find(p => p.prompt.includes('finished a turn'))!.prompt
+    // What was asked is given as known, never to be explained back; the steps' explanations come along.
+    expect(asked).toContain('add token refresh')
+    expect(asked).toContain('never explain it back to them')
+    expect(asked).toContain('Added refreshToken.')
+    expect(asked).toContain('- Step: A step.')
+    // The turn's explanations sit under its summary, in the feed and in history.
+    const cards = w.get('cards') ?? []
+    expect(cards.filter(c => c.source === 'auto').every(c => c.turn === card.turn)).toBe(true)
+    const ui = await $.ui.mount({ plugin: 'inloop', surface: 'terminal', component: 'Pane', requestId: 'inloop', props: PANE_PROPS as never })
+    expect(await ui.find({ text: /Token refresh · turn summary/ })).toBeDefined()
+    const group = await ui.find({ key: `feed:turn:${card.id}` })
+    expect(group).toBeDefined()
+    for (const c of cards.filter(c => c.source === 'auto')) expect(JSON.stringify(group)).toContain(`feed:card:${c.id}`)
+    await ui.press({ key: 'tab:history' })
+    expect(await ui.find({ key: `history:turn:${card.id}` })).toBeDefined()
+    await ui.unmount()
+    // The turn continuing without a new prompt and no new step: nothing more to summarise.
+    await $.turn.complete({ answer: '', durationMs: 1000, isAborted: false, turnId: 't2' } as never)
+    await w.clock.advance(1000)
+    expect(w.prompts.filter(p => p.prompt.includes('finished a turn')).length).toBe(1)
+  })
+
+  test('two turns ending together write one summary of their steps, not two', async ($, on) => {
+    const w = world(on, summaryReply)
+    tools(on, w)
+    await start($)
+    await $.prompt.submit({ text: 'add token refresh', wait: false } as never)
+    await w.clock.advance(100)
+    await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
+    await w.clock.advance(10_000)
+    await $.tool.call({ tool: 'Edit', ...editTables() } as never)
+    await w.clock.advance(10_000)
+    await Promise.all([
+      $.turn.complete({ answer: '', durationMs: 1000, isAborted: false, turnId: 't1' } as never),
+      $.turn.complete({ answer: '', durationMs: 1000, isAborted: false, turnId: 't2' } as never),
+    ])
+    await w.clock.advance(1000)
+    expect(w.prompts.filter(p => p.prompt.includes('finished a turn')).length).toBe(1)
+    expect((w.get('cards') ?? []).filter(c => c.source === 'turn').length).toBe(1)
+  })
+
+  test('a turn the person did not start is summarised whole, saying how it began', async ($, on) => {
+    const w = world(on, summaryReply)
+    tools(on, w)
+    await start($)
+    await $.prompt.submit({ text: '<task-notification>build finished</task-notification>', origin: { kind: 'task-notification' }, wait: false } as never)
+    await w.clock.advance(100)
+    await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
+    await w.clock.advance(10_000)
+    await $.tool.call({ tool: 'Edit', ...editTables() } as never)
+    await w.clock.advance(10_000)
+    await $.turn.complete({ answer: '', durationMs: 1000, isAborted: false, turnId: 't1' } as never)
+    await w.clock.advance(1000)
+    const asked = w.prompts.find(p => p.prompt.includes('finished a turn'))!.prompt
+    expect(asked).toContain('it began from a background task finishing')
+    expect(asked).not.toContain('build finished')
+    expect(asked).not.toContain('never explain it back')
+    expect((w.get('cards') ?? [])[0]!.source).toBe('turn')
+  })
+
+  test('a turn of one step gets only the choices the agent made, and no card when it made none', async ($, on) => {
+    let decisions = ['Sessions are kept in memory, so they are lost on restart.']
+    const w = world(on, prompt => prompt.includes('finished a turn')
+      ? JSON.stringify({ title: 'Token refresh', changes: 'Repeats the explanation.', decisions })
+      : JSON.stringify({ worth_explaining: true, title: 'Step', summary: 'A step.', steps: [] }))
+    tools(on, w)
+    await start($)
+    for (const text of ['add token refresh', 'and a sessions table']) {
+      await $.prompt.submit({ text, wait: false } as never)
+      await w.clock.advance(100)
+      await $.tool.call({ tool: 'Edit', ...(text === 'add token refresh' ? editTokens() : editTables()) } as never)
+      await w.clock.advance(10_000)
+      await $.turn.complete({ answer: '', durationMs: 1000, isAborted: false, turnId: text } as never)
+      await w.clock.advance(1000)
+      decisions = []
+    }
+    const asked = w.prompts.filter(p => p.prompt.includes('finished a turn'))
+    expect(asked.length).toBe(2)
+    expect(asked[0]!.prompt).toContain('the turn was one step')
+    const summaries = (w.get('cards') ?? []).filter(c => c.source === 'turn')
+    // The step's explanation says what changed: the summary holds only the decision.
+    expect(summaries.map(c => c.summary)).toEqual(['**Decided along the way:**\n- Sessions are kept in memory, so they are lost on restart.'])
+  })
+
+  for (const [name, settings, steps] of [['a turn with the summary turned off', { style: 'written', turnSummary: false }, 2]] as const) {
+    test(`${name} gets no summary`, async ($, on) => {
+      const w = world(on, summaryReply, { settings })
+      tools(on, w)
+      await start($)
+      await $.prompt.submit({ text: 'add token refresh', wait: false } as never)
+      await w.clock.advance(100)
+      await $.tool.call({ tool: 'Edit', ...editTokens() } as never)
+      await w.clock.advance(10_000)
+      if (steps === 2) {
+        await $.tool.call({ tool: 'Edit', ...editTables() } as never)
+        await w.clock.advance(10_000)
+      }
+      await $.turn.complete({ answer: '', durationMs: 1000, isAborted: false, turnId: 't1' } as never)
+      await w.clock.advance(1000)
+      expect(w.prompts.some(p => p.prompt.includes('finished a turn'))).toBe(false)
+      expect((w.get('cards') ?? []).some(c => c.source === 'turn')).toBe(false)
+      // The finished turn still groups, under a line naming its request.
+      const ui = await $.ui.mount({ plugin: 'inloop', surface: 'terminal', component: 'Pane', requestId: 'inloop', props: PANE_PROPS as never })
+      expect(await ui.find({ text: /“add token refresh”/ })).toBeDefined()
+      expect(await ui.find({ text: new RegExp(`${steps} explanations?`) })).toBeDefined()
+      await ui.unmount()
+    })
+  }
 })
 
 describe('changes since the last prompt', () => {

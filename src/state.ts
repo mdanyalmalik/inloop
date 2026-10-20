@@ -10,6 +10,7 @@ export const DEFAULT_SETTINGS: InloopSettings = {
   focus: '',
   style: 'spoken',
   briefAgent: true,
+  turnSummary: true,
   voice: '',
   autoVoiceSetup: true,
   autoModel: 'haiku',

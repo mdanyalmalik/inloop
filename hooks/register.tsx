@@ -116,6 +116,18 @@ async function showTab(tab: InloopTab | undefined, open: () => Promise<{ isPlace
   return (await open()).isPlaced
 }
 
+/** How a turn began that the person did not start; their own messages (typed, from a phone, an SDK host) are absent. */
+const TURN_STARTS: Record<string, string | undefined> = {
+  'task-notification': 'a background task finishing',
+  'scheduled-trigger': 'a scheduled task or /loop firing',
+  peer: 'a message from another Claude session',
+  'peer-send-message': 'a message from another Claude session',
+  'projects-relay': 'a message relayed from another project',
+  channel: 'a message from a connected channel',
+  coordinator: 'the coordinating agent',
+  observer: 'an observing agent',
+}
+
 /**
  * The uv release inloop fetches when uv is missing, one build per machine kind
  * (`uname -s -m`, or Windows' PROCESSOR_ARCHITECTURE), each with its SHA-256 as
@@ -452,7 +464,10 @@ export const register: Register = on => {
     if (app === null || e.command !== undefined || e.isMeta === true) return next(e)
     // After /clear the conversation's state starts fresh: settings and the feed come back first.
     await app.ensureState().catch(() => undefined)
-    app.markPrompt()
+    // The person's own message is the request the turn summary leaves out; any other start is said as such.
+    const started = TURN_STARTS[origin?.kind ?? 'composer']
+    if (started === undefined) app.markPrompt(e.text)
+    else app.markOtherStart(started)
     if (!(await app.isBriefActive())) return next(e)
     return next({ ...e, context: [...(e.context ?? []), BRIEF_REMINDER] })
   }).catch(($, e, next) => next(e))
@@ -487,7 +502,10 @@ export const register: Register = on => {
       if (isHeadless) await app.drain(60_000).catch(() => undefined)
       else {
         const live = app
-        live.detach(() => live.flush('turn'))
+        live.detach(async () => {
+          await live.flush('turn')
+          if (!e.isAborted) await live.summarizeTurn(e.answer)
+        })
       }
     }
     return next(e)

@@ -43,7 +43,14 @@ export type InloopCard = {
   /** Unified diff hunks behind the card, when it explains a change. */
   diff?: string
   rev?: string
-  source: 'auto' | 'ask' | 'commit' | 'compare' | 'recent' | 'flow'
+  /** 'turn': the summary written when the agent's turn ended. */
+  source: 'auto' | 'ask' | 'commit' | 'compare' | 'recent' | 'flow' | 'turn'
+  /** A small change, explained in a sentence or two and one part. */
+  isBrief?: boolean
+  /** The agent turn the card was written in: a finished turn's explanations sit under its summary in the feed and history. */
+  turn?: string
+  /** The first words of that turn's request, or how the turn began: the line over a turn with no summary. */
+  asked?: string
   question?: string
   bookmarked?: boolean
   /** True when no model call was made (static analysis only). */
@@ -129,6 +136,8 @@ export type InloopSettings = {
   style: InloopStyle
   /** Ask the coding agent to keep its own replies short while inloop explains the changes. */
   briefAgent: boolean
+  /** At the end of each agent turn that made several changes, a short summary of what the request did not already say. */
+  turnSummary: boolean
   /** System voice to speak with; '' picks the best installed. */
   voice: string
   /** Download the natural Kokoro voice in the background when a session starts, if it is not there yet. */
@@ -141,7 +150,7 @@ export type InloopSettings = {
   useReader: boolean
   /** 'model' asks a model for automatic cards; 'static' explains from analysis alone. */
   autoEngine: 'model' | 'static'
-  /** Minimum significance score (0-10) before a change batch gets a card. */
+  /** Minimum significance score (0-10) for a full explanation; a step below it gets a short one. */
   minScore: number
   /** Seconds of quiet after the last edit before a batch is explained. */
   quietSeconds: number

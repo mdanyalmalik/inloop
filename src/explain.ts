@@ -9,6 +9,7 @@ import type {
   InloopDepth,
   InloopFlow,
   InloopFlowEdge,
+  InloopFileChange,
   InloopFlowNode,
   InloopRef,
   InloopSettings,
@@ -489,12 +490,16 @@ export function partsFor(batch: Pick<Batch, 'analyses'>): { min: number; max: nu
   return { min: 3, max: 6, summary: '3-4 connected sentences (at most 90 words)' }
 }
 
+/** A small change's size: a sentence or two and the one part that shows it. */
+const BRIEF: ReturnType<typeof partsFor> = { min: 1, max: 1, summary: '1-2 sentences (at most 40 words)' }
+
 /**
  * A card written by the model from the batch's diffs and the static facts.
- * Resolves null when the model judges the batch not worth a card, unless the
- * person asked for it (`isAsked`).
+ * Resolves null when, in focus mode, the model judges the batch off the topic,
+ * unless the person asked for it (`isAsked`). A small change (`isBrief`) gets
+ * a sentence or two and one part.
  */
-export async function modelCard(env: Env, batch: Batch, base: InloopCard, focus: string, index?: CodeIndex, isAsked = false): Promise<InloopCard | null> {
+export async function modelCard(env: Env, batch: Batch, base: InloopCard, focus: string, index?: CodeIndex, isAsked = false, isBrief = false): Promise<InloopCard | null> {
   const facts = base.summary
   const related = index === undefined ? '' : calleeContext(index, batch)
   let budget = 14_000
@@ -503,7 +508,7 @@ export async function modelCard(env: Env, batch: Batch, base: InloopCard, focus:
     budget -= text.length
     return data(d.path, text)
   }).join('\n')
-  const size = partsFor(batch)
+  const size = isBrief ? BRIEF : partsFor(batch)
   const prompt = `The coding agent just made these edits as one step of its work.
 
 Static analysis (computed by inloop, reliable):
@@ -512,7 +517,7 @@ ${facts}
 Diffs:
 ${diffs}
 ${related !== '' ? `\nDefinitions the changed code calls (current files, for context):\n${related}\n` : ''}${focus !== '' ? `\nThe developer only wants explanations about: "${focus}". If this step has nothing to do with that, set worth_explaining to false.\n` : ''}
-Write one explanation card for this step, sized to the change (it is ${size.min === 0 ? 'tiny' : size.max <= 2 ? 'small' : size.max <= 4 ? 'medium-sized' : 'large'}):
+Write one explanation card for this step, sized to the change (it is ${isBrief ? 'a small change: keep it short, and say what it changes and why it matters' : size.min === 0 ? 'tiny' : size.max <= 2 ? 'small' : size.max <= 4 ? 'medium-sized' : 'large'}). Every step gets one, however minor:
 - "summary": ${size.summary} telling the whole story as one explanation: what the agent did, why the code needs it, and how it fits with the rest of the project.
 - "steps": ${size.min}-${size.max} parts, as many as the change needs and no more: one for each distinct piece worth looking at, in the order someone should read the change, each pointing at the code it describes (the new or changed lines, a caller, the data it touches) and adding a detail the summary does not already say. Never pad: when the summary already says it all, give fewer${size.min === 0 ? ' (an empty list is right for a one-line change)' : ''}. Each part may be read aloud while its code is on screen.
 Reply with JSON only:
@@ -529,7 +534,8 @@ Reply with JSON only:
   // A reply cut off before its summary is a failed one: say so, never show it raw.
   if (isCutOff && (json === null || (str(json.summary) === '' && !isNo(json.worth_explaining)))) throw new Error('the reply was cut off')
   if (json === null) return { ...base, summary: `${clip(reply.trim(), 3000)}\n\n---\n${base.summary}`, isHeuristic: false }
-  if (isNo(json.worth_explaining) && !isAsked) return null
+  // Only being off the focus topic leaves a change unexplained; a minor one is explained briefly.
+  if (isNo(json.worth_explaining) && !isAsked && focus !== '') return null
   const rawSteps = json.steps ?? json.key_lines
   const steps = await groundSteps(env.repo, rawSteps)
   // No parts asked for is an answer (the summary covers it); only parts that could not be placed fall back.
@@ -539,10 +545,80 @@ Reply with JSON only:
     title: str(json.title, 120) || base.title,
     concept: str(json.concept, 60) || base.concept,
     summary: str(json.summary) || base.summary,
-    steps: steps.length > 0 ? steps : isNoneMeant ? [] : base.steps,
+    steps: (steps.length > 0 ? steps : isNoneMeant ? [] : base.steps).slice(0, isBrief ? 1 : undefined),
     refs: steps.length > 0 ? steps.map(st => st.ref) : base.refs,
     isHeuristic: false,
+    ...(isBrief ? { isBrief: true } : {}),
   }
+}
+
+/** What an agent turn did, for the summary written when it ends. */
+export type TurnWork = {
+  /** What the person asked for when the turn began ('' when it began without a typed prompt). */
+  request: string
+  /** How the turn began when the person did not start it (a background task finishing). */
+  from?: string
+  /** The agent's final reply. */
+  answer: string
+  /** Each file's net change over the turn. */
+  files: readonly InloopFileChange[]
+  /** The explanations already written for the turn's steps. */
+  explained: readonly { title: string; summary: string }[]
+  /** The turn was one step: its explanation already says what changed, so only the agent's own choices are wanted. */
+  isOneStep?: boolean
+}
+
+/**
+ * The summary written when an agent turn ends: the code changes and the choices
+ * the agent made that the request did not mention. What the person asked for
+ * is theirs already, so it is never explained back to them. Null when the
+ * reply has no summary.
+ */
+export async function turnSummary(env: Env, work: TurnWork): Promise<{ title: string; summary: string } | null> {
+  let budget = 12_000
+  const diffs = work.files.map(f => {
+    const text = clip(f.hunks, Math.max(800, Math.floor(budget / work.files.length)))
+    budget -= text.length
+    return data(`${f.path} (+${f.added} −${f.removed}${f.isNew === true ? ', new file' : f.isDeleted === true ? ', deleted' : ''})`, text)
+  }).join('\n')
+  const explained = work.explained.map(c => `- ${c.title}: ${clip(c.summary, 400)}`).join('\n')
+  const start = work.from !== undefined
+    ? `The developer did not start this turn: it began from ${work.from}. They have seen none of it, so cover what was done and why it was done.`
+    : `What the developer asked for at the start of the turn (they know all of this; never explain it back to them):
+${work.request.trim() !== '' ? data('request', clip(work.request, 4000)) : '(the turn began without a typed request)'}`
+  const prompt = `The coding agent just finished a turn of work. Summarise it for the developer${work.from === undefined ? ', who already knows what they asked for' : ''}.
+
+${start}
+
+The agent's final reply (it may mention choices it made):
+${work.answer.trim() !== '' ? data('reply', clip(work.answer, 3000)) : '(none)'}
+
+Explanations already shown for the turn's steps:
+${explained || '(none)'}
+
+The turn's net changes:
+${diffs}
+
+Write:
+- "changes": ${work.isOneStep === true ? '"" (the turn was one step, and its explanation above already says what changed)' : '1-3 connected sentences (at most 60 words) on what the code now does, as the result of the whole turn. Leave out anything that only restates the request or the explanations above; say what they did not spell out (where it went, what it touches, side effects).'}
+- "decisions": the design choices the agent made on its own that the request did not mention, one sentence each (at most 5): an approach picked over another, a default or limit chosen, a name or format, something left out or handled differently than asked, a behaviour that changed elsewhere. Only choices the diffs or the reply show; an empty list when there were none.
+Reply with JSON only:
+{"title": "a few words naming what the turn did", "changes": "markdown", "decisions": ["..."]}`
+  const reply = await env.model({
+    model: env.settings.autoModel,
+    system: `${BASE_SYSTEM}\n${depthGuide(env.settings.depth)}`,
+    prompt,
+    maxTokens: 3000,
+    effort: 'low',
+    signal: env.signal,
+  })
+  const { json } = parseReply(reply)
+  if (json === null) return null
+  const changes = work.isOneStep === true ? '' : str(json.changes)
+  const decisions = Array.isArray(json.decisions) ? json.decisions.map(d => str(d, 300)).filter(Boolean).slice(0, 5) : []
+  if (changes === '' && decisions.length === 0) return null
+  const summary = [changes, decisions.length > 0 ? `**Decided along the way:**\n${decisions.map(d => `- ${d}`).join('\n')}` : ''].filter(Boolean).join('\n\n')
+  return { title: str(json.title, 120) || 'This turn', summary }
 }
 
 // ---------------------------------------------------------------------------

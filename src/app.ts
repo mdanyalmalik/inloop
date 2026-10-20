@@ -38,6 +38,7 @@ import {
   speakable,
   staticCard,
   staticFlow,
+  turnSummary,
 } from './explain'
 import { enclosingSymbol } from './graph'
 import { summarizeDiff, unifiedDiff } from './diff'
@@ -130,7 +131,8 @@ export class App {
 
   /**
    * This project's explanations from earlier sessions, newest first: those
-   * tagged with its folder, and older untagged ones whose files are all here.
+   * tagged with its folder. An untagged one is never guessed in: another
+   * project with the same file names (a copy, a clone, a demo) would pass.
    */
   private async ownEarlier(history: readonly InloopCard[]): Promise<InloopCard[]> {
     if (this.repo.notProject !== null) return []
@@ -138,13 +140,7 @@ export class App {
     for (const card of history) {
       if (out.length >= 20) break
       if (card.source === 'ask' || card.at >= this.startedAt) continue
-      if (card.root !== undefined) {
-        if (card.root === this.repo.root) out.push(card)
-        continue
-      }
-      if (card.files.length === 0) continue
-      const here = await Promise.all(card.files.map(f => this.repo.read(f).then(() => true, () => false)))
-      if (here.every(Boolean)) out.push(card)
+      if (card.root === this.repo.root) out.push(card)
     }
     return out
   }
@@ -390,13 +386,108 @@ export class App {
   /** Each file touched since the person's last prompt, with its text as it was then (null: it did not exist). */
   private turnStart = new Map<string, string | null>()
 
+  /**
+   * What the person asked for, and since when; the turn summary leaves out what it
+   * already says. `from` names how a turn began that the person did not start.
+   */
+  private request: { text: string; since: number; from?: string } = { text: '', since: 0 }
+
+  /** A turn began without the person (a background task, a scheduled prompt): nothing in it is theirs already. */
+  markOtherStart(from: string): void {
+    this.request = { text: '', since: Date.now(), from }
+    this.turnKey = this.newId()
+    this.asked = `from ${from}`
+  }
+
+  /** The turn explanations are written in now; its cards sit under a line or summary only once it ends. */
+  get currentTurn(): string {
+    return this.turnKey
+  }
+
+  /** The line over the current turn's cards: its request's first words, or how it began. */
+  private asked = ''
+
+  /** The turn explanations are written in now ('' before the first prompt), the key that groups them under its summary. */
+  private turnKey = ''
+
   /** The person sent a prompt: what changes from here is what the changes strip shows. */
-  markPrompt(): void {
+  markPrompt(text = ''): void {
     this.turnStart.clear()
     const since = Date.now()
+    this.request = { text, since }
+    this.turnKey = this.newId()
+    const line = text.trim().replace(/\s+/g, ' ')
+    this.asked = line.length > 70 ? `${line.slice(0, 69)}…` : line
     this.detach(() => this.host.state.changes.update(() => ({ since, files: [] })))
     // What changed since the agent's turn ended is the person's own work: learned, never explained.
     this.detach(() => this.scanWorkingTree(true))
+  }
+
+  /** Where the last turn summary left off: a turn continued without a new prompt is summarised from there. */
+  private summarizedTo = 0
+
+  /**
+   * The agent's turn ended: once its steps are explained, the turn's cards are
+   * grouped, and one card says what the turn did that the request did not
+   * already say, with the choices the agent made on its own. After a turn of one
+   * step, whose explanation already says what changed, it holds only those
+   * choices, and is left out when there were none. Auto mode, models on.
+   */
+  summarizeTurn(answer: string): Promise<void> {
+    // One at a time: turns ending close together never summarise the same steps twice.
+    const run = this.summaries.then(() => this.writeTurnSummary(answer))
+    this.summaries = run.catch(() => undefined)
+    return run
+  }
+
+  private summaries: Promise<void> = Promise.resolve()
+
+  private async writeTurnSummary(answer: string): Promise<void> {
+    const from = Math.max(this.request.since, this.summarizedTo)
+    const steps = this.recent.filter(r => r.at >= from).length
+    if (steps === 0) return
+    // The turn's own explanations come first.
+    const until = Date.now() + 120_000
+    while ((this.isWorking || this.queue.length > 0) && Date.now() < until) await new Promise<void>(resolve => this.host.after(200, resolve))
+    this.summarizedTo = Date.now()
+    // The turn is over: its cards group in the feed, and what is explained from here on is the next one's.
+    const turn = this.turnKey
+    const asked = this.asked
+    this.turnKey = this.newId()
+    const settings = await this.settings()
+    if (!settings.turnSummary || settings.mode !== 'auto' || settings.autoEngine !== 'model' || this.repo.notProject !== null) return
+    // The steps' changes since the turn began (or the last summary), file by file.
+    const byPath = new Map<string, string[]>()
+    for (const { batch } of this.recent.filter(r => r.at >= from)) {
+      for (const d of batch.diffs) byPath.set(d.path, [...(byPath.get(d.path) ?? []), d.hunks])
+    }
+    const files: InloopFileChange[] = []
+    for (const [path, hunks] of byPath) {
+      const summary = summarizeDiff(`--- a/${path}\n+++ b/${path}\n${hunks.join('\n')}`)[0]
+      if (summary !== undefined) files.push(summary)
+    }
+    if (files.length === 0) return
+    const explained = (await this.host.state.cards.get())
+      .filter(c => c.source === 'auto' && c.turn === turn && c.skipped === undefined && c.failed === undefined)
+      .reverse()
+      .map(c => ({ title: c.title, summary: c.summary }))
+    const written = await this.whileBusy('summarising this turn…', async () =>
+      turnSummary(await this.env(), { request: this.request.text, from: this.request.from, answer, files, explained, isOneStep: steps === 1 }),
+    ).catch(() => null)
+    if (written === null) return
+    await this.addCard({
+      id: this.newId(),
+      at: Date.now(),
+      title: written.title,
+      summary: written.summary,
+      files: files.map(f => f.path),
+      symbols: [],
+      refs: files.map(f => ({ path: f.path, line: f.ranges[0]?.[0] })),
+      steps: [],
+      diff: files.map(f => `--- a/${f.path}\n+++ b/${f.path}\n${f.hunks}`).join('\n'),
+      source: 'turn',
+      ...(turn !== '' ? { turn, asked } : {}),
+    })
   }
 
   /** Recomputes the net change of every file touched since the prompt, from its text then to its text now. */
@@ -653,11 +744,13 @@ export class App {
   }
 
   /** Makes a card for a batch if it is significant (and on topic in focus mode). */
-  async explainBatch(batch: Batch, source: InloopCard['source'], force = false, titlePrefix = ''): Promise<InloopCard | null> {
+  async explainBatch(batch: Batch, source: InloopCard['source'], force = false, titlePrefix = '', turn?: Pick<InloopCard, 'turn' | 'asked'>): Promise<InloopCard | null> {
     const settings = await this.settings()
     const score = Math.max(...batch.analyses.map(a => a.score), 0) + Math.min(2, batch.analyses.length - 1)
-    if (!force && score < settings.minScore) {
-      await this.addSkipped(batch, 'a small change')
+    // A small change is explained briefly; only one that changed nothing but whitespace or comments is left out.
+    const isBrief = !force && score < settings.minScore
+    if (isBrief && batch.analyses.every(a => a.isTrivial)) {
+      await this.addSkipped(batch, 'only whitespace or comments changed')
       return null
     }
     const diffText = batch.diffs.map(d => d.hunks).join('\n')
@@ -674,36 +767,41 @@ export class App {
         return null
       }
     }
-    return this.whileBusy('explaining a change…', () => this.writeCard(batch, source, force, titlePrefix, focus))
+    return this.whileBusy('explaining a change…', () => this.writeCard(batch, source, force, titlePrefix, focus, isBrief, turn))
   }
 
-  private async writeCard(batch: Batch, source: InloopCard['source'], force: boolean, titlePrefix: string, focus: string): Promise<InloopCard | null> {
+  private async writeCard(batch: Batch, source: InloopCard['source'], force: boolean, titlePrefix: string, focus: string, isBrief = false, turn?: Pick<InloopCard, 'turn' | 'asked'>): Promise<InloopCard | null> {
     const settings = await this.settings()
     const index = await this.repo.index().catch(() => null)
     const callers = index === null ? new Map<string, string[]>() : callerMap(index, batch.analyses)
     const base = staticCard(batch, callers, this.newId(), Date.now())
     base.source = source
-    let card: InloopCard | null = base
+    let card: InloopCard | null = isBrief ? { ...base, steps: base.steps?.slice(0, 1), isBrief: true } : base
     if (settings.autoEngine === 'model') {
       try {
-        card = await modelCard(await this.env(), batch, base, force ? '' : focus, index ?? undefined, force)
+        card = await modelCard(await this.env(), batch, base, force ? '' : focus, index ?? undefined, force, isBrief)
       } catch (err) {
         // inloop itself stopped (the session ended or restarted): nothing to show.
         if (this.aborter.signal.aborted) return null
         // Said plainly, with the change and a way to try again; never a bare list of code passed off as an explanation.
-        card = { ...base, title: `${titlePrefix}${base.title}`, steps: [], failed: String((err as Error).message ?? err).replace(/^model call failed: /, '') }
+        card = this.inTurn({ ...base, ...turn, title: `${titlePrefix}${base.title}`, steps: [], failed: String((err as Error).message ?? err).replace(/^model call failed: /, '') })
         this.batches.set(card.id, { batch, source })
         await this.host.state.cards.update(list => [card!, ...list].slice(0, MAX_CARDS))
         return null
       }
     }
     if (card === null) {
-      await this.addSkipped(batch, 'the model judged it too minor to explain')
+      await this.addSkipped(batch, `not about "${focus}"`)
       return null
     }
     if (titlePrefix !== '') card = { ...card, title: `${titlePrefix}${card.title}` }
-    await this.addCard(card)
+    await this.addCard(this.inTurn({ ...card, ...turn }))
     return card
+  }
+
+  /** An automatic card, marked with the turn it was written in. */
+  private inTurn(card: InloopCard): InloopCard {
+    return card.source === 'auto' && this.turnKey !== '' && card.turn === undefined ? { ...card, turn: this.turnKey, asked: this.asked } : card
   }
 
   /** The batch behind each skipped or failed card, for "explain anyway" and "try again". */
@@ -711,7 +809,7 @@ export class App {
 
   /** A change not explained still shows: one line in the feed, with its changes and "explain anyway". Never read aloud. */
   private async addSkipped(batch: Batch, reason: string): Promise<void> {
-    const card: InloopCard = { ...staticCard(batch, new Map(), this.newId(), Date.now()), steps: [], skipped: reason, root: this.repo.root }
+    const card: InloopCard = this.inTurn({ ...staticCard(batch, new Map(), this.newId(), Date.now()), steps: [], skipped: reason, root: this.repo.root })
     this.batches.set(card.id, { batch, source: 'auto' })
     await this.host.state.cards.update(list => [card, ...list].slice(0, MAX_CARDS))
   }
@@ -738,7 +836,8 @@ export class App {
       }
       this.batches.delete(id)
       await this.host.state.cards.update(list => list.filter(c => c.id !== id))
-      await this.explainBatch(held.batch, held.source, true)
+      // Explained in its place: in the turn it was made in.
+      await this.explainBatch(held.batch, held.source, true, '', card.turn === undefined ? undefined : { turn: card.turn, asked: card.asked })
     } finally {
       this.explaining.delete(id)
     }
@@ -865,7 +964,7 @@ export class App {
   private async withSteps(card: InloopCard): Promise<InloopCard> {
     if (card.steps !== undefined && card.steps.length > 0) return card
     // A change explained in its summary alone was meant that way: no parts made up from its references.
-    if (card.source === 'auto' && card.steps !== undefined && !card.isHeuristic) return card
+    if ((card.source === 'auto' || card.source === 'turn') && card.steps !== undefined && !card.isHeuristic) return card
     const steps: InloopStep[] = []
     for (const ref of card.refs.slice(0, 5)) {
       if (ref.line === undefined) continue
@@ -1271,7 +1370,7 @@ export class App {
     }
     if (away === null) return `Nothing was written while you were away.${back}`
     const until = away.until ?? Date.now()
-    const written = (await this.host.state.cards.get()).filter(c => c.source === 'auto' && c.at >= away.since && c.at <= until)
+    const written = (await this.host.state.cards.get()).filter(c => (c.source === 'auto' || c.source === 'turn') && c.at >= away.since && c.at <= until)
     if (written.length === 0) return `Nothing was written while you were away.${back}`
     const oldest = written[written.length - 1]!
     await this.host.state.expanded.update(() => oldest.id)
